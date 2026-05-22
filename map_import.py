@@ -81,6 +81,135 @@ def ensure_parent_collection_for_file(filepath: str) -> bpy.types.Collection:
     return col
 
 
+def ensure_child_collection(
+    parent_collection: bpy.types.Collection,
+    child_name: str,
+) -> bpy.types.Collection:
+    """Return an existing child collection by name, creating/linking it if needed."""
+    col = bpy.data.collections.get(child_name)
+    if col is None:
+        col = bpy.data.collections.new(child_name)
+
+    if parent_collection.children.get(col.name) is None:
+        parent_collection.children.link(col)
+
+    return col
+
+
+def ensure_typed_import_collection(
+    root_collection: bpy.types.Collection,
+    suffix: str,
+) -> bpy.types.Collection:
+    """Return a typed import child collection such as ``<root>_Static``."""
+    return ensure_child_collection(root_collection, f"{root_collection.name}{suffix}")
+
+
+def remove_linked_assets_scene_branch(root_collection: bpy.types.Collection) -> None:
+    """Remove the old source-asset scene branch that created origin duplicates."""
+    assets_collection_name = f"{root_collection.name}_LinkedAssets"
+    assets_collection = root_collection.children.get(assets_collection_name)
+    if assets_collection is None:
+        assets_collection = bpy.data.collections.get(assets_collection_name)
+        if assets_collection is not None:
+            assets_collection.hide_viewport = False
+            assets_collection.hide_render = False
+        return
+
+    try:
+        root_collection.children.unlink(assets_collection)
+        assets_collection.hide_viewport = False
+        assets_collection.hide_render = False
+        print(
+            f"[End JSON Import]   Removed old linked asset scene branch "
+            f"'{assets_collection.name}' to avoid origin duplicates."
+        )
+    except RuntimeError as exc:
+        print(
+            f"[End JSON Import]   Could not remove linked asset scene branch "
+            f"'{assets_collection.name}': {exc}"
+        )
+
+
+def file_source_collection_under_import_type(
+    collection: bpy.types.Collection,
+    target_collection: bpy.types.Collection,
+) -> None:
+    """
+    File a linked source collection under a typed import collection.
+
+    Blender may link collection assets at the scene root when they are loaded.
+    The source collection is still useful in the Outliner, but it belongs with
+    the placed instance empties under _Static/_Skeletal instead of as top-level
+    scene clutter.
+    """
+    if collection is None or target_collection is None:
+        return
+
+    scene_root = bpy.context.scene.collection
+
+    if target_collection.children.get(collection.name) is None:
+        try:
+            target_collection.children.link(collection)
+        except RuntimeError as exc:
+            print(
+                f"[End JSON Import]   Could not file source collection "
+                f"'{collection.name}' under '{target_collection.name}': {exc}"
+            )
+            return
+
+    parents_to_unlink: list[bpy.types.Collection] = []
+
+    def visit(parent: bpy.types.Collection) -> None:
+        for child in list(parent.children):
+            if child == collection:
+                if parent == scene_root:
+                    parents_to_unlink.append(parent)
+            else:
+                visit(child)
+
+    visit(scene_root)
+
+    for parent in parents_to_unlink:
+        try:
+            parent.children.unlink(collection)
+            print(
+                f"[End JSON Import]   Filed source collection '{collection.name}' "
+                f"under '{target_collection.name}' instead of scene root."
+            )
+        except RuntimeError as exc:
+            print(
+                f"[End JSON Import]   Could not remove source collection "
+                f"'{collection.name}' from scene root: {exc}"
+            )
+
+
+def collapse_outliner_collections() -> None:
+    """Best-effort collapse pass for visible Outliner editors after import."""
+    screen = getattr(bpy.context, "screen", None)
+    if screen is None:
+        return
+
+    for area in screen.areas:
+        if area.type != "OUTLINER":
+            continue
+
+        region = next((r for r in area.regions if r.type == "WINDOW"), None)
+        space = next((s for s in area.spaces if s.type == "OUTLINER"), None)
+        if region is None or space is None:
+            continue
+
+        try:
+            with bpy.context.temp_override(area=area, region=region, space_data=space):
+                # Blender exposes Outliner expansion as UI state rather than ID
+                # data, so collapse repeatedly to cover nested import groups.
+                for _ in range(8):
+                    result = bpy.ops.outliner.show_one_level(open=False)
+                    if result == {"CANCELLED"}:
+                        break
+        except Exception as exc:
+            print(f"[End JSON Import]   Could not collapse Outliner collections: {exc}")
+
+
 def _collection_matches_asset_name(collection: bpy.types.Collection, asset_name: str) -> bool:
     """
     Return True when *collection* looks like a datablock for *asset_name*,
@@ -863,6 +992,19 @@ def resolve_streaming_level_json_path(asset_path_name: str, game_root: str) -> s
     return resolve_game_asset_file_path(asset_path_name, game_root, ".json")
 
 
+def is_path_in_or_beneath(path: str, root_dir: str) -> bool:
+    """Return True when *path* is inside *root_dir* or is *root_dir* itself."""
+    if not path or not root_dir:
+        return True
+
+    try:
+        resolved_path = os.path.normcase(os.path.realpath(path))
+        resolved_root = os.path.normcase(os.path.realpath(root_dir))
+        return os.path.commonpath([resolved_path, resolved_root]) == resolved_root
+    except (OSError, ValueError):
+        return False
+
+
 def collect_level_streaming_asset_paths(data: list) -> list[str]:
     """
     Return the JSON asset paths referenced by LevelStreaming entries.
@@ -932,6 +1074,8 @@ def import_streaming_asset_paths(
     attenuation_radius_mult: float,
     visited_paths: set[str],
     recursive_import: bool,
+    allow_external_recursive_json: bool,
+    recursive_root_dir: str,
     import_massive_environment_umaps: bool,
     imported_umap_paths: set[str],
 ) -> tuple[int, set[str]]:
@@ -945,6 +1089,15 @@ def import_streaming_asset_paths(
         if not json_path:
             print(f"[End JSON Import]     Could not resolve path for: {asset_path_name!r}")
             continue
+        if (
+            not allow_external_recursive_json
+            and not is_path_in_or_beneath(json_path, recursive_root_dir)
+        ):
+            print(
+                f"[End JSON Import]     Skipping external streaming JSON outside "
+                f"'{recursive_root_dir}': {json_path}"
+            )
+            continue
         if not os.path.exists(json_path):
             print(f"[End JSON Import]     Streaming JSON not found: {json_path}")
             continue
@@ -957,6 +1110,8 @@ def import_streaming_asset_paths(
             game_root=game_root,
             visited_paths=visited_paths,
             recursive_import=recursive_import,
+            allow_external_recursive_json=allow_external_recursive_json,
+            recursive_root_dir=recursive_root_dir,
             import_massive_environment_umaps=import_massive_environment_umaps,
             imported_umap_paths=imported_umap_paths,
         )
@@ -1664,6 +1819,8 @@ def import_json_file(
     game_root: str,
     visited_paths: set[str],
     recursive_import: bool = True,
+    allow_external_recursive_json: bool = False,
+    recursive_root_dir: str | None = None,
     import_massive_environment_umaps: bool = True,
     imported_umap_paths: set[str] | None = None,
 ) -> tuple[int, set[str]]:
@@ -1674,6 +1831,10 @@ def import_json_file(
         (created_count, missing_assets)
     """
     filepath = os.path.realpath(filepath)
+    if recursive_root_dir is None:
+        recursive_root_dir = os.path.dirname(filepath)
+    else:
+        recursive_root_dir = os.path.realpath(recursive_root_dir)
 
     if filepath in visited_paths:
         print(f"[End JSON Import] Skipping already-visited file: {filepath}")
@@ -1716,6 +1877,19 @@ def import_json_file(
     # Parent collection is created on demand, only if we actually add objects.
     parent_collection = None
 
+    def ensure_root_collection() -> bpy.types.Collection:
+        nonlocal parent_collection
+        if parent_collection is None:
+            parent_collection = ensure_parent_collection_for_file(filepath)
+            remove_linked_assets_scene_branch(parent_collection)
+        return parent_collection
+
+    def ensure_static_collection() -> bpy.types.Collection:
+        return ensure_typed_import_collection(ensure_root_collection(), "_Static")
+
+    def ensure_skeletal_collection() -> bpy.types.Collection:
+        return ensure_typed_import_collection(ensure_root_collection(), "_Skeletal")
+
     created_count = 0
     missing_assets: set[str] = set()
     pending_parent_attaches: list[tuple[bpy.types.Object, dict, str]] = []
@@ -1744,6 +1918,8 @@ def import_json_file(
                 attenuation_radius_mult=attenuation_radius_mult,
                 visited_paths=visited_paths,
                 recursive_import=recursive_import,
+                allow_external_recursive_json=allow_external_recursive_json,
+                recursive_root_dir=recursive_root_dir,
                 import_massive_environment_umaps=import_massive_environment_umaps,
                 imported_umap_paths=imported_umap_paths,
             )
@@ -1774,8 +1950,7 @@ def import_json_file(
             loc = location_from_relative(rel_loc, scale_factor=location_scale)
             rot = rotation_from_relative(rel_rot)
 
-            if parent_collection is None:
-                parent_collection = ensure_parent_collection_for_file(filepath)
+            static_collection = ensure_static_collection()
 
             attach_socket = props.get("AttachSocketName")
             has_attach_socket = bool(attach_socket)
@@ -1784,13 +1959,14 @@ def import_json_file(
             if asset is not None:
                 if asset.kind == "COLLECTION":
                     collection = asset.datablock
+                    file_source_collection_under_import_type(collection, static_collection)
                     if attach_socket:
                         new_obj, instance_obj = create_wrapped_collection_instance(
                             collection=collection,
                             name=attach_name,
                             location=loc,
                             rotation_euler=rot,
-                            parent_collection=parent_collection,
+                            parent_collection=static_collection,
                         )
                         instance_obj = ensure_overrideable_collection_instance(instance_obj)
                         ensure_top_level_object_overrides(instance_obj)
@@ -1801,7 +1977,7 @@ def import_json_file(
                             name=attach_name,
                             location=loc,
                             rotation_euler=rot,
-                            parent_collection=parent_collection,
+                            parent_collection=static_collection,
                         )
                 else:
                     new_obj = create_linked_object_instance(
@@ -1809,12 +1985,12 @@ def import_json_file(
                         name=attach_name,
                         location=loc,
                         rotation_euler=rot,
-                        parent_collection=parent_collection,
+                        parent_collection=static_collection,
                     )
             else:
                 missing_assets.add(asset_name)
                 placeholder_name = attach_name
-                new_obj = create_mesh_empty(placeholder_name, loc, rot, parent_collection)
+                new_obj = create_mesh_empty(placeholder_name, loc, rot, static_collection)
                 print(
                     f"[End JSON Import]   StaticMesh fallback empty '{placeholder_name}' | "
                     f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
@@ -1906,8 +2082,7 @@ def import_json_file(
         # Skeletal mesh components -> collection instance, empty fallback
         # ------------------------------------------------------------------ #
         elif t == "EndSkeletalMeshComponent":
-            if parent_collection is None:
-                parent_collection = ensure_parent_collection_for_file(filepath)
+            skeletal_collection = ensure_skeletal_collection()
 
             props = entry.get("Properties", {})
             loc_dict = props.get("RelativeLocation", entry.get("RelativeLocation", {}))
@@ -1935,12 +2110,13 @@ def import_json_file(
 
             if asset is not None:
                 if asset.kind == "COLLECTION":
+                    file_source_collection_under_import_type(asset.datablock, skeletal_collection)
                     obj, instance_obj = create_skeletal_wrapper_instance(
                         collection=asset.datablock,
                         name=instance_name,
                         location=loc,
                         rotation_euler=rot,
-                        parent_collection=parent_collection,
+                        parent_collection=skeletal_collection,
                     )
                     assign_skeletal_source_metadata(
                         obj,
@@ -1957,7 +2133,7 @@ def import_json_file(
                         name=instance_name,
                         location=loc,
                         rotation_euler=rot,
-                        parent_collection=parent_collection,
+                        parent_collection=skeletal_collection,
                     )
                     assign_skeletal_source_metadata(
                         obj,
@@ -1974,7 +2150,7 @@ def import_json_file(
             else:
                 if asset_name:
                     missing_assets.add(asset_name)
-                obj = create_mesh_empty(instance_name, loc, rot, parent_collection)
+                obj = create_mesh_empty(instance_name, loc, rot, skeletal_collection)
                 obj["source_name"] = instance_name
                 if template_object_path:
                     obj["template_object_path"] = template_object_path
@@ -2017,8 +2193,7 @@ def import_json_file(
         # Point lights
         # ------------------------------------------------------------------ #
         elif t == "PointLightComponent":
-            if parent_collection is None:
-                parent_collection = ensure_parent_collection_for_file(filepath)
+            ensure_root_collection()
 
             props = entry.get("Properties", {})
             light_name = _resolve_light_name(entry, "PointLight")
@@ -2047,8 +2222,7 @@ def import_json_file(
         # Spot lights
         # ------------------------------------------------------------------ #
         elif t == "SpotLightComponent":
-            if parent_collection is None:
-                parent_collection = ensure_parent_collection_for_file(filepath)
+            ensure_root_collection()
 
             props = entry.get("Properties", {})
             light_name = _resolve_light_name(entry, "SpotLight")
@@ -2105,6 +2279,8 @@ def import_json_file(
                 attenuation_radius_mult=attenuation_radius_mult,
                 visited_paths=visited_paths,
                 recursive_import=recursive_import,
+                allow_external_recursive_json=allow_external_recursive_json,
+                recursive_root_dir=recursive_root_dir,
                 import_massive_environment_umaps=import_massive_environment_umaps,
                 imported_umap_paths=imported_umap_paths,
             )

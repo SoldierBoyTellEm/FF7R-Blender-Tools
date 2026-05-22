@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FF7 Rebirth map importer",
     "author": "GargoyleTech",
-    "version": (2, 0, 0),
+    "version": (2, 0, 2),
     "blender": (4, 0, 0),
     "location": "File > Import > FF7R Rebirth",
     "description": "Imports FF7R Rebirth cutscene JSON, UMAP JSON, and Massive Environment .umap files",
@@ -108,6 +108,11 @@ class FF7R_ImportPreferences(AddonPreferences):
         description="Import streaming levels referenced by EndStreamingVolume entries",
         default=True,
     )
+    allow_external_recursive_json: BoolProperty(
+        name="Allow Recursive JSON Outside Current Folder",
+        description="Allow recursive JSON imports to follow referenced maps outside the selected JSON file's folder",
+        default=False,
+    )
     import_massive_environment_umaps: BoolProperty(
         name="Import Referenced Massive Environment UMAPs",
         description="Import .umap files referenced by MassiveEnvironmentComponent entries during UMAP JSON import",
@@ -138,6 +143,9 @@ class FF7R_ImportPreferences(AddonPreferences):
         json_box.label(text="JSON Imports")
         json_box.prop(self, "game_root")
         json_box.prop(self, "recursive_import")
+        external_row = json_box.row()
+        external_row.enabled = self.recursive_import
+        external_row.prop(self, "allow_external_recursive_json")
         json_box.prop(self, "import_massive_environment_umaps")
 
         texture_box = layout.box()
@@ -282,6 +290,11 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         description="Import streaming levels referenced by EndStreamingVolume entries",
         default=True,
     )
+    allow_external_recursive_json: BoolProperty(
+        name="Allow Recursive JSON Outside Current Folder",
+        description="Allow recursive JSON imports to follow referenced maps outside the selected JSON file's folder",
+        default=False,
+    )
     import_massive_environment_umaps: BoolProperty(
         name="Import Massive Environment UMAPs",
         description="Import .umap files referenced by MassiveEnvironmentComponent entries",
@@ -337,6 +350,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
                     game_root=game_root,
                     visited_paths=visited_paths,
                     recursive_import=self.recursive_import,
+                    allow_external_recursive_json=self.allow_external_recursive_json,
                     import_massive_environment_umaps=(
                         self.import_massive_environment_umaps
                         and map_import.is_umap_addon_available()
@@ -360,6 +374,9 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         if not total_created and errors:
             return {"CANCELLED"}
 
+        if total_created:
+            map_import.collapse_outliner_collections()
+
         self.report({"INFO"}, f"Created {total_created} item(s) from {len(import_paths)} UMAP JSON file(s)")
         return {"FINISHED"}
 
@@ -369,6 +386,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
             if not self.game_root:
                 self.game_root = prefs.game_root
             self.recursive_import = prefs.recursive_import
+            self.allow_external_recursive_json = prefs.allow_external_recursive_json
             self.import_massive_environment_umaps = prefs.import_massive_environment_umaps
             self.asset_library_selection = prefs.asset_library_selection
             self.manual_asset_library_path = prefs.manual_asset_library_path
@@ -385,6 +403,9 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         layout.separator(factor=0.7)
         layout.prop(self, "game_root")
         layout.prop(self, "recursive_import")
+        external_row = layout.row()
+        external_row.enabled = self.recursive_import
+        external_row.prop(self, "allow_external_recursive_json")
         if map_import.is_umap_addon_available():
             layout.prop(self, "import_massive_environment_umaps")
         layout.separator(factor=0.7)
