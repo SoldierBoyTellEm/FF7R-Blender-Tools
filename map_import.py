@@ -4,57 +4,23 @@ import os
 import math
 import re
 import importlib
+from contextlib import contextmanager as _contextmanager
 from mathutils import Vector, Euler, Matrix
 
 from . import asset_linking, lights
 
 
 ASSET_LIBRARY_SELECTION = asset_linking.ASSET_LIBRARY_ALL
-IMPORT_MASSIVE_ENVIRONMENT_UMAPS = True
 VERBOSE_OVERRIDE_LOGGING = False
+TextureIndexCache = dict[tuple[str, str], dict[str, str]]
 
 # Blender spot lights emit along local -Z, while UE components use +X forward.
-# Apply this after the normal mesh-style UE->Blender axis conversion.
 _LIGHT_FWD_FIX = (
     Matrix.Rotation(math.radians(90.0), 4, "X") @
     Matrix.Rotation(math.radians(-90.0), 4, "Y")
 )
 
-# ---------------------------------------------------------------------------
-# Asset index compatibility helpers
-# ---------------------------------------------------------------------------
-
-_ASSET_INDEX_CACHE = None  # type: dict[str, list[str]] | None
-_ASSET_INDEX_SELECTION = None  # type: str | None
-
-
-def build_asset_index(selection: str | None = None) -> dict:
-    """Build mapping: collection name -> .blend files for the selected prop library."""
-    return asset_linking.build_collection_asset_index(selection or ASSET_LIBRARY_SELECTION)
-
-
-def get_asset_index(selection: str | None = None) -> dict:
-    """Get (and lazily build) a collection asset index for the selected prop library."""
-    global _ASSET_INDEX_CACHE, _ASSET_INDEX_SELECTION
-
-    resolved_selection = selection or ASSET_LIBRARY_SELECTION
-    if _ASSET_INDEX_CACHE is None or _ASSET_INDEX_SELECTION != resolved_selection:
-        print("[End JSON Import] Building asset index (this runs once per session)...")
-        _ASSET_INDEX_CACHE = build_asset_index(resolved_selection)
-        _ASSET_INDEX_SELECTION = resolved_selection
-        print(f"[End JSON Import] Indexed {len(_ASSET_INDEX_CACHE)} collection names.")
-    return _ASSET_INDEX_CACHE
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def extract_static_mesh_name(object_name_str: str) -> str | None:
-    """
-    From Unreal-like object name: "StaticMesh'Block_GSFlowerBed_04A'"
-    -> "Block_GSFlowerBed_04A"
-    """
     if not object_name_str:
         return None
     if "'" in object_name_str:
@@ -65,10 +31,6 @@ def extract_static_mesh_name(object_name_str: str) -> str | None:
 
 
 def ensure_parent_collection_for_file(filepath: str) -> bpy.types.Collection:
-    """
-    Create or get a collection named after the JSON file (without extension),
-    and ensure it is linked to the current scene.
-    """
     base_name = os.path.splitext(os.path.basename(filepath))[0]
     col = bpy.data.collections.get(base_name)
     if col is None:
@@ -85,7 +47,6 @@ def ensure_child_collection(
     parent_collection: bpy.types.Collection,
     child_name: str,
 ) -> bpy.types.Collection:
-    """Return an existing child collection by name, creating/linking it if needed."""
     col = bpy.data.collections.get(child_name)
     if col is None:
         col = bpy.data.collections.new(child_name)
@@ -100,91 +61,128 @@ def ensure_typed_import_collection(
     root_collection: bpy.types.Collection,
     suffix: str,
 ) -> bpy.types.Collection:
-    """Return a typed import child collection such as ``<root>_Static``."""
     return ensure_child_collection(root_collection, f"{root_collection.name}{suffix}")
 
 
-def remove_linked_assets_scene_branch(root_collection: bpy.types.Collection) -> None:
-    """Remove the old source-asset scene branch that created origin duplicates."""
-    assets_collection_name = f"{root_collection.name}_LinkedAssets"
-    assets_collection = root_collection.children.get(assets_collection_name)
-    if assets_collection is None:
-        assets_collection = bpy.data.collections.get(assets_collection_name)
-        if assets_collection is not None:
-            assets_collection.hide_viewport = False
-            assets_collection.hide_render = False
-        return
-
-    try:
-        root_collection.children.unlink(assets_collection)
-        assets_collection.hide_viewport = False
-        assets_collection.hide_render = False
-        print(
-            f"[End JSON Import]   Removed old linked asset scene branch "
-            f"'{assets_collection.name}' to avoid origin duplicates."
-        )
-    except RuntimeError as exc:
-        print(
-            f"[End JSON Import]   Could not remove linked asset scene branch "
-            f"'{assets_collection.name}': {exc}"
-        )
+def collection_is_child(
+    parent_collection: bpy.types.Collection,
+    child_collection: bpy.types.Collection,
+) -> bool:
+    return any(child == child_collection for child in parent_collection.children)
 
 
-def file_source_collection_under_import_type(
-    collection: bpy.types.Collection,
-    target_collection: bpy.types.Collection,
-) -> None:
-    """
-    File a linked source collection under a typed import collection.
-
-    Blender may link collection assets at the scene root when they are loaded.
-    The source collection is still useful in the Outliner, but it belongs with
-    the placed instance empties under _Static/_Skeletal instead of as top-level
-    scene clutter.
-    """
-    if collection is None or target_collection is None:
-        return
+def scene_collection_parents(collection: bpy.types.Collection) -> list[bpy.types.Collection]:
+    if collection is None:
+        return []
 
     scene_root = bpy.context.scene.collection
-
-    if target_collection.children.get(collection.name) is None:
-        try:
-            target_collection.children.link(collection)
-        except RuntimeError as exc:
-            print(
-                f"[End JSON Import]   Could not file source collection "
-                f"'{collection.name}' under '{target_collection.name}': {exc}"
-            )
-            return
-
-    parents_to_unlink: list[bpy.types.Collection] = []
+    parents: list[bpy.types.Collection] = []
+    visited: set[int] = set()
 
     def visit(parent: bpy.types.Collection) -> None:
+        pointer = parent.as_pointer()
+        if pointer in visited:
+            return
+        visited.add(pointer)
+
         for child in list(parent.children):
             if child == collection:
-                if parent == scene_root:
-                    parents_to_unlink.append(parent)
+                parents.append(parent)
             else:
                 visit(child)
 
     visit(scene_root)
+    return parents
 
-    for parent in parents_to_unlink:
+
+def unlink_collection_from_scene(collection: bpy.types.Collection) -> int:
+    parents = scene_collection_parents(collection)
+
+    unlinked_count = 0
+    for parent in parents:
         try:
             parent.children.unlink(collection)
-            print(
-                f"[End JSON Import]   Filed source collection '{collection.name}' "
-                f"under '{target_collection.name}' instead of scene root."
-            )
+            unlinked_count += 1
         except RuntimeError as exc:
             print(
-                f"[End JSON Import]   Could not remove source collection "
-                f"'{collection.name}' from scene root: {exc}"
+                f"[End JSON Import]   Could not unlink collection "
+                f"'{collection.name}' from '{parent.name}': {exc}"
             )
+
+    return unlinked_count
+
+
+def file_collection_under_import_type(
+    collection: bpy.types.Collection,
+    target_collection: bpy.types.Collection,
+) -> None:
+    """Keep local override collections filed, but leave linked source collections scene-unlinked."""
+    if collection is None or target_collection is None:
+        return
+
+    scene_root = bpy.context.scene.collection
+    if collection == scene_root or collection == target_collection:
+        return
+
+    if collection.library is not None:
+        if unlink_collection_from_scene(collection):
+            print(
+                f"[End JSON Import]   Unlinked source collection "
+                f"'{collection.name}' from the scene hierarchy."
+        )
+        return
+
+    if not collection_is_child(target_collection, collection):
+        try:
+            target_collection.children.link(collection)
+        except RuntimeError as exc:
+            print(
+                f"[End JSON Import]   Could not file collection "
+                f"'{collection.name}' under '{target_collection.name}': {exc}"
+            )
+            return
+
+    unlinked_count = 0
+    for parent in scene_collection_parents(collection):
+        if parent == target_collection:
+            continue
+        try:
+            parent.children.unlink(collection)
+            unlinked_count += 1
+        except RuntimeError as exc:
+            print(
+                f"[End JSON Import]   Could not remove collection "
+                f"'{collection.name}' from '{parent.name}': {exc}"
+            )
+
+    if unlinked_count:
+        print(
+            f"[End JSON Import]   Filed override collection '{collection.name}' "
+            f"under '{target_collection.name}'."
+        )
+
+
+@_contextmanager
+def _scene_link_collection(collection: bpy.types.Collection, parent: bpy.types.Collection):
+    """Temporarily link a collection under parent so override_hierarchy_create can see it, then unlink the source."""
+    already_linked = collection_is_child(parent, collection)
+    if not already_linked:
+        try:
+            parent.children.link(collection)
+        except RuntimeError:
+            yield
+            return
+    try:
+        yield
+    finally:
+        if not already_linked and collection_is_child(parent, collection):
+            try:
+                parent.children.unlink(collection)
+            except RuntimeError:
+                pass
 
 
 def collapse_outliner_collections() -> None:
-    """Best-effort collapse pass for visible Outliner editors after import."""
     screen = getattr(bpy.context, "screen", None)
     if screen is None:
         return
@@ -200,8 +198,6 @@ def collapse_outliner_collections() -> None:
 
         try:
             with bpy.context.temp_override(area=area, region=region, space_data=space):
-                # Blender exposes Outliner expansion as UI state rather than ID
-                # data, so collapse repeatedly to cover nested import groups.
                 for _ in range(8):
                     result = bpy.ops.outliner.show_one_level(open=False)
                     if result == {"CANCELLED"}:
@@ -210,44 +206,11 @@ def collapse_outliner_collections() -> None:
             print(f"[End JSON Import]   Could not collapse Outliner collections: {exc}")
 
 
-def _collection_matches_asset_name(collection: bpy.types.Collection, asset_name: str) -> bool:
-    """
-    Return True when *collection* looks like a datablock for *asset_name*,
-    allowing Blender numeric suffixes such as ".001".
-    """
-    if collection is None:
-        return False
-    return asset_linking.id_name_matches(asset_name, collection.name)
-
-
-def find_loaded_linked_source_collection(asset_name: str) -> bpy.types.Collection | None:
-    """
-    Find an already-loaded linked source collection for *asset_name* while
-    ignoring local override collections created for previous actor instances.
-    """
-    for col in bpy.data.collections:
-        if not _collection_matches_asset_name(col, asset_name):
-            continue
-        if col.library is None:
-            continue
-        if getattr(col, "override_library", None) is not None:
-            continue
-        return col
-    return None
-
-
 def find_or_load_collection_cached(asset_name: str) -> bpy.types.Collection | None:
-    """
-    Find an existing linked source collection, or use the cached asset index
-    to locate a .blend file that contains a collection with that name and link it.
-    """
     return asset_linking.find_or_load_collection(asset_name, ASSET_LIBRARY_SELECTION)
 
 
 def find_or_load_asset_cached(asset_name: str) -> asset_linking.LinkedAsset | None:
-    """
-    Find a linked collection asset, or fall back to a lone linked object asset.
-    """
     return asset_linking.find_or_load_asset(asset_name, ASSET_LIBRARY_SELECTION)
 
 
@@ -258,7 +221,6 @@ def create_collection_instance(
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
 ):
-    """Create a collection instance object with the given transform."""
     obj = bpy.data.objects.new(name, None)
     obj.instance_type = "COLLECTION"
     obj.instance_collection = collection
@@ -277,7 +239,6 @@ def create_linked_object_instance(
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
 ):
-    """Create a directly-linked object instance copy with the given transform."""
     obj = source_obj.copy()
     obj.name = name
     obj.rotation_mode = "XYZ"
@@ -294,10 +255,6 @@ def create_wrapped_linked_object_instance(
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
 ):
-    """
-    Create a stable local wrapper empty and place a linked object copy under it
-    at identity transform.
-    """
     wrapper = create_mesh_empty(name, location, rotation_euler, parent_collection)
 
     instance_obj = source_obj.copy()
@@ -318,10 +275,6 @@ def create_skeletal_wrapper_instance(
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
 ):
-    """
-    Create a stable local empty for the actor and put the linked skeletal
-    collection instance under it at identity transform.
-    """
     return create_wrapped_collection_instance(
         collection=collection,
         name=name,
@@ -338,10 +291,6 @@ def create_wrapped_collection_instance(
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
 ):
-    """
-    Create a stable local wrapper empty and place the linked collection
-    instance under it at identity transform.
-    """
     wrapper = create_mesh_empty(name, location, rotation_euler, parent_collection)
 
     instance_obj = bpy.data.objects.new(f"{name}__INSTANCE", None)
@@ -361,9 +310,6 @@ def assign_skeletal_source_metadata(
     instance_name: str,
     template_object_path: str | None,
 ) -> None:
-    """
-    Store import provenance on the actor wrapper and its current linked helper.
-    """
     wrapper_obj["source_name"] = instance_name
     if template_object_path:
         wrapper_obj["template_object_path"] = template_object_path
@@ -373,25 +319,7 @@ def assign_skeletal_source_metadata(
 
 
 def rotation_from_relative(rot_dict: dict) -> Euler:
-    """
-    Convert the RelativeRotation dict to a Blender XYZ Euler.
-
-    Requirements:
-    - X and Y rotations appeared swapped -> use Roll on X, Pitch on Y.
-    - Z rotation inverted -> negate Yaw.
-    - Y rotation also inverted -> negate Pitch.
-    - Yaw still corresponds to Blender's Z axis.
-
-    Unreal:
-      Pitch: rotate around Y
-      Yaw  : rotate around Z
-      Roll : rotate around X
-
-    Mapping to Blender XYZ euler:
-      X = Roll
-      Y = -Pitch
-      Z = -Yaw
-    """
+    """UE RelativeRotation (Pitch/Yaw/Roll degrees) -> Blender XYZ Euler. Mapping: X=Roll, Y=-Pitch, Z=-Yaw."""
     pitch_deg = float(rot_dict.get("Pitch", 0.0))
     yaw_deg = float(rot_dict.get("Yaw", 0.0))
     roll_deg = float(rot_dict.get("Roll", 0.0))
@@ -404,29 +332,19 @@ def rotation_from_relative(rot_dict: dict) -> Euler:
 
 
 def light_rotation_from_relative(rot_dict: dict) -> Euler:
-    """
-    Convert RelativeRotation with the same mesh axis mapping, then align the
-    Blender spot-light emission axis to UE's component-forward axis.
-    """
+    """rotation_from_relative plus the Blender spot -Z -> UE +X forward correction."""
     mesh_rot = rotation_from_relative(rot_dict)
     return (mesh_rot.to_matrix().to_4x4() @ _LIGHT_FWD_FIX).to_euler("XYZ")
 
 
 def location_from_relative(loc_dict: dict, scale_factor: float = 0.01) -> Vector:
-    """
-    Convert the RelativeLocation dict to a Blender Vector and apply scale factor.
-
-    Requirement:
-    - Y location should be inverted.
-    """
     x = float(loc_dict.get("X", 0.0)) * scale_factor
-    y = -float(loc_dict.get("Y", 0.0)) * scale_factor  # invert Y
+    y = -float(loc_dict.get("Y", 0.0)) * scale_factor
     z = float(loc_dict.get("Z", 0.0)) * scale_factor
     return Vector((x, y, z))
 
 
 def _float_or_default(value, default: float = 0.0) -> float:
-    """Safely coerce *value* to float."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -434,7 +352,6 @@ def _float_or_default(value, default: float = 0.0) -> float:
 
 
 def _bool_or_default(value, default: bool = False) -> bool:
-    """Safely coerce common JSON-ish truthy values to bool."""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -451,11 +368,6 @@ def _bool_or_default(value, default: bool = False) -> bool:
 
 
 def _get_light_temperature(props: dict) -> float | None:
-    """
-    Return whichever temperature key the export uses.
-
-    FModel UMAP exports have shown both `Temperature` and `ColorTemperature`.
-    """
     if "Temperature" in props:
         return _float_or_default(props.get("Temperature"), 6500.0)
     if "ColorTemperature" in props:
@@ -481,49 +393,24 @@ def create_point_light_from_entry(
     attenuation_radius_mult: float,
     attach_parent_obj: bpy.types.Object | None = None,
 ):
-    """
-    Create a Blender point light from a UE PointLightComponent JSON entry.
-    """
     props = entry.get("Properties", {})
-
-    # Intensity / energy
-    if "Intensity" in props:
-        raw_intensity = props.get("Intensity", 0.0)
-    else:
-        raw_intensity = entry.get("IntensityNits", 0.0)
-
-    intensity = _float_or_default(raw_intensity)
-    energy = intensity * exposure_mult
-
     light_name = _resolve_light_name(entry, "PointLight")
-
     light_data = lights.create_static_light_data(
-        light_name,
-        "POINT",
-        {**entry, **props},
+        light_name, "POINT", {**entry, **props},
         location_scale=location_scale,
         exposure_mult=exposure_mult,
         attenuation_radius_mult=attenuation_radius_mult,
     )
-    energy = light_data.energy
-
-    # Color (R/G/B 0-255 -> 0-1)
-    r, g, b = light_data.color
-
-    # Location / rotation (Properties.* preferred, else top-level)
     loc_dict = props.get("RelativeLocation", entry.get("RelativeLocation", {}))
     rot_dict = props.get("RelativeRotation", entry.get("RelativeRotation", {}))
-
     loc = location_from_relative(loc_dict, scale_factor=location_scale)
     rot = rotation_from_relative(rot_dict)
-
     light_obj = bpy.data.objects.new(light_name, light_data)
     if attach_parent_obj is not None:
         light_obj.parent = attach_parent_obj
     light_obj.location = loc
     light_obj.rotation_euler = rot
     lights.apply_ue_light_object_properties(light_obj)
-
     parent_collection.objects.link(light_obj)
     return light_obj
 
@@ -536,66 +423,30 @@ def create_spot_light_from_entry(
     attenuation_radius_mult: float,
     attach_parent_obj: bpy.types.Object | None = None,
 ):
-    """
-    Create a Blender spot light from a UE SpotLightComponent JSON entry.
-    """
     props = entry.get("Properties", {})
-
-    if "Intensity" in props:
-        raw_intensity = props.get("Intensity", 0.0)
-    else:
-        raw_intensity = entry.get("IntensityNits", 0.0)
-
-    intensity = _float_or_default(raw_intensity)
-    energy = intensity * exposure_mult
-
     light_name = _resolve_light_name(entry, "SpotLight")
     light_data = lights.create_static_light_data(
-        light_name,
-        "SPOT",
-        {**entry, **props},
+        light_name, "SPOT", {**entry, **props},
         location_scale=location_scale,
         exposure_mult=exposure_mult,
         attenuation_radius_mult=attenuation_radius_mult,
     )
-    energy = light_data.energy
-    r, g, b = light_data.color
-
     loc_dict = props.get("RelativeLocation", entry.get("RelativeLocation", {}))
     rot_dict = props.get("RelativeRotation", entry.get("RelativeRotation", {}))
-
     loc = location_from_relative(loc_dict, scale_factor=location_scale)
     rot = light_rotation_from_relative(rot_dict)
-
     light_obj = bpy.data.objects.new(light_name, light_data)
     if attach_parent_obj is not None:
         light_obj.parent = attach_parent_obj
     light_obj.location = loc
     light_obj.rotation_euler = rot
     lights.apply_ue_light_object_properties(light_obj)
-
     parent_collection.objects.link(light_obj)
     return light_obj
 
 
 def extract_skeletal_mesh_name(entry: dict) -> tuple[str | None, str | None]:
-    """
-    Extract the asset-lookup name and the template object path from an
-    EndSkeletalMeshComponent entry.
-
-    Asset lookup is derived from Template.ObjectPath, e.g.:
-      "/Game/BluePrint/Character/Environment/BG0215_00_Switch_Standard.2"
-    We take the last path segment before the dot-index:
-      "BG0215_00_Switch_Standard"
-    That is passed to the asset library lookup.
-
-    The raw Template.ObjectPath string is also returned so callers can store
-    it as a custom property on the created object.
-
-    Returns:
-        (asset_name, template_object_path)
-        Either or both may be None if the data is absent.
-    """
+    """Return (asset_name, template_object_path) from an EndSkeletalMeshComponent entry."""
     template = entry.get("Template", {})
     if not isinstance(template, dict):
         return None, None
@@ -604,36 +455,22 @@ def extract_skeletal_mesh_name(entry: dict) -> tuple[str | None, str | None]:
     if not obj_path:
         return None, None
 
-    # "/Game/.../BG0215_00_Switch_Standard.2"  ->  "BG0215_00_Switch_Standard"
-    last_segment = obj_path.rstrip("/").rsplit("/", 1)[-1]  # "BG0215_00_Switch_Standard.2"
-    asset_name = last_segment.split(".")[0] or None           # "BG0215_00_Switch_Standard"
+    last_segment = obj_path.rstrip("/").rsplit("/", 1)[-1]
+    asset_name = last_segment.split(".")[0] or None
 
     return asset_name or None, obj_path
 
 
 def _resolve_outer_name(entry: dict) -> str:
-    """
-    Return a human-readable actor name from the "Outer" field, which may be
-    a plain string or a dict depending on the source JSON.
-    """
     outer_raw = entry.get("Outer", "")
     if isinstance(outer_raw, dict):
         obj_name = outer_raw.get("ObjectName", "")
-        # "ClassName'Path:PersistentLevel.ActorName'" -> "ActorName"
         name = obj_name.rsplit(".", 1)[-1].rstrip("'").strip()
         return name
     return outer_raw.strip()
 
 
 def _object_reference_keys(ref: dict) -> set[str]:
-    """
-    Return stable lookup keys for an Unreal object reference dict.
-
-    FModel references often include both a full ObjectName and an ObjectPath;
-    the ObjectName is the useful one for matching component attachments, but
-    shorter PersistentLevel/actor.component suffixes make constructed keys
-    resilient to class-name differences.
-    """
     keys: set[str] = set()
     if not isinstance(ref, dict):
         return keys
@@ -654,12 +491,7 @@ def _object_reference_keys(ref: dict) -> set[str]:
 
 
 def _object_reference_lookup_keys(ref: dict) -> list[str]:
-    """
-    Return AttachParent lookup keys in priority order.
-
-    Exact Unreal references are tried first; XENGINE__ aliases are only
-    fallback keys so they cannot shadow a more precise component match.
-    """
+    """Return AttachParent lookup keys with exact UE refs first, XENGINE__ aliases as fallback."""
     exact_keys: list[str] = []
     alias_keys: list[str] = []
 
@@ -692,13 +524,7 @@ def _object_reference_lookup_keys(ref: dict) -> list[str]:
 
 
 def _xengine_reference_aliases(key: str) -> set[str]:
-    """
-    Return lookup aliases with an XENGINE__ actor prefix stripped.
-
-    Some map exports attach lights to paths like
-    ``PersistentLevel.XENGINE__Light_Wall_06A139.StaticMeshComponent0`` even
-    when the useful actor identity is the unprefixed ``Light_Wall_06A139``.
-    """
+    """Return lookup aliases with the XENGINE__ actor prefix stripped."""
     aliases: set[str] = set()
     if not isinstance(key, str) or "XENGINE__" not in key:
         return aliases
@@ -727,7 +553,6 @@ def _xengine_reference_aliases(key: str) -> set[str]:
 
 
 def _add_reference_key_with_aliases(keys: set[str], key: str):
-    """Add a reference key plus normalized aliases used for loose matching."""
     if not key:
         return
     keys.add(key)
@@ -735,10 +560,6 @@ def _add_reference_key_with_aliases(keys: set[str], key: str):
 
 
 def _entry_component_reference_keys(entry: dict) -> set[str]:
-    """
-    Build lookup keys for a component entry so AttachParent can find the
-    Blender object created for that component later in the same JSON file.
-    """
     keys: set[str] = set()
     component_name = entry.get("Name")
     outer = entry.get("Outer", {})
@@ -926,19 +747,7 @@ def apply_deferred_object_parent(
 
 
 def outer_to_instance_name(outer_name: str, asset_name: str) -> str:
-    """
-    Convert a UE actor name into a Blender-style name that preserves the
-    instance number as a dot-suffix.
-
-    UE appends ``_N`` when placing duplicate actors, e.g.:
-      outer_name = "BG0522_00_Monitor_Standard_2"
-      asset_name = "BG0522_00_Monitor_Standard"
-      -> "BG0522_00_Monitor_Standard.2"
-
-    When the outer name starts with the asset name but the remainder is not
-    a plain ``_N`` pattern (e.g. "Standard2_2" after partial stripping),
-    the outer name is returned unchanged so that uniqueness is still kept.
-    """
+    """Convert UE duplicate-suffix ``_N`` to Blender dot-suffix ``.N`` (e.g. ``Mesh_2`` -> ``Mesh.2``)."""
     if asset_name and outer_name.startswith(asset_name):
         remainder = outer_name[len(asset_name):]
         m = re.match(r"^_(\d+)$", remainder)
@@ -953,7 +762,6 @@ def create_mesh_empty(
     rot: "Euler",
     parent_collection: "bpy.types.Collection",
 ):
-    """Create and link a PLAIN_AXES empty with the given transform."""
     obj = bpy.data.objects.new(name, None)
     obj.empty_display_type = "PLAIN_AXES"
     obj.empty_display_size = 1.0
@@ -964,12 +772,7 @@ def create_mesh_empty(
 
 
 def resolve_game_asset_file_path(asset_path_name: str, game_root: str, extension: str) -> str | None:
-    """
-    Convert an Unreal asset path like:
-      "/Game/Level/Game/Field/.../Name.Name"
-    into a local exported file path:
-      "<game_root>/Level/Game/Field/.../Name.<extension>"
-    """
+    """Map a /Game/... asset path to a local file path under game_root."""
     if not game_root or not asset_path_name:
         return None
 
@@ -986,9 +789,6 @@ def resolve_game_asset_file_path(asset_path_name: str, game_root: str, extension
 
 
 def resolve_streaming_level_json_path(asset_path_name: str, game_root: str) -> str | None:
-    """
-    Convert an Unreal asset path into the matching exported JSON path.
-    """
     return resolve_game_asset_file_path(asset_path_name, game_root, ".json")
 
 
@@ -1006,13 +806,7 @@ def is_path_in_or_beneath(path: str, root_dir: str) -> bool:
 
 
 def collect_level_streaming_asset_paths(data: list) -> list[str]:
-    """
-    Return the JSON asset paths referenced by LevelStreaming entries.
-
-    These are the world's direct streaming-level records. EndStreamingVolume
-    actors are trigger volumes and often point at adjacent/event maps, so they
-    are used only as a fallback when these entries are absent.
-    """
+    """Return asset paths from LevelStreamingAlwaysLoaded/Dynamic entries (preferred over EndStreamingVolume)."""
     asset_paths: list[str] = []
     seen: set[str] = set()
 
@@ -1039,7 +833,6 @@ def collect_level_streaming_asset_paths(data: list) -> list[str]:
 
 
 def collect_volume_streaming_asset_paths(data: list) -> list[str]:
-    """Return streaming level paths referenced by EndStreamingVolume triggers."""
     asset_paths: list[str] = []
     seen: set[str] = set()
 
@@ -1078,6 +871,7 @@ def import_streaming_asset_paths(
     recursive_root_dir: str,
     import_massive_environment_umaps: bool,
     imported_umap_paths: set[str],
+    texture_index_cache: TextureIndexCache | None = None,
 ) -> tuple[int, set[str]]:
     """Resolve streaming asset paths to JSON files and import them."""
     created_count = 0
@@ -1114,6 +908,7 @@ def import_streaming_asset_paths(
             recursive_root_dir=recursive_root_dir,
             import_massive_environment_umaps=import_massive_environment_umaps,
             imported_umap_paths=imported_umap_paths,
+            texture_index_cache=texture_index_cache,
         )
         print(f"[End JSON Import]     Streaming level done - {child_created} item(s) created, {len(child_missing)} missing.")
         created_count += child_created
@@ -1123,15 +918,7 @@ def import_streaming_asset_paths(
 
 
 def resolve_massive_environment_umap_path(entry: dict, game_root: str) -> str | None:
-    """
-    Convert a MassiveEnvironmentComponent's StreamingProxy path into a .umap path.
-
-    The owning MassiveEnvironmentActor is a higher-level wrapper. The
-    StreamingProxy points at the actual level package, e.g.:
-      /Game/Level/Game/Field/1110-KALMT/Layout/1110-KALMT_Terrain_Strip.135
-    which resolves to:
-      <game_root>/Level/Game/Field/1110-KALMT/Layout/1110-KALMT_Terrain_Strip.umap
-    """
+    """Resolve a MassiveEnvironmentComponent StreamingProxy ObjectPath to a local .umap path."""
     props = entry.get("Properties", {})
     if not isinstance(props, dict):
         return None
@@ -1145,7 +932,6 @@ def resolve_massive_environment_umap_path(entry: dict, game_root: str) -> str | 
 
 
 def get_umap_import_function():
-    """Return the bundled Massive Environment .umap import function."""
     try:
         importer_module = importlib.import_module(f"{__package__}.mec.importer")
     except Exception as exc:
@@ -1167,13 +953,8 @@ def import_massive_environment_umap(
     entry: dict,
     game_root: str,
     imported_umap_paths: set[str],
+    texture_index_cache: TextureIndexCache | None = None,
 ) -> tuple[int, int, set[str]]:
-    """
-    Import the .umap referenced by a MassiveEnvironmentComponent, if possible.
-
-    Returns:
-        (processed, skipped, missing_assets)
-    """
     if not game_root:
         print("[End JSON Import]   MassiveEnvironmentComponent found but Game Root is not set - skipping .umap import.")
         return 0, 1, set()
@@ -1207,6 +988,7 @@ def import_massive_environment_umap(
             lod_mode="LEVEL",
             lod_level=0,
             scale_factor=0.01,
+            texture_index_cache=texture_index_cache,
         )
         return processed, skipped, set()
     except Exception as exc:
@@ -1215,10 +997,6 @@ def import_massive_environment_umap(
 
 
 def find_bone_by_socket_name(armature_obj: bpy.types.Object, socket_name: str):
-    """
-    Search the pose bones of *armature_obj* for one whose custom property
-    'SocketName' equals *socket_name*.  Returns the bone name string, or None.
-    """
     if armature_obj is None or armature_obj.type != "ARMATURE":
         return None
     for bone in armature_obj.pose.bones:
@@ -1228,79 +1006,34 @@ def find_bone_by_socket_name(armature_obj: bpy.types.Object, socket_name: str):
 
 
 def make_library_override_for_instance(instance_obj: bpy.types.Object) -> bpy.types.Object | None:
-    """
-    If *instance_obj* is a linked collection instance whose collection still
-    lives in a library, create a library override for the collection's *content*
-    so that every object inside the hierarchy becomes an individually addressable
-    local override object.
-
-    This is the Python equivalent of:
-        Library Override > Make > Content
-    in the Blender UI (right-click on the instance in the Outliner).
-
-    ``ID.override_hierarchy_create`` creates local override copies of the
-    collection AND all objects within it, making them reachable via
-    ``instance_obj.children_recursive``, selectable in the viewport, and
-    usable for bone parenting - unlike ``bpy.ops.object.make_override_library``
-    which only overrides the instance empty itself and leaves the interior
-    objects as unaddressable linked data.
-
-    Returns *instance_obj* (with its instance_collection updated to the new
-    local override collection), or *instance_obj* unchanged if the override
-    cannot be created.
-    """
+    """Create a library content override for a linked collection instance (equivalent to Library Override > Make > Content)."""
     col = instance_obj.instance_collection
     if col is None or col.library is None:
-        # Already local or not a linked collection - nothing to do.
         return instance_obj
 
     try:
         scene = bpy.context.scene
         view_layer = bpy.context.view_layer
-
-        # override_hierarchy_create is the direct Python equivalent of
-        # "Library Override > Make > Content": it produces local override
-        # copies of the collection and every object in its hierarchy.
-        override_col = col.override_hierarchy_create(
-            scene=scene,
-            view_layer=view_layer,
-        )
+        override_col = col.override_hierarchy_create(scene=scene, view_layer=view_layer)
 
         if override_col is not None:
-            # Redirect the instance empty to the new local collection so that
-            # children_recursive is populated with the override objects.
             instance_obj.instance_collection = override_col
-            # Flush the depsgraph so children_recursive reflects the new state.
             view_layer.update()
-            print(
-                f"[End JSON Import]   Library override (content) created for "
-                f"'{instance_obj.name}' -> collection '{override_col.name}'."
-            )
+            print(f"[End JSON Import]   Library override created for '{instance_obj.name}' -> '{override_col.name}'.")
         else:
-            print(
-                f"[End JSON Import]   override_hierarchy_create returned None for "
-                f"'{instance_obj.name}' - override may already exist or collection "
-                f"cannot be overridden."
-            )
+            print(f"[End JSON Import]   override_hierarchy_create returned None for '{instance_obj.name}'.")
 
         return instance_obj
 
     except Exception as exc:
-        print(
-            f"[End JSON Import]   Could not make library override for "
-            f"'{instance_obj.name}': {exc}"
-        )
+        print(f"[End JSON Import]   Could not make library override for '{instance_obj.name}': {exc}")
         return instance_obj
 
 
 def ensure_overrideable_collection_instance(
     instance_obj: bpy.types.Object,
+    parent_collection: bpy.types.Collection | None = None,
 ) -> bpy.types.Object | None:
-    """
-    Resolve a skeletal actor wrapper to its collection-instance child and
-    create a local content override when the linked collection still comes
-    from a library.
-    """
     target_instance = instance_obj
     if (
         target_instance is not None
@@ -1346,6 +1079,9 @@ def ensure_overrideable_collection_instance(
         view_layer.update()
 
         active_collection = target_instance.instance_collection
+        if active_collection is not None and parent_collection is not None:
+            file_collection_under_import_type(active_collection, parent_collection)
+
         if active_collection is not None and active_collection.library is None:
             print(
                 f"[End JSON Import]   Library override (content) created for "
@@ -1370,193 +1106,75 @@ def ensure_overrideable_collection_instance(
 def ensure_top_level_object_overrides(
     instance_obj: bpy.types.Object,
 ):
-    """
-    Force local overrides for top-level objects in an overridden collection.
-
-    Blender 5 can leave the collection override visible while the root objects
-    themselves are still linked, which blocks adding constraints directly to
-    those objects.
-    """
+    """Force local overrides for root objects in an overridden collection (needed for Blender 5 constraint targets)."""
     if instance_obj is None:
-        print("[End JSON Import]   Top-level override pass skipped: instance_obj is None.")
         return
 
     override_collection = instance_obj.instance_collection
     if override_collection is None or override_collection.library is not None:
-        print(
-            f"[End JSON Import]   Top-level override pass skipped for "
-            f"'{getattr(instance_obj, 'name', '<unknown>')}': no local override collection."
-        )
         return
-
-    if VERBOSE_OVERRIDE_LOGGING:
-        print(
-            f"[End JSON Import]   Forcing top-level object overrides for collection "
-            f"'{override_collection.name}' via instance '{instance_obj.name}'."
-        )
 
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
     overridden_count = 0
-    skipped_parented = 0
-    skipped_override = 0
-    skipped_local = 0
     failed_names: list[str] = []
 
     for obj in list(override_collection.objects):
-        if obj.parent is not None:
-            skipped_parented += 1
-            if VERBOSE_OVERRIDE_LOGGING:
-                print(
-                    f"[End JSON Import]     Skipping top-level override for '{obj.name}': "
-                    f"already parented to '{obj.parent.name}'."
-                )
-            continue
-        if obj.override_library is not None:
-            skipped_override += 1
-            if VERBOSE_OVERRIDE_LOGGING:
-                print(
-                    f"[End JSON Import]     Skipping top-level override for '{obj.name}': "
-                    f"object is already an override."
-                )
-            continue
-        if obj.library is None:
-            skipped_local += 1
-            if VERBOSE_OVERRIDE_LOGGING:
-                print(
-                    f"[End JSON Import]     Skipping top-level override for '{obj.name}': "
-                    f"object is already local."
-                )
+        if obj.parent is not None or obj.override_library is not None or obj.library is None:
             continue
 
         override_obj = None
         try:
             override_obj = obj.override_create(remap_local_usages=True)
         except Exception:
-            override_obj = None
+            pass
 
         if override_obj is None:
             try:
-                override_obj = obj.override_hierarchy_create(
-                    scene=scene,
-                    view_layer=view_layer,
-                )
+                override_obj = obj.override_hierarchy_create(scene=scene, view_layer=view_layer)
             except Exception:
-                override_obj = None
+                pass
 
         if isinstance(override_obj, bpy.types.Object):
             overridden_count += 1
-            if VERBOSE_OVERRIDE_LOGGING:
-                print(
-                    f"[End JSON Import]     Created object override for '{obj.name}' "
-                    f"-> '{override_obj.name}'."
-                )
         else:
             failed_names.append(obj.name)
 
     if overridden_count:
         view_layer.update()
-        print(
-            f"[End JSON Import]   Forced object overrides for {overridden_count} "
-            f"top-level collection object(s) in '{override_collection.name}'."
-        )
-    elif VERBOSE_OVERRIDE_LOGGING:
-        print(
-            f"[End JSON Import]   No new top-level object overrides were created for "
-            f"'{override_collection.name}'."
-        )
+        print(f"[End JSON Import]   Forced {overridden_count} top-level object override(s) in '{override_collection.name}'.")
 
     if failed_names:
         preview = ", ".join(failed_names[:5])
         suffix = "" if len(failed_names) <= 5 else f", +{len(failed_names) - 5} more"
-        print(
-            f"[End JSON Import]   Failed to create {len(failed_names)} top-level "
-            f"object override(s) in '{override_collection.name}': {preview}{suffix}."
-        )
-    elif VERBOSE_OVERRIDE_LOGGING and (skipped_parented or skipped_override or skipped_local):
-        print(
-            f"[End JSON Import]   Top-level override skipped existing objects in "
-            f"'{override_collection.name}' "
-            f"(parented={skipped_parented}, overrides={skipped_override}, local={skipped_local})."
-        )
+        print(f"[End JSON Import]   Failed to override {len(failed_names)} object(s) in '{override_collection.name}': {preview}{suffix}.")
 
 
 def parent_override_roots_to_wrapper(
     wrapper_obj: bpy.types.Object,
     instance_obj: bpy.types.Object,
 ):
-    """
-    Parent top-level overridden collection objects to the wrapper empty and
-    clear their local transforms so the wrapper carries actor placement.
-    """
     if wrapper_obj is None or instance_obj is None:
-        print("[End JSON Import]   Wrapper parenting skipped: wrapper or instance is None.")
         return
 
     override_collection = instance_obj.instance_collection
     if override_collection is None or override_collection.library is not None:
-        print(
-            f"[End JSON Import]   Wrapper parenting skipped for "
-            f"'{getattr(wrapper_obj, 'name', '<unknown>')}': no local override collection."
-        )
         return
 
-    if VERBOSE_OVERRIDE_LOGGING:
-        print(
-            f"[End JSON Import]   Parenting override roots from collection "
-            f"'{override_collection.name}' under wrapper '{wrapper_obj.name}'."
-        )
-
     reparented_count = 0
-    skipped_helpers = 0
-    skipped_parented = 0
     for obj in override_collection.objects:
-        if obj == wrapper_obj or obj == instance_obj:
-            skipped_helpers += 1
-            if VERBOSE_OVERRIDE_LOGGING:
-                print(
-                    f"[End JSON Import]     Skipping '{obj.name}' during wrapper parenting: "
-                    f"wrapper/instance helper object."
-                )
+        if obj == wrapper_obj or obj == instance_obj or obj.parent is not None:
             continue
-        if obj.parent is not None:
-            skipped_parented += 1
-            if VERBOSE_OVERRIDE_LOGGING:
-                print(
-                    f"[End JSON Import]     Skipping '{obj.name}' during wrapper parenting: "
-                    f"already parented to '{obj.parent.name}'."
-                )
-            continue
-
         obj.parent = wrapper_obj
         obj.location = Vector((0.0, 0.0, 0.0))
         obj.rotation_euler = Euler((0.0, 0.0, 0.0), "XYZ")
         obj.scale = Vector((1.0, 1.0, 1.0))
         reparented_count += 1
-        if VERBOSE_OVERRIDE_LOGGING:
-            print(
-                f"[End JSON Import]     Parented '{obj.name}' to '{wrapper_obj.name}' "
-                f"and cleared local transforms."
-            )
 
     if reparented_count:
-        print(
-            f"[End JSON Import]   Parented {reparented_count} top-level override object(s) "
-            f"under '{wrapper_obj.name}'."
-        )
-    elif VERBOSE_OVERRIDE_LOGGING:
-        print(
-            f"[End JSON Import]   No override roots needed parenting under "
-            f"'{wrapper_obj.name}' (helper={skipped_helpers}, already_parented={skipped_parented})."
-        )
+        print(f"[End JSON Import]   Parented {reparented_count} override object(s) under '{wrapper_obj.name}'.")
 
-    instance_name = instance_obj.name
     bpy.data.objects.remove(instance_obj, do_unlink=True)
-    if VERBOSE_OVERRIDE_LOGGING:
-        print(
-            f"[End JSON Import]   Removed temporary collection instance "
-            f"'{instance_name}' after override expansion."
-        )
 
 
 def _strip_blender_numeric_suffix(name: str) -> str:
@@ -1570,30 +1188,12 @@ def find_attach_socket_empty(
     actor_obj: bpy.types.Object,
     socket_name: str,
 ) -> bpy.types.Object | None:
-    """
-    Search the descendants of *actor_obj* for an empty whose name ends with
-    *socket_name*.
-    """
     if actor_obj is None or not socket_name:
-        print("[End JSON Import]   Socket search skipped: actor_obj missing or socket_name empty.")
         return None
-
-    print(
-        f"[End JSON Import]   Searching descendants of '{actor_obj.name}' "
-        f"for socket empty ending with '{socket_name}'."
-    )
     for child in actor_obj.children_recursive:
         child_name = _strip_blender_numeric_suffix(child.name)
         if child.type == "EMPTY" and child_name.endswith(socket_name):
-            print(
-                f"[End JSON Import]   Found socket empty '{child.name}' "
-                f"under '{actor_obj.name}'."
-            )
             return child
-    print(
-        f"[End JSON Import]   No socket empty ending with '{socket_name}' found under "
-        f"'{actor_obj.name}'."
-    )
     return None
 
 
@@ -1602,9 +1202,6 @@ def add_child_of_constraint(
     target_obj: bpy.types.Object,
     socket_name: str,
 ):
-    """
-    Add or reuse a Child Of constraint targeting *target_obj* on *child_obj*.
-    """
     if child_obj is None or target_obj is None:
         return
 
@@ -1618,80 +1215,39 @@ def add_child_of_constraint(
     constraint.subtarget = ""
     constraint.inverse_matrix = Matrix.Identity(4)
 
-    print(
-        f"[End JSON Import]   Added Child Of constraint '{constraint.name}' "
-        f"on '{child_obj.name}' targeting '{target_obj.name}'."
-    )
-
 
 def try_attach_to_socket_empty(
     child_obj: bpy.types.Object,
     props: dict,
     socket_name: str,
 ) -> bool:
-    """
-    Try to attach *child_obj* to a descendant empty of the target skeletal
-    actor whose name ends with *socket_name*.
-    """
     attach_actor_name = _resolve_attach_parent_name(props)
     if not attach_actor_name:
-        print(
-            f"[End JSON Import]   Socket attach skipped for '{child_obj.name}': "
-            f"AttachParent could not be resolved."
-        )
         return False
 
     target_actor = bpy.data.objects.get(attach_actor_name)
     if target_actor is None:
-        print(
-            f"[End JSON Import]   Socket attach skipped for '{child_obj.name}': "
-            f"target actor '{attach_actor_name}' not found."
-        )
         return False
 
-    print(
-        f"[End JSON Import]   Attempting socket-empty attach for '{child_obj.name}' "
-        f"to actor '{target_actor.name}' socket '{socket_name}'."
-    )
     ensure_overrideable_collection_instance(target_actor)
     socket_obj = find_attach_socket_empty(target_actor, socket_name)
     if socket_obj is None:
-        print(
-            f"[End JSON Import]   Socket-empty attach failed for '{child_obj.name}': "
-            f"no matching socket empty found."
-        )
         return False
 
     add_child_of_constraint(child_obj, socket_obj, socket_name)
-    print(
-        f"[End JSON Import]   Socket-empty attach succeeded for '{child_obj.name}' "
-        f"using '{socket_obj.name}'."
-    )
     return True
 
 
 def _resolve_attach_parent_name(props: dict) -> str | None:
-    """
-    Pull the actor instance name out of Properties.AttachParent.ObjectName.
-
-    Example ObjectName value:
-      "EndSkeletalMeshComponent'2350-GOLDS_Gimmick:PersistentLevel.BG1017_00_FerrisWheel_Standard_4.SkeletalMeshComponent0'"
-    We want:
-      "BG1017_00_FerrisWheel_Standard_4"
-    i.e. the part after "PersistentLevel." and before the next ".".
-    """
     attach_parent = props.get("AttachParent", {})
     if not isinstance(attach_parent, dict):
         return None
     obj_name = attach_parent.get("ObjectName", "")
     if not obj_name:
         return None
-    # "SomeClass'Level:PersistentLevel.ActorName.ComponentName'"
     if "PersistentLevel." in obj_name:
         after = obj_name.split("PersistentLevel.", 1)[1]
-        actor_and_rest = after.split(".")[0]
-        return actor_and_rest.rstrip("'") or None
-    # Fallback: last dotted segment stripped of quotes
+        return after.split(".")[0].rstrip("'") or None
     return obj_name.rsplit(".", 1)[-1].strip("'") or None
 
 
@@ -1700,17 +1256,9 @@ def parent_to_bone(
     armature_obj: bpy.types.Object,
     bone_name: str,
 ):
-    """
-    Parent *child_obj* to *bone_name* on *armature_obj* using 'BONE' parenting
-    without clearing the child's existing transform.
-    """
     child_obj.parent = armature_obj
     child_obj.parent_type = "BONE"
     child_obj.parent_bone = bone_name
-    print(
-        f"[End JSON Import]   Parented '{child_obj.name}' to bone '{bone_name}' "
-        f"on armature '{armature_obj.name}'."
-    )
 
 
 def process_deferred_attach(
@@ -1719,76 +1267,41 @@ def process_deferred_attach(
     attach_socket: str,
     location_scale: float,
 ):
-    """
-    Resolve AttachSocketName after all objects for the file have been created.
-    """
-    print(
-        f"[End JSON Import]   Processing deferred attach for '{child_obj.name}' "
-        f"socket '{attach_socket}'."
-    )
-
     if try_attach_to_socket_empty(child_obj, props, attach_socket):
         return
 
     attach_actor_name = _resolve_attach_parent_name(props)
-    if attach_actor_name:
-        target_instance = bpy.data.objects.get(attach_actor_name)
-        if target_instance is None:
-            print(
-                f"[End JSON Import]   AttachSocketName '{attach_socket}': "
-                f"parent actor '{attach_actor_name}' not found in scene - skipping bone parent."
-            )
-        else:
-            # Ensure the target collection instance has a library
-            # override so its armature is accessible.
-            target_instance = ensure_overrideable_collection_instance(target_instance)
+    if not attach_actor_name:
+        return
 
-            # Find the armature object inside the override hierarchy.
-            armature_obj = None
-            # The override may itself be an armature, or contain one
-            # as a child.
-            if target_instance.type == "ARMATURE":
-                armature_obj = target_instance
-            else:
-                for child in target_instance.children_recursive:
-                    if child.type == "ARMATURE":
-                        armature_obj = child
-                        break
+    target_instance = bpy.data.objects.get(attach_actor_name)
+    if target_instance is None:
+        print(f"[End JSON Import]   AttachSocketName '{attach_socket}': parent '{attach_actor_name}' not found.")
+        return
 
-            if armature_obj is None:
-                print(
-                    f"[End JSON Import]   AttachSocketName '{attach_socket}': "
-                    f"no armature found under '{target_instance.name}' - skipping bone parent."
-                )
-                apply_deferred_object_parent(child_obj, props, target_instance, location_scale)
-                print(
-                    f"[End JSON Import]   Attached '{child_obj.name}' to "
-                    f"'{target_instance.name}' as fallback parent."
-                )
-            else:
-                bone_name = find_bone_by_socket_name(armature_obj, attach_socket)
-                if bone_name:
-                    parent_to_bone(child_obj, armature_obj, bone_name)
-                else:
-                    print(
-                        f"[End JSON Import]   AttachSocketName '{attach_socket}': "
-                        f"no bone with SocketName='{attach_socket}' found on "
-                        f"'{armature_obj.name}' - skipping bone parent."
-                    )
-                    apply_deferred_object_parent(child_obj, props, target_instance, location_scale)
-                    print(
-                        f"[End JSON Import]   Attached '{child_obj.name}' to "
-                        f"'{target_instance.name}' as fallback parent."
-                    )
+    target_instance = ensure_overrideable_collection_instance(target_instance)
+
+    armature_obj = None
+    if target_instance.type == "ARMATURE":
+        armature_obj = target_instance
     else:
-        print(
-            f"[End JSON Import]   AttachSocketName '{attach_socket}' present but "
-            f"AttachParent could not be resolved - skipping bone parent."
-        )
+        for child in target_instance.children_recursive:
+            if child.type == "ARMATURE":
+                armature_obj = child
+                break
+
+    if armature_obj is None:
+        apply_deferred_object_parent(child_obj, props, target_instance, location_scale)
+        return
+
+    bone_name = find_bone_by_socket_name(armature_obj, attach_socket)
+    if bone_name:
+        parent_to_bone(child_obj, armature_obj, bone_name)
+    else:
+        apply_deferred_object_parent(child_obj, props, target_instance, location_scale)
 
 
 def collect_asset_names_for_import(data: list) -> tuple[set[str], set[str]]:
-    """Return unique static-mesh and skeletal-mesh asset names referenced by a JSON export."""
     static_asset_names: set[str] = set()
     skeletal_asset_names: set[str] = set()
 
@@ -1823,13 +1336,8 @@ def import_json_file(
     recursive_root_dir: str | None = None,
     import_massive_environment_umaps: bool = True,
     imported_umap_paths: set[str] | None = None,
+    texture_index_cache: TextureIndexCache | None = None,
 ) -> tuple[int, set[str]]:
-    """
-    Import one JSON environment file (recursively, via streaming volumes).
-
-    Returns:
-        (created_count, missing_assets)
-    """
     filepath = os.path.realpath(filepath)
     if recursive_root_dir is None:
         recursive_root_dir = os.path.dirname(filepath)
@@ -1842,6 +1350,8 @@ def import_json_file(
     visited_paths.add(filepath)
     if imported_umap_paths is None:
         imported_umap_paths = set()
+    if texture_index_cache is None:
+        texture_index_cache = {}
 
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Invalid file path: {filepath}")
@@ -1874,14 +1384,12 @@ def import_json_file(
         for asset_name in skeletal_asset_names
     }
 
-    # Parent collection is created on demand, only if we actually add objects.
     parent_collection = None
 
     def ensure_root_collection() -> bpy.types.Collection:
         nonlocal parent_collection
         if parent_collection is None:
             parent_collection = ensure_parent_collection_for_file(filepath)
-            remove_linked_assets_scene_branch(parent_collection)
         return parent_collection
 
     def ensure_static_collection() -> bpy.types.Collection:
@@ -1889,6 +1397,9 @@ def import_json_file(
 
     def ensure_skeletal_collection() -> bpy.types.Collection:
         return ensure_typed_import_collection(ensure_root_collection(), "_Skeletal")
+
+    def ensure_lights_collection() -> bpy.types.Collection:
+        return ensure_typed_import_collection(ensure_root_collection(), "_Lights")
 
     created_count = 0
     missing_assets: set[str] = set()
@@ -1901,7 +1412,7 @@ def import_json_file(
     material_targets: dict[int, bpy.types.Object] = {}
     pending_material_parameter_lights: list[dict] = []
     pending_vector_parameters: list[tuple[int, dict]] = []
-    location_scale = 0.01  # UE units -> Blender (cm -> m)
+    location_scale = 0.01
 
     level_streaming_asset_paths = collect_level_streaming_asset_paths(data)
     use_volume_streaming_fallback = not level_streaming_asset_paths
@@ -1922,6 +1433,7 @@ def import_json_file(
                 recursive_root_dir=recursive_root_dir,
                 import_massive_environment_umaps=import_massive_environment_umaps,
                 imported_umap_paths=imported_umap_paths,
+                texture_index_cache=texture_index_cache,
             )
             created_count += child_created
             missing_assets |= child_missing
@@ -1932,9 +1444,6 @@ def import_json_file(
 
         t = entry.get("Type")
 
-        # ------------------------------------------------------------------ #
-        # Static mesh components -> collection instances (empty fallback)
-        # ------------------------------------------------------------------ #
         if t in {"EndEnvironmentStaticMeshComponent", "StaticMeshComponent"}:
             props = entry.get("Properties", {})
             static_mesh = props.get("StaticMesh", {})
@@ -1959,16 +1468,20 @@ def import_json_file(
             if asset is not None:
                 if asset.kind == "COLLECTION":
                     collection = asset.datablock
-                    file_source_collection_under_import_type(collection, static_collection)
+                    file_collection_under_import_type(collection, static_collection)
                     if attach_socket:
-                        new_obj, instance_obj = create_wrapped_collection_instance(
-                            collection=collection,
-                            name=attach_name,
-                            location=loc,
-                            rotation_euler=rot,
-                            parent_collection=static_collection,
-                        )
-                        instance_obj = ensure_overrideable_collection_instance(instance_obj)
+                        with _scene_link_collection(collection, static_collection):
+                            new_obj, instance_obj = create_wrapped_collection_instance(
+                                collection=collection,
+                                name=attach_name,
+                                location=loc,
+                                rotation_euler=rot,
+                                parent_collection=static_collection,
+                            )
+                            instance_obj = ensure_overrideable_collection_instance(
+                                instance_obj,
+                                static_collection,
+                            )
                         ensure_top_level_object_overrides(instance_obj)
                         parent_override_roots_to_wrapper(new_obj, instance_obj)
                     else:
@@ -1998,10 +1511,6 @@ def import_json_file(
 
             if attach_socket:
                 pending_attaches.append((new_obj, props, attach_socket))
-                print(
-                    f"[End JSON Import]   Deferred attach for '{new_obj.name}' "
-                    f"socket '{attach_socket}' until all file objects are imported."
-                )
                 attach_socket = None
 
             register_component_object(component_objects, entry, new_obj)
@@ -2029,58 +1538,8 @@ def import_json_file(
             # AttachSocketName -> prefer a matching socket empty under the
             # target skeletal actor, with the old bone path as fallback.
             # -------------------------------------------------------------- #
-            if attach_socket and not try_attach_to_socket_empty(new_obj, props, attach_socket):
-                attach_actor_name = _resolve_attach_parent_name(props)
-                if attach_actor_name:
-                    target_instance = bpy.data.objects.get(attach_actor_name)
-                    if target_instance is None:
-                        print(
-                            f"[End JSON Import]   AttachSocketName '{attach_socket}': "
-                            f"parent actor '{attach_actor_name}' not found in scene - skipping bone parent."
-                        )
-                    else:
-                        # Ensure the target collection instance has a library
-                        # override so its armature is accessible.
-                        target_instance = ensure_overrideable_collection_instance(target_instance)
-
-                        # Find the armature object inside the override hierarchy.
-                        armature_obj = None
-                        # The override may itself be an armature, or contain one
-                        # as a child.
-                        if target_instance.type == "ARMATURE":
-                            armature_obj = target_instance
-                        else:
-                            for child in target_instance.children_recursive:
-                                if child.type == "ARMATURE":
-                                    armature_obj = child
-                                    break
-
-                        if armature_obj is None:
-                            print(
-                                f"[End JSON Import]   AttachSocketName '{attach_socket}': "
-                                f"no armature found under '{target_instance.name}' - skipping bone parent."
-                            )
-                        else:
-                            bone_name = find_bone_by_socket_name(armature_obj, attach_socket)
-                            if bone_name:
-                                parent_to_bone(new_obj, armature_obj, bone_name)
-                            else:
-                                print(
-                                    f"[End JSON Import]   AttachSocketName '{attach_socket}': "
-                                    f"no bone with SocketName='{attach_socket}' found on "
-                                    f"'{armature_obj.name}' - skipping bone parent."
-                                )
-                else:
-                    print(
-                        f"[End JSON Import]   AttachSocketName '{attach_socket}' present but "
-                        f"AttachParent could not be resolved - skipping bone parent."
-                    )
-
             created_count += 1
 
-        # ------------------------------------------------------------------ #
-        # Skeletal mesh components -> collection instance, empty fallback
-        # ------------------------------------------------------------------ #
         elif t == "EndSkeletalMeshComponent":
             skeletal_collection = ensure_skeletal_collection()
 
@@ -2090,41 +1549,38 @@ def import_json_file(
             loc = location_from_relative(loc_dict, scale_factor=location_scale)
             rot = rotation_from_relative(rot_dict)
 
-            # asset_name: bare mesh name derived from Template.ObjectPath for
-            # asset library lookup (e.g. "BG0215_00_Switch_Standard").
-            # template_object_path: the raw path stored as a custom property.
             asset_name, template_object_path = extract_skeletal_mesh_name(entry)
 
-            # instance_name: use the outer actor name exactly as-is so that
-            # e.g. "BG0215_00_Switch_Standard2_5" is preserved without any
-            # suffix stripping or dot-conversion.
             outer_name = _resolve_outer_name(entry)
             if not outer_name:
                 comp_name = entry.get("Name", "SkeletalMeshComponent")
                 outer_name = comp_name if isinstance(comp_name, str) else "SkeletalMeshComponent"
-            instance_name = outer_name  # no suffix modifications for skeletal meshes
+            instance_name = outer_name
 
-            # Try to find a linked asset by the bare class name. Collections
-            # remain preferred, but armature/object assets are valid too.
             asset = skeletal_asset_cache.get(asset_name) if asset_name else None
 
             if asset is not None:
                 if asset.kind == "COLLECTION":
-                    file_source_collection_under_import_type(asset.datablock, skeletal_collection)
-                    obj, instance_obj = create_skeletal_wrapper_instance(
-                        collection=asset.datablock,
-                        name=instance_name,
-                        location=loc,
-                        rotation_euler=rot,
-                        parent_collection=skeletal_collection,
-                    )
-                    assign_skeletal_source_metadata(
-                        obj,
-                        instance_obj,
-                        instance_name,
-                        template_object_path,
-                    )
-                    instance_obj = ensure_overrideable_collection_instance(instance_obj)
+                    collection = asset.datablock
+                    file_collection_under_import_type(collection, skeletal_collection)
+                    with _scene_link_collection(collection, skeletal_collection):
+                        obj, instance_obj = create_skeletal_wrapper_instance(
+                            collection=collection,
+                            name=instance_name,
+                            location=loc,
+                            rotation_euler=rot,
+                            parent_collection=skeletal_collection,
+                        )
+                        assign_skeletal_source_metadata(
+                            obj,
+                            instance_obj,
+                            instance_name,
+                            template_object_path,
+                        )
+                        instance_obj = ensure_overrideable_collection_instance(
+                            instance_obj,
+                            skeletal_collection,
+                        )
                     ensure_top_level_object_overrides(instance_obj)
                     parent_override_roots_to_wrapper(obj, instance_obj)
                 else:
@@ -2166,10 +1622,6 @@ def import_json_file(
             attach_socket = props.get("AttachSocketName")
             if attach_socket:
                 pending_attaches.append((obj, props, attach_socket))
-                print(
-                    f"[End JSON Import]   Deferred attach for '{obj.name}' "
-                    f"socket '{attach_socket}' until all file objects are imported."
-                )
             elif props.get("AttachParent"):
                 parent_obj = resolve_attach_parent_object(
                     props,
@@ -2189,11 +1641,8 @@ def import_json_file(
 
             created_count += 1
 
-        # ------------------------------------------------------------------ #
-        # Point lights
-        # ------------------------------------------------------------------ #
         elif t == "PointLightComponent":
-            ensure_root_collection()
+            lights_collection = ensure_lights_collection()
 
             props = entry.get("Properties", {})
             light_name = _resolve_light_name(entry, "PointLight")
@@ -2205,7 +1654,7 @@ def import_json_file(
             )
             light_obj = create_point_light_from_entry(
                 entry=entry,
-                parent_collection=parent_collection,
+                parent_collection=lights_collection,
                 location_scale=location_scale,
                 exposure_mult=exposure_mult,
                 attenuation_radius_mult=attenuation_radius_mult,
@@ -2218,11 +1667,8 @@ def import_json_file(
                 pending_light_attaches.append((light_obj, props, light_name))
             created_count += 1
 
-        # ------------------------------------------------------------------ #
-        # Spot lights
-        # ------------------------------------------------------------------ #
         elif t == "SpotLightComponent":
-            ensure_root_collection()
+            lights_collection = ensure_lights_collection()
 
             props = entry.get("Properties", {})
             light_name = _resolve_light_name(entry, "SpotLight")
@@ -2234,7 +1680,7 @@ def import_json_file(
             )
             light_obj = create_spot_light_from_entry(
                 entry=entry,
-                parent_collection=parent_collection,
+                parent_collection=lights_collection,
                 location_scale=location_scale,
                 exposure_mult=exposure_mult,
                 attenuation_radius_mult=attenuation_radius_mult,
@@ -2247,18 +1693,12 @@ def import_json_file(
                 pending_light_attaches.append((light_obj, props, light_name))
             created_count += 1
 
-        # ------------------------------------------------------------------ #
-        # Material/light metadata components -> custom properties
-        # ------------------------------------------------------------------ #
         elif t == "MaterialParameterLightPlacedComponent":
             pending_material_parameter_lights.append(entry)
 
         elif t == "MaterialInstanceDynamic":
             pending_vector_parameters.append((entry_index, entry))
 
-        # ------------------------------------------------------------------ #
-        # Streaming volumes -> recursively import referenced JSONs
-        # ------------------------------------------------------------------ #
         elif t == "EndStreamingVolume":
             if not use_volume_streaming_fallback:
                 continue
@@ -2283,6 +1723,7 @@ def import_json_file(
                 recursive_root_dir=recursive_root_dir,
                 import_massive_environment_umaps=import_massive_environment_umaps,
                 imported_umap_paths=imported_umap_paths,
+                texture_index_cache=texture_index_cache,
             )
             created_count += child_created
             missing_assets |= child_missing
@@ -2293,6 +1734,7 @@ def import_json_file(
                     entry,
                     game_root,
                     imported_umap_paths,
+                    texture_index_cache,
                 )
                 created_count += processed
                 missing_assets |= child_missing
@@ -2357,8 +1799,6 @@ def import_json_file(
         if target is not None:
             _apply_vector_parameter_props(target, entry.get("Properties", {}))
 
-    # If created_count == 0 we never created parent_collection, so no empty
-    # collection is left behind.
     print(
         f"[End JSON Import] Finished '{os.path.basename(filepath)}' - "
         f"{created_count} item(s) created, {len(missing_assets)} missing asset(s)."

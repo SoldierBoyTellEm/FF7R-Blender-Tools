@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FF7 Rebirth map importer",
     "author": "GargoyleTech",
-    "version": (2, 0, 2),
+    "version": (2, 0, 3),
     "blender": (4, 0, 0),
     "location": "File > Import > FF7R Rebirth",
     "description": "Imports FF7R Rebirth cutscene JSON, UMAP JSON, and Massive Environment .umap files",
@@ -129,6 +129,16 @@ class FF7R_ImportPreferences(AddonPreferences):
         description="File extension used when resolving /Game texture paths",
         default="dds",
     )
+    texture_match_by_filename: BoolProperty(
+        name="Match Textures by Filename Only",
+        description=(
+            "Ignore /Game/ path hierarchy when loading textures. "
+            "On import, builds an in-memory index of every texture file under "
+            "Texture Content Root and matches by filename alone. "
+            "Useful when your local texture folder layout does not mirror the game's /Game/ paths"
+        ),
+        default=False,
+    )
 
     def draw(self, _context):
         layout = self.layout
@@ -154,6 +164,7 @@ class FF7R_ImportPreferences(AddonPreferences):
         row = texture_box.row()
         row.label(text="Extension:")
         row.prop(self, "texture_extension", text="")
+        texture_box.prop(self, "texture_match_by_filename")
 
 
 class FF7R_REBIRTH_OT_import_cutscene_json(Operator):
@@ -337,6 +348,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         game_root = bpy.path.abspath(self.game_root) if self.game_root else ""
         visited_paths: set[str] = set()
         imported_umap_paths: set[str] = set()
+        texture_index_cache: dict[tuple[str, str], dict[str, str]] = {}
         total_created = 0
         all_missing_assets: set[str] = set()
         errors: list[tuple[str, str]] = []
@@ -356,6 +368,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
                         and map_import.is_umap_addon_available()
                     ),
                     imported_umap_paths=imported_umap_paths,
+                    texture_index_cache=texture_index_cache,
                 )
                 total_created += created
                 all_missing_assets |= missing

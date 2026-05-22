@@ -5,7 +5,10 @@ import json
 import bpy
 
 from .parser import BinReader, build_import_hash_table, build_objects_from_component
-from .material import load_hash_table
+from .material import load_hash_table, build_texture_index
+
+
+TextureIndexCache = dict[tuple[str, str], dict[str, str]]
 
 
 def _addon_package_name():
@@ -20,8 +23,28 @@ def _get_addon_preferences(context):
 def _get_texture_settings(context, fallback_tex_root="", fallback_tex_ext="dds"):
     prefs = _get_addon_preferences(context)
     if prefs:
-        return prefs.game_texture_root, prefs.texture_extension
-    return fallback_tex_root, fallback_tex_ext
+        return prefs.game_texture_root, prefs.texture_extension, prefs.texture_match_by_filename
+    return fallback_tex_root, fallback_tex_ext, False
+
+
+def _texture_index_cache_key(tex_root: str, tex_ext: str) -> tuple[str, str]:
+    return os.path.normcase(os.path.realpath(tex_root)), tex_ext.lstrip(".").lower()
+
+
+def _get_texture_index(
+        tex_root: str,
+        tex_ext: str,
+        texture_index_cache: TextureIndexCache | None,
+) -> dict[str, str]:
+    if texture_index_cache is None:
+        return build_texture_index(tex_root, tex_ext)
+
+    key = _texture_index_cache_key(tex_root, tex_ext)
+    tex_index = texture_index_cache.get(key)
+    if tex_index is None:
+        tex_index = build_texture_index(tex_root, tex_ext)
+        texture_index_cache[key] = tex_index
+    return tex_index
 
 
 def import_umap_paths(
@@ -36,25 +59,37 @@ def import_umap_paths(
         scale_factor=0.01,
         tex_root=None,
         tex_ext=None,
+        tex_match_by_filename=None,
+        texture_index_cache: TextureIndexCache | None = None,
 ):
     """Import one or more .umap files from Python.
 
     Texture settings default to addon preferences. Passing tex_root or tex_ext
-    overrides only that value.
+    overrides only that value. When tex_match_by_filename is True (or None and
+    the preference is enabled) textures are matched by filename only, ignoring
+    the full /Game/ path hierarchy.
     """
     if isinstance(paths, (str, bytes, os.PathLike)):
         paths = [paths]
 
-    pref_tex_root, pref_tex_ext = _get_texture_settings(context)
+    pref_tex_root, pref_tex_ext, pref_match_by_filename = _get_texture_settings(context)
     if tex_root is None:
         tex_root = pref_tex_root
     if tex_ext is None:
         tex_ext = pref_tex_ext
+    if tex_match_by_filename is None:
+        tex_match_by_filename = pref_match_by_filename
 
     if tex_root:
-        print(f"Texture root: {tex_root!r}  ext: {tex_ext!r}")
+        print(f"Texture root: {tex_root!r}  ext: {tex_ext!r}  match_by_filename: {tex_match_by_filename}")
     else:
         print("No texture root set - materials will have empty image nodes.")
+
+    tex_index = (
+        _get_texture_index(tex_root, tex_ext, texture_index_cache)
+        if tex_match_by_filename and tex_root
+        else None
+    )
 
     # Reload CSV on every import run so edits take effect without restarting Blender
     load_hash_table()
@@ -188,6 +223,7 @@ def import_umap_paths(
                     import_names=import_names,
                     tex_root=tex_root,
                     tex_ext=tex_ext,
+                    tex_index=tex_index,
                 )
                 found = True
                 break
@@ -364,9 +400,3 @@ if hasattr(bpy.types, "FileHandler"):
             return context.area and context.area.type == 'VIEW_3D'
 else:
     FF7R_REBIRTH_FH_import_mec_umap = None
-
-
-FF7R_OT_import_mec_umap = FF7R_REBIRTH_OT_import_mec_umap
-FF7R_FH_import_mec_umap = FF7R_REBIRTH_FH_import_mec_umap
-IMPORT_UMAP_OT_massive = FF7R_REBIRTH_OT_import_mec_umap
-UMAP_FH_import = FF7R_REBIRTH_FH_import_mec_umap

@@ -1,11 +1,4 @@
-"""
-import_ue_cutscene.py  -  FF7 Rebirth UE Sequencer -> Blender importer
-Handles cameras, character visibility/action assignment, and time-ranged
-light attachment via Child Of constraints.
-
-Set FILE_PREFIX to everything before the _Camera / _Character / _Light suffix.
-Run from the Blender Text Editor or Script Console.
-"""
+"""FF7 Rebirth UE Sequencer -> Blender importer (cameras, characters, lights)."""
 
 import bpy
 import json
@@ -18,88 +11,44 @@ from bpy_extras import anim_utils
 from . import asset_linking, lights, timeline_actions
 
 
-# -----------------------------------------------------------------------------
-# USER CONFIGURATION
-# -----------------------------------------------------------------------------
-
 FILE_PREFIX: str = (
     r"O:\Games\Rebirth Tools\FModel\Output\Exports"
     r"\End\Content\Cut\Game\8400-GOLDE\EV_GOLDE_4840\EV_GOLDE_4840"
 )
 
-# -- Cameras -------------------------------------------------------------------
 CLEAR_EXISTING_CAMERAS: bool  = False
-DEFAULT_SENSOR_WIDTH:   float = 36.0    # mm; used when FilmWidth track is absent
-CAMERA_PREFIX:          str   = ""      # optional prefix for camera object names
+DEFAULT_SENSOR_WIDTH:   float = 36.0
+CAMERA_PREFIX:          str   = ""
 CREATE_CUT_MARKERS:     bool  = True
 BIND_CUT_CAMERAS:       bool  = True
-CAMERA_ACTOR_YAW_DEG:   float = -180.0  # fixed yaw used to place CameraComponent offsets
+CAMERA_ACTOR_YAW_DEG:   float = -180.0
 
-# -- Characters ----------------------------------------------------------------
 IMPORT_CHARACTERS: bool = True
-
-# Frame rate at which armature animations are authored in UE.
-# Skeletal actions are always keyframed at 30 fps regardless of the cutscene
-# display rate.  The NLA strip scale is simply scene_fps / ARMATURE_ACTION_FPS
-# (e.g. 2.0 at 60 fps) so the clip plays back at the correct speed.
-# strip.frame_end is set directly from the JSON tick-converted frame count.
 ARMATURE_ACTION_FPS: float = 30.0
-
-# Assumed source frame rate for sequencer timing such as camera data,
-# camera cuts, and the imported scene playback range. Set to `None` to use
-# the MovieScene DisplayRate stored in the JSON instead.
+# Set to None to use the MovieScene DisplayRate stored in the JSON.
 SEQUENCER_SOURCE_FPS: float | None = 24
-
-# Slot name substring that identifies facial animation tracks.
-# Facial strips are added first so body ends up on the higher NLA track.
 FACE_SLOT_KEYWORD: str = "Facial"
-
-# Maps CutsceneID (the trailing segment of the UE level actor name, e.g. "PC0000_00")
-# to the name of an existing Blender scene object.
-# Leave empty to use the CutsceneID directly as the object name (default behaviour).
 CHARACTER_OBJECT_MAP: dict[str, str] = {}
-
-# If True, find an action whose name starts with (ACTION_PREFIX + CutsceneID)
-# and assign it. The search uses startswith so trailing suffixes like "_C0050"
-# are ignored automatically.
-# When ACTION_PREFIX is "" the scene name is used as the prefix automatically,
-# e.g. CutsceneID "PC0004_00" in scene "EV_GOLDE_4840" matches any action
-# whose name starts with "EV_GOLDE_4840_PC0004_00".
-# Set ACTION_PREFIX explicitly only if your action names use a different scheme.
 ASSIGN_ACTIONS: bool = True
 ACTION_PREFIX:  str  = ""
 CLEAR_EXISTING_CHARACTER_ANIMATION: bool = True
 SEARCH_ASSET_LIBRARIES_FOR_ACTIONS: bool = True
 
-# -- Lights --------------------------------------------------------------------
 IMPORT_LIGHTS: bool = True
 IMPORT_CAMERAS: bool = True
 ASSET_LIBRARY_SELECTION: str = asset_linking.ASSET_LIBRARY_ALL
-
-# Prepended to the UE light actor name when searching the Blender scene.
-# If the umap importer strips the scene prefix, adjust this accordingly.
 LIGHT_NAME_PREFIX: str = ""
 
-# -----------------------------------------------------------------------------
-
-
-# -- Timing container ----------------------------------------------------------
 
 Timing = namedtuple(
     "Timing",
     ["tick_num", "display_rate", "start_frame", "end_frame", "source_display_rate"],
 )
 
-# -- UE RichCurve interpolation mode integers ----------------------------------
-
 INTERP_CONSTANT = 0
 INTERP_LINEAR   = 1
 INTERP_CUBIC    = 2
 
-
-# -----------------------------------------------------------------------------
-# LIGHT HELPERS
-# -----------------------------------------------------------------------------
 
 _UE_LIGHT_TYPES: dict[str, str] = {
     "SpotLight":            "SPOT",
@@ -201,17 +150,12 @@ def _find_prop_sections(data: list, track_paths: list, prop_names: set,
     return out
 
 
-# -----------------------------------------------------------------------------
-# COORDINATE HELPERS  (unchanged from camera importer)
-# -----------------------------------------------------------------------------
 
 def ue_tick_to_frame(tick: int, tick_num: int, display_rate: int) -> float:
-    """Convert a UE sequencer tick to a Blender frame number."""
     return tick * display_rate / tick_num
 
 
 def _scene_fps(scene) -> float:
-    """Return the scene's effective frame rate, respecting fps_base."""
     fps = float(scene.render.fps)
     fps_base = float(scene.render.fps_base) if scene.render.fps_base else 1.0
     return fps / fps_base
@@ -219,28 +163,24 @@ def _scene_fps(scene) -> float:
 
 def _source_to_scene_time_scale(
         display_rate: float | int, source_display_rate: float | int | None) -> float:
-    """Scale authored source-frame timing out to the current scene frame rate."""
     if source_display_rate in (None, 0):
         return 1.0
     return float(display_rate) / float(source_display_rate)
 
 
 def _resolved_sequencer_source_fps(json_source_display_rate: float | int | None) -> float | int | None:
-    """Return the configured sequencer source fps override, if any."""
     if SEQUENCER_SOURCE_FPS in (None, 0):
         return json_source_display_rate
     return float(SEQUENCER_SOURCE_FPS)
 
 
 def _set_scene_frame(scene, frame: float) -> None:
-    """Set the current frame, preserving fractional subframes when present."""
     frame_int = math.floor(frame)
     subframe = frame - frame_int
     scene.frame_set(frame_int, subframe=subframe)
 
 
 def _clear_childof_inverse(obj, constraint_name: str) -> None:
-    """Mirror Blender's Child Of 'Clear Inverse' button for an object constraint."""
     con = obj.constraints.get(constraint_name)
     if con is None:
         return
@@ -260,7 +200,6 @@ def _clear_childof_inverse(obj, constraint_name: str) -> None:
 
 
 def ue_loc_to_bl(x: float, y: float, z: float) -> tuple:
-    """UE world location (cm, left-handed) -> Blender (m, right-handed)."""
     return (x * 0.01, -y * 0.01, z * 0.01)
 
 
@@ -340,10 +279,6 @@ def _bl_interp(ue_interp: int) -> str:
     return "BEZIER"
 
 
-# -----------------------------------------------------------------------------
-# CURVE EXTRACTION  (unchanged)
-# -----------------------------------------------------------------------------
-
 def extract_curve(curve_data: dict, tick_num: int, display_rate: int,
                   frame_lo: float = -1e18, frame_hi: float = 1e18) -> list:
     """
@@ -395,10 +330,6 @@ def interp_at(keys: list, frame: float) -> int:
             break
     return m
 
-
-# -----------------------------------------------------------------------------
-# BLENDER 5.0 SLOTTED-ACTION HELPERS  (unchanged)
-# -----------------------------------------------------------------------------
 
 def _setup_action(id_block, id_type: str, action_name: str):
     """
@@ -474,10 +405,6 @@ def _scale_slot_time(strip, slot, scale: float) -> None:
         fc.update()
 
 
-# -----------------------------------------------------------------------------
-# DATA RESOLUTION HELPERS  (unchanged)
-# -----------------------------------------------------------------------------
-
 def item_at_path(data: list, obj_path: str):
     """Resolve an ObjectPath string to a data-list item using its .N index suffix."""
     try:
@@ -517,10 +444,6 @@ def get_float_section(data: list, track_path: str, prop_name: str,
     hi = sr.get("UpperBound", {}).get("Value", {}).get("Value", 0)
     return sec, lo * display_rate / tick_num, hi * display_rate / tick_num
 
-
-# -----------------------------------------------------------------------------
-# SHARED UTILITIES
-# -----------------------------------------------------------------------------
 
 def _load_json(prefix: str, suffix: str):
     """Load {prefix}{suffix}.json if it exists, else return None."""
@@ -798,18 +721,8 @@ def _skeletal_sections_for_binding(
     )
 
 
-# -----------------------------------------------------------------------------
-# TIMING EXTRACTION
-# -----------------------------------------------------------------------------
-
 def _extract_timing(data: list, target_frame_rate: float) -> Timing:
-    """
-    Extract timing parameters from a JSON data list containing a MovieScene.
-
-    MovieScene.TickResolution can be unreliable in some UE exporters.
-    The per-curve TickResolution (stored on each RichCurve) is authoritative
-    and overrides it when they differ - same logic as the original camera importer.
-    """
+    """Extract Timing from a MovieScene data list. Per-curve TickResolution overrides the MovieScene value."""
     bt = _by_type(data)
     ms_props     = bt["MovieScene"][0]["Properties"]
     ms_tick_num  = ms_props["TickResolution"]["Numerator"]
@@ -849,22 +762,10 @@ def _extract_timing(data: list, target_frame_rate: float) -> Timing:
     )
 
 
-# -----------------------------------------------------------------------------
-# CUT FRAME LOOKUP  (used to position per-cut character actions in NLA)
-# -----------------------------------------------------------------------------
-
 def _build_cut_frames(
         cam_data: list, tick_num: int, display_rate: int,
         source_display_rate: float | int | None = None) -> dict:
-    """
-    Build {cut_id: start_frame} from the Camera JSON's CameraCutSections.
-    cut_id is the trailing segment of the camera possessable name, e.g. "C0010".
-
-    Camera actor names follow the pattern {scene_name}_CAM_{cut_id}, so
-    rsplit("_", 1)[-1] reliably extracts C0010, C0020, etc.
-    The resulting dict is passed to _import_characters so each per-cut action
-    (e.g. EV_GOLDE_4840_PC0000_00_C0030) lands at the right NLA frame.
-    """
+    """Return {cut_id: start_frame} from CameraCutSections (cut_id = last segment of camera name, e.g. 'C0010')."""
     if cam_data is None:
         return {}
 
@@ -888,10 +789,6 @@ def _build_cut_frames(
 
     return cut_frames
 
-
-# -----------------------------------------------------------------------------
-# CAMERA IMPORT  (refactored from original - logic identical, now takes data)
-# -----------------------------------------------------------------------------
 
 def _import_cameras(data: list, t: Timing, scene) -> None:
     tick_num, display_rate = t.tick_num, t.display_rate
@@ -947,7 +844,6 @@ def _import_cameras(data: list, t: Timing, scene) -> None:
         cam_obj.rotation_mode = "XYZ"
         imported_cameras[cam_guid] = cam_obj
 
-        # -- Transform ---------------------------------------------------------
         actor_xform_sec = None
         for tp in tracks_for.get(cam_guid, []):
             s = get_transform_section(data, tp)
@@ -1002,7 +898,6 @@ def _import_cameras(data: list, t: Timing, scene) -> None:
             loc_keys = [[], [], []]
             rot_keys = [[], [], []]
 
-            _dbg = True
             for frame in all_frames:
                 a_tx = val_at(atx, frame, a_tx_d); a_ty = val_at(aty, frame, a_ty_d)
                 a_tz = val_at(atz, frame, a_tz_d); a_rx = val_at(arx, frame, a_rx_d)
@@ -1019,22 +914,9 @@ def _import_cameras(data: list, t: Timing, scene) -> None:
                     )
                 else:
                     wx, wy, wz = a_tx, a_ty, a_tz
-                    bl_rot = mathutils.Euler((
-                        0.0,
-                        0.0,
-                        math.radians(90.0),
-                    ), "XYZ")
+                    bl_rot = mathutils.Euler((0.0, 0.0, math.radians(90.0)), "XYZ")
 
                 bl_x, bl_y, bl_z = ue_loc_to_bl(wx, wy, wz)
-
-                if _dbg:
-                    print(f"[UE Import]     Actor   rot: roll={a_rx:.2f} pitch={a_ry:.2f} yaw={a_rz:.2f} deg")
-                    print(f"[UE Import]     Comp    rot: roll={c_rx:.2f} pitch={c_ry:.2f} yaw={c_rz:.2f} deg")
-                    print(f"[UE Import]     Camera mapping: X={math.degrees(bl_rot.x):.2f} "
-                          f"Y={math.degrees(bl_rot.y):.2f} Z={math.degrees(bl_rot.z):.2f} deg")
-                    print(f"[UE Import]     Blender rot: x={math.degrees(bl_rot.x):.2f} y={math.degrees(bl_rot.y):.2f} z={math.degrees(bl_rot.z):.2f} deg")
-                    print(f"[UE Import]     Blender loc: x={bl_x:.3f} y={bl_y:.3f} z={bl_z:.3f} m")
-                    _dbg = False
 
                 imode_t = interp_at(ctx if ctx else atx, frame)
                 imode_r = interp_at(crz if crz else arz, frame)
@@ -1055,7 +937,6 @@ def _import_cameras(data: list, t: Timing, scene) -> None:
                 _force_interp(strip, slot, "rotation_euler", i, "BEZIER", "AUTO_CLAMPED")
             _scale_slot_time(strip, slot, camera_time_scale)
 
-        # -- Camera data-block (lens / sensor / DOF) ----------------------------
         cam_action = cam_slot = cam_strip = None
 
         def _ensure_cam_action():
@@ -1110,7 +991,6 @@ def _import_cameras(data: list, t: Timing, scene) -> None:
         if cam_strip is not None:
             _scale_slot_time(cam_strip, cam_slot, camera_time_scale)
 
-    # -- Cut markers ------------------------------------------------------------
     if CREATE_CUT_MARKERS:
         for cut in bt.get("MovieSceneCameraCutSection", []):
             cp = cut["Properties"]
@@ -1127,154 +1007,16 @@ def _import_cameras(data: list, t: Timing, scene) -> None:
 
 
 # -----------------------------------------------------------------------------
-# CHARACTER IMPORT
-# -----------------------------------------------------------------------------
-
-def _import_characters(data: list, t: Timing, scene, scene_name: str,
-                       cut_frames: dict | None = None) -> None:
-    """
-    For each actor bound in _Character.json:
-      - Find the corresponding Blender scene object (CutsceneID used as name directly).
-      - Find ALL actions whose name starts with {scene_prefix}_{cid} and push each
-        as a separate NLA strip positioned at its cut's start frame (from cut_frames).
-      - Write hide_viewport / hide_render into a separate active action that
-        evaluates on top of NLA with CONSTANT interpolation.
-
-    cut_frames: {cut_id: start_frame} built from camera cut sections.
-                If None or missing a key, t.start_frame is used as fallback.
-    """
-    tick_num, display_rate = t.tick_num, t.display_rate
-    if cut_frames is None:
-        cut_frames = {}
-
-    uuid_to_cid  = _parse_binding_refs(data, scene_name)
-    uuid_to_trks = _parse_obj_bindings(data)
-
-    processed = 0
-    for uuid, cid in uuid_to_cid.items():
-        obj = _find_obj(cid, scene)
-        if obj is None:
-            continue
-
-        print(f"[UE Import]   '{cid}' -> '{obj.name}'")
-        processed += 1
-
-        ad = obj.animation_data_create()
-        ad.use_nla = True
-
-        # -- Push ALL per-cut actions to NLA -----------------------------------
-        # Actions follow the pattern {scene_name}_{cid}_{cut_id}, e.g.
-        # EV_GOLDE_4840_PC0000_00_C0030. Collect every match, extract the
-        # cut_id suffix, look up its start frame, and place each as its own
-        # NLA strip on a shared track. Cuts are non-overlapping so one track
-        # is sufficient; a try/except guards against unexpected overlaps.
-        if ASSIGN_ACTIONS:
-            effective_prefix = ACTION_PREFIX if ACTION_PREFIX else (scene_name + "_")
-            search_prefix    = effective_prefix + cid   # e.g. "EV_GOLDE_4840_PC0000_00"
-
-            matching = sorted(
-                (a for a in bpy.data.actions if a.name.startswith(search_prefix)),
-                key=lambda a: a.name,
-            )
-
-            if matching:
-                nla_track = ad.nla_tracks.new()
-                nla_track.name = cid + "_animation"
-
-                for action in matching:
-                    # Extract cut_id: "EV_GOLDE_4840_PC0000_00_C0030" -> "C0030"
-                    suffix   = action.name[len(search_prefix):]
-                    cut_id   = suffix.lstrip("_")
-                    start_fr = cut_frames.get(cut_id, t.start_frame)
-
-                    anim_slot = next(
-                        (s for s in action.slots if s.target_id_type == "OBJECT"),
-                        action.slots[0] if action.slots else None,
-                    )
-                    try:
-                        nla_strip = nla_track.strips.new(
-                            action.name, start=start_fr, action=action)
-                        if anim_slot and hasattr(nla_strip, "action_slot"):
-                            nla_strip.action_slot = anim_slot
-                        print(f"[UE Import]     '{action.name}' -> NLA f{start_fr}")
-                    except Exception as exc:
-                        print(f"[UE Import]     WARNING '{action.name}': {exc}")
-            else:
-                print(f"[UE Import]     No actions '{search_prefix}*' - skipped")
-
-        # -- Visibility range from EndCinemaVisibilityTrack / MovieSceneBoolSection -
-        # Default: visible for the full playback range.
-        vis_lo, vis_hi = t.start_frame, t.end_frame
-
-        for tp in uuid_to_trks.get(uuid, []):
-            track = item_at_path(data, tp)
-            if track is None or track["Type"] != "EndCinemaVisibilityTrack":
-                continue
-            for sec_ref in track["Properties"].get("Sections", []):
-                sec = item_at_path(data, sec_ref["ObjectPath"])
-                if sec is None or sec["Type"] != "MovieSceneBoolSection":
-                    continue
-                sr   = sec["Properties"].get("SectionRange", {}).get("Value", {})
-                lo_t = sr.get("LowerBound", {}).get("Value", {}).get("Value")
-                hi_t = sr.get("UpperBound", {}).get("Value", {}).get("Value")
-                if lo_t is not None:
-                    vis_lo = ue_tick_to_frame(lo_t, tick_num, display_rate)
-                if hi_t is not None:
-                    vis_hi = ue_tick_to_frame(hi_t, tick_num, display_rate)
-                break
-            break
-
-        # -- Visibility keyframes - written into the active action -------------
-        # The active action evaluates on top of NLA strips so these are
-        # independent of the character animation action pushed above.
-        # hide_viewport/hide_render: 0.0 = visible, 1.0 = hidden.
-        vis_keys = [
-            {"frame": vis_lo - 1, "value": 1.0, "interp": INTERP_CONSTANT, "arrive": 0.0, "leave": 0.0},
-            {"frame": vis_lo,     "value": 0.0, "interp": INTERP_CONSTANT, "arrive": 0.0, "leave": 0.0},
-            {"frame": vis_hi - 1, "value": 0.0, "interp": INTERP_CONSTANT, "arrive": 0.0, "leave": 0.0},
-            {"frame": vis_hi,     "value": 1.0, "interp": INTERP_CONSTANT, "arrive": 0.0, "leave": 0.0},
-        ]
-
-        # _setup_action creates a fresh action and assigns it to ad.action.
-        # Since we already pushed the animation to NLA (not the active slot),
-        # this is safe - it won't disturb the NLA strip.
-        _, vis_slot, vis_strip = _setup_action(obj, "OBJECT", cid + "_vis")
-        for path in ("hide_viewport", "hide_render"):
-            _write_keys(vis_strip, vis_slot, path, 0, vis_keys)
-            _apply_interp(vis_strip, vis_slot, path, 0, vis_keys)
-
-    print(f"[UE Import] Characters: {processed} actor(s) processed.")
-
-
-# -----------------------------------------------------------------------------
 # LIGHT IMPORT
 # -----------------------------------------------------------------------------
 
 def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
-    """
-    Two-phase import from _Light.json:
-
-    Phase 1 - Spawnable light creation:
-      Iterates MovieScene.Spawnables for SpotLight / PointLight actors. If an
-      object with the same name already exists in the scene (e.g. imported by
-      the umap importer) it is reused; otherwise a new light is created.
-      Static world-space transform is read from the actor's DefaultValue.
-      Light properties (intensity, color, cone) are keyed via slotted actions.
-
-      Lights near the origin are intended to be parented; their correct position
-      is established by the Child Of constraints in Phase 2.
-
-    Phase 2 - Attachment scheduling:
-      Reads EndCinemaAttachTrack -> EndCinemaAttachSection to build time-ranged
-      Child Of constraints with animated influence on each light.
-      Requires character actions to be active (called after _import_characters).
-    """
+    """Phase 1: create/find spawnable lights and key properties. Phase 2: time-ranged Child Of constraints."""
     tick_num, display_rate = t.tick_num, t.display_rate
     light_time_scale = _source_to_scene_time_scale(
         display_rate, getattr(t, "source_display_rate", None))
     NULL_GUID = "00000000-00000000-00000000-00000000"
 
-    # -- Build light-file-local lookup structures --------------------------------
     ms_props = next(
         (item.get("Properties", {}) for item in data if item["Type"] == "MovieScene"),
         {},
@@ -1282,8 +1024,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
 
     spawnables_by_guid: dict = {s["Guid"]: s for s in ms_props.get("Spawnables", [])}
 
-    # children_of: parent GUID -> list of child possessable dicts
-    # (used to find SpotLightComponent / PointLightComponent children)
     possessables = ms_props.get("Possessables", [])
     children_of: dict = {}
     for p in possessables:
@@ -1291,18 +1031,14 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
         if par != NULL_GUID:
             children_of.setdefault(par, []).append(p)
 
-    # tracks_for: object GUID -> list of track ObjectPaths
     tracks_for: dict = {
         b["ObjectGuid"]: [tr["ObjectPath"] for tr in b.get("Tracks", [])]
         for b in ms_props.get("ObjectBindings", [])
     }
 
     saved_frame = scene.frame_current
-    imported_lights: dict = {}   # spawn_guid -> light Object
+    imported_lights: dict = {}
 
-    # ==========================================================================
-    # Phase 1: create / find spawnable light objects and apply properties
-    # ==========================================================================
     for spawn_guid, spawnable in spawnables_by_guid.items():
         light_type = _get_light_type(spawnable)
         if light_type is None:
@@ -1310,7 +1046,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
 
         light_name = LIGHT_NAME_PREFIX + spawnable["Name"]
 
-        # Reuse an existing object (e.g. from the umap importer) if present.
         light_obj = scene.objects.get(light_name)
         if light_obj is None:
             bl_light = bpy.data.lights.new(name=light_name, type=light_type)
@@ -1324,7 +1059,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
         imported_lights[spawn_guid] = light_obj
         bl_light: bpy.types.Light = light_obj.data
 
-        # -- Static world-space transform from actor DefaultValue ---------------
         for tp in tracks_for.get(spawn_guid, []):
             xform = get_transform_section(data, tp)
             if xform is None:
@@ -1340,7 +1074,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             light_obj.rotation_euler = ue_rot_to_bl_euler(rx, ry, rz)
             break
 
-        # -- Resolve light component tracks ------------------------------------
         component_tracks: list = []
         for child in children_of.get(spawn_guid, []):
             cls = str(child.get("PossessedObjectClass", ""))
@@ -1356,7 +1089,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
                 light_action, light_slot, light_strip = _setup_action(
                     bl_light, "LIGHT", light_name + "_light")
 
-        # -- Intensity ---------------------------------------------------------
         for _track, sec, lo, hi in _find_prop_sections(
                 data, component_tracks, {"Intensity", "Brightness"}, tick_num, display_rate):
             curve = sec["Properties"].get("FloatCurve")
@@ -1365,14 +1097,11 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             keys = _extract_default_or_curve(curve, tick_num, display_rate, lo, hi)
             if not keys:
                 continue
-            # UE intensities are in lux/candelas and much larger than Blender's watts.
-            # Scale factor 0.01 matches the conversion used for cameras in this pipeline.
             bl_keys = [{**k, "value": k["value"] * 0.01} for k in keys]
             _ensure_light_action()
             _write_keys(light_strip, light_slot, "energy", 0, bl_keys)
             _apply_interp(light_strip, light_slot, "energy", 0, bl_keys)
 
-        # -- Color -------------------------------------------------------------
         light_color_curves = None
         for _track, sec, lo, hi in _find_prop_sections(
                 data, component_tracks, {"LightColor"}, tick_num, display_rate,
@@ -1423,7 +1152,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             _write_keys(light_strip, light_slot, "temperature", 0, temperature_curve)
             _apply_interp(light_strip, light_slot, "temperature", 0, temperature_curve)
 
-        # -- Source radius ----------------------------------------------------
         for _track, sec, lo, hi in _find_prop_sections(
                 data, component_tracks, {"SourceRadius"}, tick_num, display_rate,
                 track_types={"MovieSceneFloatTrack"}):
@@ -1433,13 +1161,11 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             keys = _extract_default_or_curve(curve, tick_num, display_rate, lo, hi)
             if not keys:
                 continue
-            # UE uses centimeters; Blender shadow_soft_size uses meters.
             bl_keys = [{**k, "value": k["value"] * 0.01} for k in keys]
             _ensure_light_action()
             _write_keys(light_strip, light_slot, "shadow_soft_size", 0, bl_keys)
             _apply_interp(light_strip, light_slot, "shadow_soft_size", 0, bl_keys)
 
-        # -- Shadow casting ---------------------------------------------------
         for _track, sec, lo, hi in _find_prop_sections(
                 data, component_tracks, {"CastShadows"}, tick_num, display_rate,
                 track_types={"MovieSceneBoolTrack"}):
@@ -1451,7 +1177,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             _write_keys(light_strip, light_slot, "use_shadow", 0, keys)
             _apply_interp(light_strip, light_slot, "use_shadow", 0, keys)
 
-        # -- Volumetric scattering metadata ----------------------------------
         for _track, sec, lo, hi in _find_prop_sections(
                 data, component_tracks, {lights.VOLUMETRIC_SCATTERING_PROP}, tick_num, display_rate,
                 track_types={"MovieSceneFloatTrack"}):
@@ -1467,7 +1192,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             _write_keys(light_strip, light_slot, data_path, -1, keys)
             _apply_interp(light_strip, light_slot, data_path, -1, keys)
 
-        # -- Spot cone angles ---------------------------------------------------
         if light_type == "SPOT":
             outer_deg: float | None = None
             inner_deg: float | None = None
@@ -1486,7 +1210,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
                     continue
 
                 if prop == "OuterFullConeAngle":
-                    # UE full cone angle is already the full spread in degrees.
                     outer_deg = keys[0]["value"]
                     bl_keys = [{**k, "value": math.radians(k["value"])} for k in keys]
                     _ensure_light_action()
@@ -1494,18 +1217,12 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
                     _apply_interp(light_strip, light_slot, "spot_size", 0, bl_keys)
 
                 elif prop == "InnerFullConeAngle":
-                    # spot_blend = 1 - inner/outer (requires outer to be known first).
-                    # Cache inner; resolve blend below once both angles are read.
                     inner_deg = keys[0]["value"]
 
-            # Resolve spot_blend from the cached angle pair.
             if outer_deg is not None and inner_deg is not None and outer_deg > 0:
                 blend = max(0.0, min(1.0, 1.0 - inner_deg / outer_deg))
                 bl_light.spot_blend = blend
 
-    # ==========================================================================
-    # Phase 2: time-ranged attachment via Child Of constraints
-    # ==========================================================================
     for spawn_guid, light_obj in imported_lights.items():
         for tp in tracks_for.get(spawn_guid, []):
             track = item_at_path(data, tp)
@@ -1552,8 +1269,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
                 con.subtarget  = BONE_NAME   # follow the Trans bone, not the object root
                 con.use_scale_x = con.use_scale_y = con.use_scale_z = False
                 con.influence   = 0.0
-                # inverse_matrix = target_world-1 @ light_world: preserves the
-                # light's world offset from the Trans bone at the attachment frame.
                 _clear_childof_inverse(light_obj, con_name)
 
                 for frame, value in (
@@ -1572,9 +1287,6 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
     print(f"[UE Import] Lights: {len(imported_lights)} light(s) processed.")
 
 
-# -----------------------------------------------------------------------------
-# MAIN ENTRY POINT
-# -----------------------------------------------------------------------------
 
 def import_ue_cutscene(
     file_prefix: str,
@@ -1585,17 +1297,7 @@ def import_ue_cutscene(
     camera_prefix: str | None = None,
     asset_library_selection: str | None = None,
 ) -> None:
-    """
-    Load _Camera.json, _Character.json, and _Light.json from file_prefix and
-    import each into the current Blender scene.
-
-    Import order is significant:
-      1. Cameras   - establishes scene fps, frame range, and camera objects.
-      2. Characters - assigns actions; must complete before lights so that
-                      character animations are active when light inverse
-                      matrices are computed.
-      3. Lights    - creates Child Of constraints and influence keyframes.
-    """
+    """Load _Camera, _Character, _Light JSONs from file_prefix and import into the current scene."""
     global IMPORT_LIGHTS, IMPORT_CAMERAS, CLEAR_EXISTING_CAMERAS
     global IMPORT_CHARACTERS, CAMERA_PREFIX, ASSET_LIBRARY_SELECTION
 
@@ -1619,7 +1321,6 @@ def import_ue_cutscene(
     char_data  = _load_json(file_prefix, "_Character")
     light_data = _load_json(file_prefix, "_Light")
 
-    # Use the first available file with a MovieScene to extract timing.
     timing_src = cam_data or char_data or light_data
     if timing_src is None:
         raise RuntimeError(
@@ -1644,8 +1345,6 @@ def import_ue_cutscene(
         print("[UE Import] -- Cameras -----------------------------------------")
         _import_cameras(cam_data, t, scene)
 
-    # Build cut -> frame mapping from camera data so character actions can be
-    # placed at the correct NLA position per cut (C0010, C0020, ...).
     cut_frames = _build_cut_frames(
         cam_data, t.tick_num, t.display_rate, t.source_display_rate)
     if cut_frames:
@@ -1663,7 +1362,6 @@ def import_ue_cutscene(
     print("[UE Import] -- Done ---------------------------------------------")
 
 
-# -- Run -----------------------------------------------------------------------
 def _import_characters_explicit_sections(
         data: list, t: Timing, scene, scene_name: str,
         cut_frames: dict | None = None) -> None:
@@ -1699,18 +1397,11 @@ def _import_characters_explicit_sections(
                 t.source_display_rate)
 
             if sections:
-                # Split into face/body groups and place each group on one shared
-                # track. Facial goes on the lower track; body is created second
-                # so it appears above facial in Blender's NLA.
                 body_sections = [s for s in sections
                                  if FACE_SLOT_KEYWORD not in s["slot_name"]]
                 face_sections = [s for s in sections
                                  if FACE_SLOT_KEYWORD in s["slot_name"]]
 
-                # Scale: actions are authored at ARMATURE_ACTION_FPS (30 fps).
-                # Stretching to the scene rate is a flat multiplier - no
-                # per-section span ratio needed.  frame_end is set directly
-                # from the tick-converted JSON value.
                 armature_scale = display_rate / ARMATURE_ACTION_FPS
 
                 track_groups = (

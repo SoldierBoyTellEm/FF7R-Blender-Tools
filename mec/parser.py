@@ -204,6 +204,7 @@ def build_objects_from_component(
         import_names: list | None = None,
         tex_root: str = "",
         tex_ext: str = "dds",
+        tex_index: "dict | None" = None,
 ) -> None:
     """Parse ONE MassiveEnvironmentComponent0 and populate the Blender scene."""
 
@@ -629,7 +630,8 @@ def build_objects_from_component(
                         hashes = group_material_hashes[mat_name]
                         for hash_idx, hash_val in enumerate(hashes, start=1):
                             mat[f"UE import {hash_idx:02d}"] = hash_val
-                        setup_material_nodes(mat, hashes, tex_root, tex_ext)
+                        setup_material_nodes(mat, hashes, tex_root, tex_ext,
+                                             tex_index=tex_index)
                     mesh.materials.append(mat)
                     npoly = len(mesh.polygons)
                     if npoly:

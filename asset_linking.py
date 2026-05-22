@@ -125,12 +125,7 @@ def id_name_candidates(name: str) -> tuple[str, ...]:
 
 
 def id_name_matches(requested_name: str, actual_name: str) -> bool:
-    """
-    Return True when *actual_name* can represent *requested_name*.
-
-    Blender 5.x keeps full ID names. Blender 4.x truncates long names when it
-    reads newer .blend files, so matching must also accept the truncated form.
-    """
+    """Return True when actual_name can represent requested_name (including Blender 4.x truncation)."""
     if not requested_name or not actual_name:
         return False
 
@@ -291,24 +286,12 @@ def ensure_asset_indexes(selection: str = ASSET_LIBRARY_ALL) -> None:
     )
 
 
-def build_collection_asset_index(selection: str = ASSET_LIBRARY_ALL) -> dict[str, list[str]]:
-    """Build mapping: collection name -> .blend files where it exists."""
-    collection_index, _object_index = build_asset_indexes(selection)
-    return collection_index
-
-
 def get_collection_asset_index(selection: str = ASSET_LIBRARY_ALL) -> dict[str, list[str]]:
     """Get or lazily build the collection asset index for a selection."""
     key = _cache_key(selection)
     if key not in _ASSET_INDEX_CACHE:
         ensure_asset_indexes(selection)
     return _ASSET_INDEX_CACHE[key]
-
-
-def build_object_asset_index(selection: str = ASSET_LIBRARY_ALL) -> dict[str, list[str]]:
-    """Build mapping: object name -> .blend files where it exists."""
-    _collection_index, object_index = build_asset_indexes(selection)
-    return object_index
 
 
 def get_object_asset_index(selection: str = ASSET_LIBRARY_ALL) -> dict[str, list[str]]:
@@ -409,14 +392,7 @@ def preload_assets(
     selection: str = ASSET_LIBRARY_ALL,
     include_objects: bool = True,
 ) -> None:
-    """
-    Best-effort batch link for asset names from selected asset libraries.
-
-    Collections are preferred, matching find_or_load_asset(). Object assets are
-    only considered for names that do not have a collection index entry.
-    Individual find_or_load_* calls should still be used afterward as a fallback
-    for missing names or failed library loads.
-    """
+    """Batch-link assets; collections preferred, object assets used for names with no collection entry."""
     if selection == ASSET_LIBRARY_NONE:
         return
 

@@ -126,25 +126,39 @@ def _slot(hashes: list, index: int) -> str | None:
     return _usable_texture_path(hashes[index]) if index < len(hashes) else None
 
 
-def load_image(game_path: str, tex_root: str, tex_ext: str):
+def load_image(game_path: str, tex_root: str, tex_ext: str,
+               tex_index: "dict[str, str] | None" = None):
     """Resolve a /Game/... asset path to a local file and return a bpy.types.Image.
 
+    When *tex_index* is provided (filename-only mode) the full /Game/ path is
+    ignored and the basename is looked up directly in the pre-built index.
     Returns None when tex_root is empty or the file cannot be found.
     """
     if not game_path or not tex_root:
         return None
     if _strip_ue_suffix(game_path).lower().startswith('/game/renderer/texture/'):
         return None
-    p = _strip_ue_suffix(game_path)
-    if p.lower().startswith('/game/'):
-        p = p[6:]
+
+    if tex_index is not None:
+        # Filename-only mode: extract the last path segment (no extension) and look it up.
+        stem = _strip_ue_suffix(game_path).rstrip('/').rsplit('/', 1)[-1]
+        ext  = tex_ext.lstrip('.')
+        key  = (stem + '.' + ext).lower()
+        full = tex_index.get(key)
+        if full is None:
+            return None
     else:
-        return None
-    rel  = p.replace('/', os.sep)
-    ext  = tex_ext.lstrip('.')
-    full = os.path.join(tex_root, rel + '.' + ext)
-    if not os.path.isfile(full):
-        return None
+        p = _strip_ue_suffix(game_path)
+        if p.lower().startswith('/game/'):
+            p = p[6:]
+        else:
+            return None
+        rel  = p.replace('/', os.sep)
+        ext  = tex_ext.lstrip('.')
+        full = os.path.join(tex_root, rel + '.' + ext)
+        if not os.path.isfile(full):
+            return None
+
     name = os.path.basename(full)
     img  = bpy.data.images.get(name)
     if img is None:
@@ -154,6 +168,23 @@ def load_image(game_path: str, tex_root: str, tex_ext: str):
             print(f"  Warning: could not load texture '{full}': {err}")
             return None
     return img
+
+
+def build_texture_index(tex_root: str, tex_ext: str) -> "dict[str, str]":
+    """Walk *tex_root* and return a dict mapping ``filename.ext`` (lowercase) -> absolute path.
+
+    Called once per import run when the 'match by filename' preference is on.
+    """
+    index: dict[str, str] = {}
+    if not tex_root or not os.path.isdir(tex_root):
+        return index
+    ext_lower = ('.' + tex_ext.lstrip('.')).lower()
+    for dirpath, _dirnames, filenames in os.walk(tex_root):
+        for fname in filenames:
+            if fname.lower().endswith(ext_lower):
+                index[fname.lower()] = os.path.join(dirpath, fname)
+    print(f"[ff7r_umap] Texture index built: {len(index)} file(s) under '{tex_root}'")
+    return index
 
 
 # ============================================================
@@ -202,8 +233,9 @@ def _make_y_invert_curves(nt, loc):
 
 
 def _make_tex_node(nt, game_path: str, tex_root: str, tex_ext: str,
-                   color_space: str, loc, *, links=None, uv_node=None):
-    img = load_image(game_path, tex_root, tex_ext)
+                   color_space: str, loc, *, links=None, uv_node=None,
+                   tex_index=None):
+    img = load_image(game_path, tex_root, tex_ext, tex_index)
     if img is None:
         return None
     tex = nt.nodes.new('ShaderNodeTexImage')
@@ -237,7 +269,8 @@ _COL_BSDF =  200
 _COL_OUT  =  550
 
 
-def _setup_nodes_standard(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
+def _setup_nodes_standard(mat, hashes: list, tex_root: str, tex_ext: str,
+                           tex_index=None) -> None:
     """Classic layout for < 9 slots (UV1 only).
 
     Index → socket:
@@ -263,7 +296,8 @@ def _setup_nodes_standard(mat, hashes: list, tex_root: str, tex_ext: str) -> Non
         return _slot(hashes, i)
 
     def make_tex(game_path, color_space, loc):
-        return _make_tex_node(nt, game_path, tex_root, tex_ext, color_space, loc)
+        return _make_tex_node(nt, game_path, tex_root, tex_ext, color_space, loc,
+                              tex_index=tex_index)
 
     # Slot 4: Occlusion — built first to wire into the Mix node
     occ_path = slot(4)
@@ -375,7 +409,8 @@ _9_CX_UV2  = _COL_TEX - 400
 _9_CX_TEX2 = _COL_TEX - 400   # same column as UV2 node (stacked vertically)
 
 
-def _setup_nodes_9slot(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
+def _setup_nodes_9slot(mat, hashes: list, tex_root: str, tex_ext: str,
+                        tex_index=None) -> None:
     """9-slot layout: slots 0-5 identical to standard; 6 = Color Override,
     7 = unknown/ignored, 8 = Detail Normal (UV2), 9 = Detail AO (UV2).
 
@@ -410,7 +445,8 @@ def _setup_nodes_9slot(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
     uv2.location = (_9_CX_UV2, -200)
 
     def make_tex(game_path, color_space, loc):
-        return _make_tex_node(nt, game_path, tex_root, tex_ext, color_space, loc)
+        return _make_tex_node(nt, game_path, tex_root, tex_ext, color_space, loc,
+                              tex_index=tex_index)
 
     def make_tex_uv2(game_path, color_space, loc):
         n = make_tex(game_path, color_space, loc)
@@ -564,7 +600,8 @@ _10_CX_OUT  =   550
 
 
 
-def _setup_nodes_10slot(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
+def _setup_nodes_10slot(mat, hashes: list, tex_root: str, tex_ext: str,
+                         tex_index=None) -> None:
     """10-slot layout: UV1 base fields + LayeredColor + UV2 detail fields.
 
     UV1 base fields (indices 0-4) are used directly when slots 5-9 contain
@@ -611,7 +648,8 @@ def _setup_nodes_10slot(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
 
     def make_tex_uv1(game_path, color_space, loc):
         """Load a texture on UV1 (default coordinates — no Vector link)."""
-        return _make_tex_node(nt, game_path, tex_root, tex_ext, color_space, loc)
+        return _make_tex_node(nt, game_path, tex_root, tex_ext, color_space, loc,
+                              tex_index=tex_index)
 
     def make_tex(game_path, color_space, loc):
         """Load a texture on UV2."""
@@ -712,7 +750,8 @@ _EX_CX_BSDF =   200
 _EX_CX_OUT  =   600
 
 
-def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
+def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str,
+                           tex_index=None) -> None:
     """11/12-slot layout: UV1 base textures + UV2 detail textures.
 
     Shared base indices (UV1):
@@ -761,6 +800,7 @@ def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str) -> Non
             nt, game_path, tex_root, tex_ext, color_space, loc,
             links=links if use_uv2 else None,
             uv_node=uv2 if use_uv2 else None,
+            tex_index=tex_index,
         )
 
     if is_12:
@@ -939,7 +979,8 @@ def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str) -> Non
 #  Dispatcher
 # ============================================================
 
-def setup_material_nodes(mat, hashes: list, tex_root: str, tex_ext: str) -> None:
+def setup_material_nodes(mat, hashes: list, tex_root: str, tex_ext: str,
+                          tex_index=None) -> None:
     """Choose and run the correct node-setup function for *hashes*.
 
     >= 11 -> _setup_nodes_extended   (UV1 base + UV2 detail)
@@ -948,10 +989,10 @@ def setup_material_nodes(mat, hashes: list, tex_root: str, tex_ext: str) -> None
     <=  8 -> _setup_nodes_standard   (classic layout, slots 0-6)
     """
     if len(hashes) >= 11:
-        _setup_nodes_extended(mat, hashes, tex_root, tex_ext)
+        _setup_nodes_extended(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
     elif len(hashes) == 10:
-        _setup_nodes_10slot(mat, hashes, tex_root, tex_ext)
+        _setup_nodes_10slot(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
     elif len(hashes) == 9:
-        _setup_nodes_9slot(mat, hashes, tex_root, tex_ext)
+        _setup_nodes_9slot(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
     else:
-        _setup_nodes_standard(mat, hashes, tex_root, tex_ext)
+        _setup_nodes_standard(mat, hashes, tex_root, tex_ext, tex_index=tex_index)

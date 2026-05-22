@@ -85,18 +85,7 @@ def apply_ue_attenuation_nodes(
     use_inverse_squared: bool,
     falloff_exponent: float,
 ) -> bool:
-    """
-    Build a light shader matching UE local-light attenuation.
-
-    For inverse-squared lights, UE clamps the physically based falloff with a
-    smooth radius mask:
-
-      inverse_square(distance) * saturate(1 - (distance / radius)^4)^2
-
-    Non-inverse-squared lights use the legacy exponent falloff:
-
-      saturate(1 - distance / radius)^falloff_exponent
-    """
+    """Build a shader matching UE local-light falloff (inverse-squared with radius mask, or exponent-based)."""
     if attenuation_radius <= 0.0 or not hasattr(light_data, "node_tree"):
         return False
 
