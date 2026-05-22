@@ -193,9 +193,8 @@ def _make_y_invert_curves(nt, loc):
     crv = nt.nodes.new('ShaderNodeRGBCurve')
     crv.label    = 'DX Normal Y-flip'
     crv.location = loc
-    # curves[0]=Combined, [1]=R, [2]=G, [3]=B
     # Move the Green curve's two default points from (0→0, 1→1) to (0→1, 1→0).
-    g = crv.mapping.curves[2]
+    g = crv.mapping.curves[1]
     g.points[0].location = (0.0, 1.0)
     g.points[1].location = (1.0, 0.0)
     crv.mapping.update()

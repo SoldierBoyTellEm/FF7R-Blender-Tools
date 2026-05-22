@@ -253,7 +253,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
             ("LEVEL", "Level", "Select LoD by explicit level offset from highest detail"),
             ("ALL", "All LoDs", "Import every available LoD level"),
         ),
-        default="LEVEL",
+        default="QUALITY",
     )
 
     lod_quality: bpy.props.FloatProperty(

@@ -88,7 +88,7 @@ def _collection_matches_asset_name(collection: bpy.types.Collection, asset_name:
     """
     if collection is None:
         return False
-    return collection.name == asset_name or collection.name.startswith(f"{asset_name}.")
+    return asset_linking.id_name_matches(asset_name, collection.name)
 
 
 def find_loaded_linked_source_collection(asset_name: str) -> bpy.types.Collection | None:
@@ -863,6 +863,110 @@ def resolve_streaming_level_json_path(asset_path_name: str, game_root: str) -> s
     return resolve_game_asset_file_path(asset_path_name, game_root, ".json")
 
 
+def collect_level_streaming_asset_paths(data: list) -> list[str]:
+    """
+    Return the JSON asset paths referenced by LevelStreaming entries.
+
+    These are the world's direct streaming-level records. EndStreamingVolume
+    actors are trigger volumes and often point at adjacent/event maps, so they
+    are used only as a fallback when these entries are absent.
+    """
+    asset_paths: list[str] = []
+    seen: set[str] = set()
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Type") not in {"LevelStreamingAlwaysLoaded", "LevelStreamingDynamic"}:
+            continue
+
+        props = entry.get("Properties", {})
+        if not isinstance(props, dict):
+            continue
+        world_asset = props.get("WorldAsset")
+        if not isinstance(world_asset, dict):
+            continue
+
+        asset_path_name = world_asset.get("AssetPathName")
+        if not asset_path_name or asset_path_name in seen:
+            continue
+        seen.add(asset_path_name)
+        asset_paths.append(asset_path_name)
+
+    return asset_paths
+
+
+def collect_volume_streaming_asset_paths(data: list) -> list[str]:
+    """Return streaming level paths referenced by EndStreamingVolume triggers."""
+    asset_paths: list[str] = []
+    seen: set[str] = set()
+
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("Type") != "EndStreamingVolume":
+            continue
+
+        props = entry.get("Properties", {})
+        if not isinstance(props, dict):
+            continue
+        levels = props.get("StreamingLevels", [])
+        if not isinstance(levels, list):
+            continue
+
+        for lvl in levels:
+            if not isinstance(lvl, dict):
+                continue
+            asset_path_name = lvl.get("AssetPathName")
+            if not asset_path_name or asset_path_name in seen:
+                continue
+            seen.add(asset_path_name)
+            asset_paths.append(asset_path_name)
+
+    return asset_paths
+
+
+def import_streaming_asset_paths(
+    asset_paths: list[str],
+    source_label: str,
+    game_root: str,
+    exposure_mult: float,
+    attenuation_radius_mult: float,
+    visited_paths: set[str],
+    recursive_import: bool,
+    import_massive_environment_umaps: bool,
+    imported_umap_paths: set[str],
+) -> tuple[int, set[str]]:
+    """Resolve streaming asset paths to JSON files and import them."""
+    created_count = 0
+    missing_assets: set[str] = set()
+
+    print(f"[End JSON Import]   {source_label} - {len(asset_paths)} streaming level(s) referenced.")
+    for asset_path_name in asset_paths:
+        json_path = resolve_streaming_level_json_path(asset_path_name, game_root)
+        if not json_path:
+            print(f"[End JSON Import]     Could not resolve path for: {asset_path_name!r}")
+            continue
+        if not os.path.exists(json_path):
+            print(f"[End JSON Import]     Streaming JSON not found: {json_path}")
+            continue
+
+        print(f"[End JSON Import]     Recursing into streaming level: {json_path}")
+        child_created, child_missing = import_json_file(
+            filepath=json_path,
+            exposure_mult=exposure_mult,
+            attenuation_radius_mult=attenuation_radius_mult,
+            game_root=game_root,
+            visited_paths=visited_paths,
+            recursive_import=recursive_import,
+            import_massive_environment_umaps=import_massive_environment_umaps,
+            imported_umap_paths=imported_umap_paths,
+        )
+        print(f"[End JSON Import]     Streaming level done - {child_created} item(s) created, {len(child_missing)} missing.")
+        created_count += child_created
+        missing_assets |= child_missing
+
+    return created_count, missing_assets
+
+
 def resolve_massive_environment_umap_path(entry: dict, game_root: str) -> str | None:
     """
     Convert a MassiveEnvironmentComponent's StreamingProxy path into a .umap path.
@@ -1625,6 +1729,27 @@ def import_json_file(
     pending_vector_parameters: list[tuple[int, dict]] = []
     location_scale = 0.01  # UE units -> Blender (cm -> m)
 
+    level_streaming_asset_paths = collect_level_streaming_asset_paths(data)
+    use_volume_streaming_fallback = not level_streaming_asset_paths
+    if recursive_import:
+        if not game_root:
+            if level_streaming_asset_paths:
+                print("[End JSON Import]   LevelStreaming entries found but Game Root is not set - skipping.")
+        elif level_streaming_asset_paths:
+            child_created, child_missing = import_streaming_asset_paths(
+                asset_paths=level_streaming_asset_paths,
+                source_label="LevelStreaming",
+                game_root=game_root,
+                exposure_mult=exposure_mult,
+                attenuation_radius_mult=attenuation_radius_mult,
+                visited_paths=visited_paths,
+                recursive_import=recursive_import,
+                import_massive_environment_umaps=import_massive_environment_umaps,
+                imported_umap_paths=imported_umap_paths,
+            )
+            created_count += child_created
+            missing_assets |= child_missing
+
     for entry_index, entry in enumerate(data):
         if not isinstance(entry, dict):
             continue
@@ -1961,41 +2086,30 @@ def import_json_file(
         # Streaming volumes -> recursively import referenced JSONs
         # ------------------------------------------------------------------ #
         elif t == "EndStreamingVolume":
+            if not use_volume_streaming_fallback:
+                continue
             if not recursive_import:
                 continue
             if not game_root:
                 print("[End JSON Import]   EndStreamingVolume found but Game Root is not set - skipping.")
                 continue
 
-            props = entry.get("Properties", {})
-            levels = props.get("StreamingLevels", [])
-            print(f"[End JSON Import]   EndStreamingVolume - {len(levels)} streaming level(s) referenced.")
-            for lvl in levels:
-                if not isinstance(lvl, dict):
-                    continue
-                asset_path_name = lvl.get("AssetPathName")
-                json_path = resolve_streaming_level_json_path(asset_path_name, game_root)
-                if not json_path:
-                    print(f"[End JSON Import]     Could not resolve path for: {asset_path_name!r}")
-                    continue
-                if not os.path.exists(json_path):
-                    print(f"[End JSON Import]     Streaming JSON not found: {json_path}")
-                    continue
-
-                print(f"[End JSON Import]     Recursing into streaming level: {json_path}")
-                child_created, child_missing = import_json_file(
-                    filepath=json_path,
-                    exposure_mult=exposure_mult,
-                    attenuation_radius_mult=attenuation_radius_mult,
-                    game_root=game_root,
-                    visited_paths=visited_paths,
-                    recursive_import=recursive_import,
-                    import_massive_environment_umaps=import_massive_environment_umaps,
-                    imported_umap_paths=imported_umap_paths,
-                )
-                print(f"[End JSON Import]     Streaming level done - {child_created} item(s) created, {len(child_missing)} missing.")
-                created_count += child_created
-                missing_assets |= child_missing
+            volume_asset_paths = collect_volume_streaming_asset_paths([entry])
+            if not volume_asset_paths:
+                continue
+            child_created, child_missing = import_streaming_asset_paths(
+                asset_paths=volume_asset_paths,
+                source_label="EndStreamingVolume",
+                game_root=game_root,
+                exposure_mult=exposure_mult,
+                attenuation_radius_mult=attenuation_radius_mult,
+                visited_paths=visited_paths,
+                recursive_import=recursive_import,
+                import_massive_environment_umaps=import_massive_environment_umaps,
+                imported_umap_paths=imported_umap_paths,
+            )
+            created_count += child_created
+            missing_assets |= child_missing
 
         elif t == "MassiveEnvironmentComponent":
             if import_massive_environment_umaps:

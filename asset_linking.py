@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
 
 import bpy
 
@@ -18,6 +20,8 @@ _ASSET_INDEX_CACHE: dict[str, dict[str, list[str]]] = {}
 _OBJECT_ASSET_INDEX_CACHE: dict[str, dict[str, list[str]]] = {}
 _COMBINED_INDEX_CACHE: set[str] = set()
 _BLEND_PATHS_CACHE: dict[str, list[Path]] = {}
+_BLENDER_4_ID_NAME_LIMIT = 63
+_DUPLICATE_ID_SUFFIX_RE = re.compile(r"\.\d{3}$")
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,115 @@ def selected_asset_libraries(selection: str):
 
 def _cache_key(selection: str) -> str:
     return selection or ASSET_LIBRARY_ALL
+
+
+def uses_limited_id_names() -> bool:
+    """Return True when Blender truncates ID names to the legacy 4.x limit."""
+    return tuple(getattr(bpy.app, "version", (0, 0, 0))) < (5, 0, 0)
+
+
+def limited_id_name(name: str) -> str:
+    """Return Blender 4.x's visible ID name for *name*."""
+    if not name or not uses_limited_id_names():
+        return name
+
+    encoded = name.encode("utf-8")
+    if len(encoded) <= _BLENDER_4_ID_NAME_LIMIT:
+        return name
+    return encoded[:_BLENDER_4_ID_NAME_LIMIT].decode("utf-8", errors="ignore")
+
+
+def id_name_candidates(name: str) -> tuple[str, ...]:
+    """Return acceptable library/loaded ID names for the active Blender version."""
+    if not name:
+        return ()
+
+    limited = limited_id_name(name)
+    if limited != name:
+        return name, limited
+    return (name,)
+
+
+def id_name_matches(requested_name: str, actual_name: str) -> bool:
+    """
+    Return True when *actual_name* can represent *requested_name*.
+
+    Blender 5.x keeps full ID names. Blender 4.x truncates long names when it
+    reads newer .blend files, so matching must also accept the truncated form.
+    """
+    if not requested_name or not actual_name:
+        return False
+
+    for candidate in id_name_candidates(requested_name):
+        if actual_name == candidate or actual_name.startswith(f"{candidate}."):
+            return True
+
+    if uses_limited_id_names():
+        suffix_match = _DUPLICATE_ID_SUFFIX_RE.search(actual_name)
+        if suffix_match is not None and len(actual_name.encode("utf-8")) >= _BLENDER_4_ID_NAME_LIMIT:
+            base_name = actual_name[:suffix_match.start()]
+            return bool(base_name) and any(
+                candidate.startswith(base_name) for candidate in id_name_candidates(requested_name)
+            )
+
+    return False
+
+
+def resolve_library_id_name(available_names: Iterable[str], requested_name: str) -> str | None:
+    """Resolve *requested_name* to the actual name exposed by a library load."""
+    names = list(available_names)
+    if not requested_name:
+        return None
+
+    name_set = set(names)
+    for candidate in id_name_candidates(requested_name):
+        if candidate in name_set:
+            return candidate
+
+    if uses_limited_id_names():
+        matches = sorted(name for name in names if id_name_matches(requested_name, name))
+        if matches:
+            return matches[0]
+
+    return None
+
+
+def _resolve_library_id_names(available_names: Iterable[str], requested_names: Iterable[str]) -> list[str]:
+    names = list(available_names)
+    resolved_names: list[str] = []
+    seen: set[str] = set()
+    for requested_name in requested_names:
+        resolved_name = resolve_library_id_name(names, requested_name)
+        if resolved_name is None or resolved_name in seen:
+            continue
+        seen.add(resolved_name)
+        resolved_names.append(resolved_name)
+    return resolved_names
+
+
+def index_paths_for_id_name(index: Mapping[str, list[str]], requested_name: str) -> list[str]:
+    """Return indexed blend paths for *requested_name*, including 4.x truncation aliases."""
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add_paths(indexed_paths: Iterable[str] | None) -> None:
+        if not indexed_paths:
+            return
+        for path in indexed_paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+
+    for candidate in id_name_candidates(requested_name):
+        add_paths(index.get(candidate))
+
+    if not paths and uses_limited_id_names():
+        for indexed_name, indexed_paths in index.items():
+            if id_name_matches(requested_name, indexed_name):
+                add_paths(indexed_paths)
+
+    return paths
 
 
 def clear_asset_caches() -> None:
@@ -209,13 +322,13 @@ def get_object_asset_index(selection: str = ASSET_LIBRARY_ALL) -> dict[str, list
 def _collection_matches_asset_name(collection: bpy.types.Collection, asset_name: str) -> bool:
     if collection is None:
         return False
-    return collection.name == asset_name or collection.name.startswith(f"{asset_name}.")
+    return id_name_matches(asset_name, collection.name)
 
 
 def _object_matches_asset_name(obj: bpy.types.Object, asset_name: str) -> bool:
     if obj is None:
         return False
-    return obj.name == asset_name or obj.name.startswith(f"{asset_name}.")
+    return id_name_matches(asset_name, obj.name)
 
 
 def find_loaded_linked_source_collection(asset_name: str) -> bpy.types.Collection | None:
@@ -259,7 +372,7 @@ def find_or_load_object(
     if selection == ASSET_LIBRARY_NONE:
         return None
 
-    blend_paths = get_object_asset_index(selection).get(asset_name)
+    blend_paths = index_paths_for_id_name(get_object_asset_index(selection), asset_name)
     if not blend_paths:
         print(f"[FF7R JSON Import]   Object asset not found in selected asset libraries: {asset_name!r}")
         return None
@@ -269,14 +382,16 @@ def find_or_load_object(
             continue
         try:
             with bpy.data.libraries.load(blend_path, link=True, assets_only=True) as (data_from, data_to):
-                if asset_name not in data_from.objects:
+                object_name = resolve_library_id_name(data_from.objects, asset_name)
+                if object_name is None:
                     continue
-                data_to.objects = [asset_name]
+                data_to.objects = [object_name]
         except TypeError:
             with bpy.data.libraries.load(blend_path, link=True) as (data_from, data_to):
-                if asset_name not in data_from.objects:
+                object_name = resolve_library_id_name(data_from.objects, asset_name)
+                if object_name is None:
                     continue
-                data_to.objects = [asset_name]
+                data_to.objects = [object_name]
         except Exception as exc:
             print(f"[FF7R JSON Import]   Failed to link object {asset_name!r} from {blend_path}: {exc}")
             continue
@@ -319,7 +434,7 @@ def preload_assets(
         if find_loaded_linked_source_collection(asset_name) is not None:
             continue
 
-        collection_paths = collection_index.get(asset_name)
+        collection_paths = index_paths_for_id_name(collection_index, asset_name)
         if collection_paths:
             collections_by_path.setdefault(collection_paths[0], []).append(asset_name)
             continue
@@ -330,7 +445,7 @@ def preload_assets(
         if find_loaded_linked_source_object(asset_name) is not None:
             continue
 
-        object_paths = object_index.get(asset_name)
+        object_paths = index_paths_for_id_name(object_index, asset_name)
         if object_paths:
             objects_by_path.setdefault(object_paths[0], []).append(asset_name)
 
@@ -343,12 +458,12 @@ def preload_assets(
         object_names = objects_by_path.get(blend_path, [])
         try:
             with bpy.data.libraries.load(blend_path, link=True, assets_only=True) as (data_from, data_to):
-                data_to.collections = [name for name in collection_names if name in data_from.collections]
-                data_to.objects = [name for name in object_names if name in data_from.objects]
+                data_to.collections = _resolve_library_id_names(data_from.collections, collection_names)
+                data_to.objects = _resolve_library_id_names(data_from.objects, object_names)
         except TypeError:
             with bpy.data.libraries.load(blend_path, link=True) as (data_from, data_to):
-                data_to.collections = [name for name in collection_names if name in data_from.collections]
-                data_to.objects = [name for name in object_names if name in data_from.objects]
+                data_to.collections = _resolve_library_id_names(data_from.collections, collection_names)
+                data_to.objects = _resolve_library_id_names(data_from.objects, object_names)
         except Exception as exc:
             print(f"[FF7R JSON Import]   Failed to batch link assets from {blend_path}: {exc}")
 
@@ -369,7 +484,7 @@ def find_or_load_collection(
     if selection == ASSET_LIBRARY_NONE:
         return None
 
-    blend_paths = get_collection_asset_index(selection).get(asset_name)
+    blend_paths = index_paths_for_id_name(get_collection_asset_index(selection), asset_name)
     if not blend_paths:
         if report_missing:
             print(f"[FF7R JSON Import]   Collection not found in selected asset libraries: {asset_name!r}")
@@ -380,14 +495,16 @@ def find_or_load_collection(
             continue
         try:
             with bpy.data.libraries.load(blend_path, link=True, assets_only=True) as (data_from, data_to):
-                if asset_name not in data_from.collections:
+                collection_name = resolve_library_id_name(data_from.collections, asset_name)
+                if collection_name is None:
                     continue
-                data_to.collections = [asset_name]
+                data_to.collections = [collection_name]
         except TypeError:
             with bpy.data.libraries.load(blend_path, link=True) as (data_from, data_to):
-                if asset_name not in data_from.collections:
+                collection_name = resolve_library_id_name(data_from.collections, asset_name)
+                if collection_name is None:
                     continue
-                data_to.collections = [asset_name]
+                data_to.collections = [collection_name]
         except Exception as exc:
             print(f"[FF7R JSON Import]   Failed to link {asset_name!r} from {blend_path}: {exc}")
             continue

@@ -48,13 +48,13 @@ def source_to_scene_time_scale(display_rate: float | int, source_display_rate: f
 
 
 def find_loaded_action_by_name(action_name: str):
-    """Return the exact loaded action, or a Blender duplicate-suffixed fallback."""
+    """Return the loaded action, including Blender duplicate/truncation fallbacks."""
     action = bpy.data.actions.get(action_name)
     if action is not None:
         return action
 
     matches = sorted(
-        (a for a in bpy.data.actions if a.name.startswith(action_name + ".")),
+        (a for a in bpy.data.actions if asset_linking.id_name_matches(action_name, a.name)),
         key=lambda a: a.name,
     )
     return matches[0] if matches else None
@@ -102,7 +102,7 @@ def append_action_from_asset_libraries(
     found_path: Path | None = cached_path if cached_path else None
     if found_path is None:
         for blend_path in candidate_paths:
-            if action_name in asset_action_names_in_blend(blend_path):
+            if asset_linking.resolve_library_id_name(asset_action_names_in_blend(blend_path), action_name):
                 found_path = blend_path
                 break
         _ASSET_ACTION_PATH_CACHE[cache_key] = found_path
@@ -113,14 +113,16 @@ def append_action_from_asset_libraries(
     print(f"[FF7R JSON Import]     Appending action '{action_name}' from '{found_path.name}'")
     try:
         with bpy.data.libraries.load(str(found_path), link=False, assets_only=True) as (data_from, data_to):
-            if action_name not in data_from.actions:
+            library_action_name = asset_linking.resolve_library_id_name(data_from.actions, action_name)
+            if library_action_name is None:
                 return None
-            data_to.actions = [action_name]
+            data_to.actions = [library_action_name]
     except TypeError:
         with bpy.data.libraries.load(str(found_path), link=False) as (data_from, data_to):
-            if action_name not in data_from.actions:
+            library_action_name = asset_linking.resolve_library_id_name(data_from.actions, action_name)
+            if library_action_name is None:
                 return None
-            data_to.actions = [action_name]
+            data_to.actions = [library_action_name]
     except Exception as exc:
         print(f"[FF7R JSON Import]     WARNING action append failed '{action_name}': {exc}")
         return None

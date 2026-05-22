@@ -723,16 +723,8 @@ def _trim_previous_strip_for_overlap(nla_track, new_start: float, epsilon: float
 
 
 def _find_loaded_action_by_name(action_name: str):
-    """Return the exact loaded action, or a Blender duplicate-suffixed fallback."""
-    action = bpy.data.actions.get(action_name)
-    if action is not None:
-        return action
-
-    matches = sorted(
-        (a for a in bpy.data.actions if a.name.startswith(action_name + ".")),
-        key=lambda a: a.name,
-    )
-    return matches[0] if matches else None
+    """Return the loaded action, including Blender duplicate/truncation fallbacks."""
+    return timeline_actions.find_loaded_action_by_name(action_name)
 
 
 def _append_action_from_asset_libraries(action_name: str):
