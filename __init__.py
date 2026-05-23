@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FF7 Rebirth map importer",
     "author": "GargoyleTech",
-    "version": (2, 0, 3),
+    "version": (2, 0, 8),
     "blender": (4, 0, 0),
     "location": "File > Import > FF7R Rebirth",
     "description": "Imports FF7R Rebirth cutscene JSON, UMAP JSON, and Massive Environment .umap files",
@@ -16,7 +16,7 @@ import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, StringProperty
 from bpy.types import AddonPreferences, Menu, Operator
 
-from . import asset_linking, cutscene_import, lights, map_import, timeline_actions
+from . import asset_linking, cutscene_import, lights, map_import, particles, timeline_actions, worlds
 from .mec import importer as mec_importer
 from .mec import material as mec_material
 from .mec import parser as mec_parser
@@ -24,6 +24,8 @@ from .mec import parser as mec_parser
 for _module in (
     asset_linking,
     lights,
+    particles,
+    worlds,
     timeline_actions,
     cutscene_import,
     mec_material,
@@ -348,6 +350,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         game_root = bpy.path.abspath(self.game_root) if self.game_root else ""
         visited_paths: set[str] = set()
         imported_umap_paths: set[str] = set()
+        imported_world_sky_paths: set[str] = set()
         texture_index_cache: dict[tuple[str, str], dict[str, str]] = {}
         total_created = 0
         all_missing_assets: set[str] = set()
@@ -368,6 +371,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
                         and map_import.is_umap_addon_available()
                     ),
                     imported_umap_paths=imported_umap_paths,
+                    imported_world_sky_paths=imported_world_sky_paths,
                     texture_index_cache=texture_index_cache,
                 )
                 total_created += created

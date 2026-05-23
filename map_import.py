@@ -7,7 +7,7 @@ import importlib
 from contextlib import contextmanager as _contextmanager
 from mathutils import Vector, Euler, Matrix
 
-from . import asset_linking, lights
+from . import asset_linking, lights, particles, worlds
 
 
 ASSET_LIBRARY_SELECTION = asset_linking.ASSET_LIBRARY_ALL
@@ -871,6 +871,7 @@ def import_streaming_asset_paths(
     recursive_root_dir: str,
     import_massive_environment_umaps: bool,
     imported_umap_paths: set[str],
+    imported_world_sky_paths: set[str],
     texture_index_cache: TextureIndexCache | None = None,
 ) -> tuple[int, set[str]]:
     """Resolve streaming asset paths to JSON files and import them."""
@@ -908,6 +909,7 @@ def import_streaming_asset_paths(
             recursive_root_dir=recursive_root_dir,
             import_massive_environment_umaps=import_massive_environment_umaps,
             imported_umap_paths=imported_umap_paths,
+            imported_world_sky_paths=imported_world_sky_paths,
             texture_index_cache=texture_index_cache,
         )
         print(f"[End JSON Import]     Streaming level done - {child_created} item(s) created, {len(child_missing)} missing.")
@@ -1336,6 +1338,7 @@ def import_json_file(
     recursive_root_dir: str | None = None,
     import_massive_environment_umaps: bool = True,
     imported_umap_paths: set[str] | None = None,
+    imported_world_sky_paths: set[str] | None = None,
     texture_index_cache: TextureIndexCache | None = None,
 ) -> tuple[int, set[str]]:
     filepath = os.path.realpath(filepath)
@@ -1350,6 +1353,8 @@ def import_json_file(
     visited_paths.add(filepath)
     if imported_umap_paths is None:
         imported_umap_paths = set()
+    if imported_world_sky_paths is None:
+        imported_world_sky_paths = set()
     if texture_index_cache is None:
         texture_index_cache = {}
 
@@ -1414,9 +1419,38 @@ def import_json_file(
     pending_vector_parameters: list[tuple[int, dict]] = []
     location_scale = 0.01
 
+    created_count += particles.create_niagara_empties_from_effect_json(
+        data,
+        filepath,
+        location_scale=location_scale,
+    )
+    if worlds.create_world_from_level_data(data, filepath):
+        created_count += 1
+    created_count += worlds.create_finite_fog_volume_from_level_data(
+        data,
+        filepath,
+        location_scale=location_scale,
+    )
+    created_count += worlds.create_reflection_capture_probes(
+        data,
+        filepath,
+        location_scale=location_scale,
+    )
+
     level_streaming_asset_paths = collect_level_streaming_asset_paths(data)
     use_volume_streaming_fallback = not level_streaming_asset_paths
     if recursive_import:
+        world_sky_result = worlds.import_world_sky_references(
+            data=data,
+            game_root=game_root,
+            imported_world_sky_paths=imported_world_sky_paths,
+            location_scale=location_scale,
+        )
+        created_count += (
+            world_sky_result.worlds_created
+            + world_sky_result.fog_volumes_created
+            + world_sky_result.probes_created
+        )
         if not game_root:
             if level_streaming_asset_paths:
                 print("[End JSON Import]   LevelStreaming entries found but Game Root is not set - skipping.")
@@ -1433,6 +1467,7 @@ def import_json_file(
                 recursive_root_dir=recursive_root_dir,
                 import_massive_environment_umaps=import_massive_environment_umaps,
                 imported_umap_paths=imported_umap_paths,
+                imported_world_sky_paths=imported_world_sky_paths,
                 texture_index_cache=texture_index_cache,
             )
             created_count += child_created
@@ -1723,6 +1758,7 @@ def import_json_file(
                 recursive_root_dir=recursive_root_dir,
                 import_massive_environment_umaps=import_massive_environment_umaps,
                 imported_umap_paths=imported_umap_paths,
+                imported_world_sky_paths=imported_world_sky_paths,
                 texture_index_cache=texture_index_cache,
             )
             created_count += child_created
