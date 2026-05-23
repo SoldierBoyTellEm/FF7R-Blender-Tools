@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FF7 Rebirth map importer",
     "author": "GargoyleTech",
-    "version": (2, 0, 8),
+    "version": (2, 0, 3),
     "blender": (4, 0, 0),
     "location": "File > Import > FF7R Rebirth",
     "description": "Imports FF7R Rebirth cutscene JSON, UMAP JSON, and Massive Environment .umap files",
