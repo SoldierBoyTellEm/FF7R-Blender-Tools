@@ -1058,6 +1058,7 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
 
         imported_lights[spawn_guid] = light_obj
         bl_light: bpy.types.Light = light_obj.data
+        lights.apply_default_light_options(bl_light)
 
         for tp in tracks_for.get(spawn_guid, []):
             xform = get_transform_section(data, tp)

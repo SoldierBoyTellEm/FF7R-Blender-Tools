@@ -11,11 +11,80 @@ Sections
 """
 
 import struct
+from collections import defaultdict
+
 import bpy
 import numpy as np
 from mathutils import Vector, Quaternion
 
 from .material import setup_material_nodes, resolve_hash
+
+
+OPPOSITE_FACE_OFFSET = 0.0005
+OPPOSITE_FACE_DOT_THRESHOLD = -0.99
+OPPOSITE_FACE_POSITION_DECIMALS = 6
+
+
+def offset_opposite_face_geometry(
+        verts_arr: np.ndarray,
+        normals_arr: np.ndarray,
+        faces_arr: np.ndarray,
+        *,
+        offset: float = OPPOSITE_FACE_OFFSET,
+) -> int:
+    """Directly offset vertices on overlapping faces with opposite normals."""
+    if offset == 0.0 or len(verts_arr) == 0 or len(faces_arr) == 0:
+        return 0
+
+    face_groups = defaultdict(list)
+    for face_idx, face in enumerate(faces_arr):
+        key = tuple(sorted(
+            tuple(
+                round(float(coord), OPPOSITE_FACE_POSITION_DECIMALS)
+                for coord in verts_arr[int(vert_idx)]
+            )
+            for vert_idx in face
+        ))
+        face_groups[key].append(face_idx)
+
+    face_vertices = verts_arr[faces_arr]
+    face_normals = np.cross(
+        face_vertices[:, 1] - face_vertices[:, 0],
+        face_vertices[:, 2] - face_vertices[:, 0],
+    ).astype(np.float32, copy=False)
+    face_normal_lengths = np.sqrt((face_normals * face_normals).sum(axis=1))
+    valid_face_normals = face_normal_lengths > 1e-30
+    face_normals[valid_face_normals] /= face_normal_lengths[valid_face_normals, None]
+
+    affected_vertices: set[int] = set()
+    for grouped_faces in face_groups.values():
+        if len(grouped_faces) < 2:
+            continue
+        for first_pos, face_a in enumerate(grouped_faces):
+            if not valid_face_normals[face_a]:
+                continue
+            normal_a = face_normals[face_a]
+            for face_b in grouped_faces[first_pos + 1:]:
+                if not valid_face_normals[face_b]:
+                    continue
+                if float(np.dot(normal_a, face_normals[face_b])) < OPPOSITE_FACE_DOT_THRESHOLD:
+                    affected_vertices.update(int(idx) for idx in faces_arr[face_a])
+                    affected_vertices.update(int(idx) for idx in faces_arr[face_b])
+
+    if not affected_vertices:
+        return 0
+
+    affected_indices = np.fromiter(sorted(affected_vertices), dtype=np.int32)
+    offset_dirs = normals_arr[affected_indices].astype(np.float32, copy=True)
+    offset_dir_lengths = np.sqrt((offset_dirs * offset_dirs).sum(axis=1))
+    valid_offset_dirs = offset_dir_lengths > 1e-30
+    if not np.any(valid_offset_dirs):
+        return 0
+
+    offset_dirs[valid_offset_dirs] /= offset_dir_lengths[valid_offset_dirs, None]
+    valid_indices = affected_indices[valid_offset_dirs]
+    verts_arr[valid_indices] += offset_dirs[valid_offset_dirs] * float(offset)
+    return int(len(valid_indices))
 
 
 # ============================================================
@@ -205,6 +274,7 @@ def build_objects_from_component(
         tex_root: str = "",
         tex_ext: str = "dds",
         tex_index: "dict | None" = None,
+        offset_opposite_faces: bool = False,
 ) -> None:
     """Parse ONE MassiveEnvironmentComponent0 and populate the Blender scene."""
 
@@ -597,6 +667,10 @@ def build_objects_from_component(
                 uvs_slice   = uvs_arr[vs:vs + vc]                        # (vc, num_uv_ch*2) float32
 
                 faces_arr = get_triangles(sub_s)                         # (N, 3) int32
+                if offset_opposite_faces:
+                    offset_count = offset_opposite_face_geometry(verts_slice, norms_slice, faces_arr)
+                    if offset_count:
+                        print(f"    {mesh_name}: offset {offset_count} opposite-face vertices")
                 mesh.from_pydata(verts_slice.tolist(), [], faces_arr.tolist())
 
                 # UVs via foreach_set - one C call per layer instead of a Python loop over loops.

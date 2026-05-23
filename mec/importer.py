@@ -56,6 +56,7 @@ def import_umap_paths(
         lod_quality=1.0,
         lod_level=0,
         import_originals=False,
+        offset_opposite_faces=False,
         scale_factor=0.01,
         tex_root=None,
         tex_ext=None,
@@ -224,6 +225,7 @@ def import_umap_paths(
                     tex_root=tex_root,
                     tex_ext=tex_ext,
                     tex_index=tex_index,
+                    offset_opposite_faces=offset_opposite_faces,
                 )
                 found = True
                 break
@@ -281,6 +283,15 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
         default=False,
     )
 
+    offset_opposite_faces: bpy.props.BoolProperty(
+        name="Offset opposite overlapping faces",
+        description=(
+            "Directly offset vertices on overlapping opposite-facing faces by 0.0005 "
+            "to reduce z-fighting; no modifiers or material changes"
+        ),
+        default=False,
+    )
+
     lod_mode: bpy.props.EnumProperty(
         name="LoD level",
         description="Choose how LoD meshes are selected",
@@ -322,6 +333,9 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype='FILE_PATH', options={'SKIP_SAVE', 'HIDDEN'})
 
     def invoke(self, context, event):
+        prefs = _get_addon_preferences(context)
+        if prefs:
+            self.offset_opposite_faces = getattr(prefs, "offset_mec_opposite_faces", False)
         if self.files:              # called from drag-and-drop (files already resolved)
             return context.window_manager.invoke_props_dialog(self)
         context.window_manager.fileselect_add(self)
@@ -330,6 +344,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "import_originals")
+        layout.prop(self, "offset_opposite_faces")
         layout.label(text="LOD Level")
         layout.prop(self, "lod_mode", expand=True)
         if self.lod_mode == "QUALITY":
@@ -373,6 +388,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
             lod_quality=self.lod_quality,
             lod_level=self.lod_level,
             import_originals=self.import_originals,
+            offset_opposite_faces=self.offset_opposite_faces,
             scale_factor=self.scale_factor,
             tex_root=None if prefs_available else self.fallback_tex_root,
             tex_ext=None if prefs_available else self.fallback_tex_ext,

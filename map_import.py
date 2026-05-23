@@ -333,8 +333,17 @@ def rotation_from_relative(rot_dict: dict) -> Euler:
 
 def light_rotation_from_relative(rot_dict: dict) -> Euler:
     """rotation_from_relative plus the Blender spot -Z -> UE +X forward correction."""
+    if not _has_rotation_values(rot_dict):
+        return Euler((0.0, 0.0, 0.0), "XYZ")
     mesh_rot = rotation_from_relative(rot_dict)
     return (mesh_rot.to_matrix().to_4x4() @ _LIGHT_FWD_FIX).to_euler("XYZ")
+
+
+def _has_rotation_values(rot_dict: dict) -> bool:
+    """Return True when the export supplied at least one UE rotation channel."""
+    if not isinstance(rot_dict, dict):
+        return False
+    return any(axis in rot_dict for axis in ("Pitch", "Yaw", "Roll"))
 
 
 def location_from_relative(loc_dict: dict, scale_factor: float = 0.01) -> Vector:
@@ -647,19 +656,39 @@ def _color_prop_values(color: dict) -> tuple[list[float] | None, str | None]:
     return (channels or None), hex_value if isinstance(hex_value, str) else None
 
 
-def _apply_material_parameter_light_props(obj: bpy.types.Object, props: dict):
+def _apply_material_parameter_light_props(
+    obj: bpy.types.Object,
+    props: dict,
+    exposure_mult: float = 1.0,
+):
     mpl = props.get("MaterialParameterLight", {})
     if obj is None or not isinstance(mpl, dict):
         return
     if "Intensity" in mpl:
-        obj["material_parameter_light_intensity"] = _float_or_default(mpl.get("Intensity"))
+        intensity = _float_or_default(mpl.get("Intensity"))
+        obj["material_parameter_light_intensity"] = intensity
+        light_data = getattr(obj, "data", None)
+        if light_data is not None and hasattr(light_data, "energy"):
+            light_data.energy = intensity * exposure_mult
     if "ColorTemperature" in mpl:
-        obj["material_parameter_light_color_temperature"] = _float_or_default(
-            mpl.get("ColorTemperature")
-        )
+        temperature = _float_or_default(mpl.get("ColorTemperature"))
+        obj["material_parameter_light_color_temperature"] = temperature
+        light_data = getattr(obj, "data", None)
+        if light_data is not None:
+            if hasattr(light_data, "use_temperature"):
+                light_data.use_temperature = True
+            if hasattr(light_data, "temperature"):
+                light_data.temperature = temperature
     color_value, hex_value = _color_prop_values(mpl.get("Color", {}))
     if color_value is not None:
         obj["material_parameter_light_color"] = color_value
+        light_data = getattr(obj, "data", None)
+        if light_data is not None and hasattr(light_data, "color") and len(color_value) >= 3:
+            light_data.color = (
+                max(0.0, min(1.0, color_value[0] / 255.0)),
+                max(0.0, min(1.0, color_value[1] / 255.0)),
+                max(0.0, min(1.0, color_value[2] / 255.0)),
+            )
     if hex_value is not None:
         obj["material_parameter_light_color_hex"] = hex_value
 
@@ -873,6 +902,7 @@ def import_streaming_asset_paths(
     imported_umap_paths: set[str],
     imported_world_sky_paths: set[str],
     texture_index_cache: TextureIndexCache | None = None,
+    offset_mec_opposite_faces: bool = False,
 ) -> tuple[int, set[str]]:
     """Resolve streaming asset paths to JSON files and import them."""
     created_count = 0
@@ -911,6 +941,7 @@ def import_streaming_asset_paths(
             imported_umap_paths=imported_umap_paths,
             imported_world_sky_paths=imported_world_sky_paths,
             texture_index_cache=texture_index_cache,
+            offset_mec_opposite_faces=offset_mec_opposite_faces,
         )
         print(f"[End JSON Import]     Streaming level done - {child_created} item(s) created, {len(child_missing)} missing.")
         created_count += child_created
@@ -956,6 +987,7 @@ def import_massive_environment_umap(
     game_root: str,
     imported_umap_paths: set[str],
     texture_index_cache: TextureIndexCache | None = None,
+    offset_opposite_faces: bool = False,
 ) -> tuple[int, int, set[str]]:
     if not game_root:
         print("[End JSON Import]   MassiveEnvironmentComponent found but Game Root is not set - skipping .umap import.")
@@ -991,6 +1023,7 @@ def import_massive_environment_umap(
             lod_level=0,
             scale_factor=0.01,
             texture_index_cache=texture_index_cache,
+            offset_opposite_faces=offset_opposite_faces,
         )
         return processed, skipped, set()
     except Exception as exc:
@@ -1340,6 +1373,7 @@ def import_json_file(
     imported_umap_paths: set[str] | None = None,
     imported_world_sky_paths: set[str] | None = None,
     texture_index_cache: TextureIndexCache | None = None,
+    offset_mec_opposite_faces: bool = False,
 ) -> tuple[int, set[str]]:
     filepath = os.path.realpath(filepath)
     if recursive_root_dir is None:
@@ -1469,6 +1503,7 @@ def import_json_file(
                 imported_umap_paths=imported_umap_paths,
                 imported_world_sky_paths=imported_world_sky_paths,
                 texture_index_cache=texture_index_cache,
+                offset_mec_opposite_faces=offset_mec_opposite_faces,
             )
             created_count += child_created
             missing_assets |= child_missing
@@ -1760,6 +1795,7 @@ def import_json_file(
                 imported_umap_paths=imported_umap_paths,
                 imported_world_sky_paths=imported_world_sky_paths,
                 texture_index_cache=texture_index_cache,
+                offset_mec_opposite_faces=offset_mec_opposite_faces,
             )
             created_count += child_created
             missing_assets |= child_missing
@@ -1771,6 +1807,7 @@ def import_json_file(
                     game_root,
                     imported_umap_paths,
                     texture_index_cache,
+                    offset_opposite_faces=offset_mec_opposite_faces,
                 )
                 created_count += processed
                 missing_assets |= child_missing
@@ -1828,7 +1865,7 @@ def import_json_file(
             targets.append(actor_obj)
         targets.extend(light_objects_by_outer.get(outer_name, []))
         for target in targets:
-            _apply_material_parameter_light_props(target, props)
+            _apply_material_parameter_light_props(target, props, exposure_mult=exposure_mult)
 
     for export_index, entry in pending_vector_parameters:
         target = material_targets.get(export_index)

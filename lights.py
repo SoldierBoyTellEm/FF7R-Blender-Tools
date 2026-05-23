@@ -27,6 +27,8 @@ UE_LIGHT_OBJECT_PROPS = (
     UE_LIGHT_FALLOFF_EXPONENT_PROP,
 )
 
+DEFAULT_SOURCE_RADIUS_CM = 50.0
+
 
 def blender_light_type_from_name(name: str) -> str | None:
     """Return Blender light type from a UE object/template name."""
@@ -66,6 +68,19 @@ def get_light_temperature(props: dict) -> float | None:
     if "ColorTemperature" in props:
         return float_or_default(props.get("ColorTemperature"), 6500.0)
     return None
+
+
+def apply_default_light_options(
+    light_data: bpy.types.Light,
+    location_scale: float = 0.01,
+) -> None:
+    """Apply importer-wide Blender light defaults when the running version supports them."""
+    if light_data is None:
+        return
+    if hasattr(light_data, "normalize"):
+        light_data.normalize = False
+    if hasattr(light_data, "shadow_soft_size"):
+        light_data.shadow_soft_size = DEFAULT_SOURCE_RADIUS_CM * location_scale
 
 
 def _new_math(nodes, operation: str, label: str = ""):
@@ -207,7 +222,10 @@ def apply_common_static_light_properties(
 
     light_data.use_shadow = bool_or_default(props.get("CastShadows", True), True)
 
-    src_radius = float_or_default(props.get("SourceRadius", 0.0)) * location_scale
+    raw_source_radius = props.get("SourceRadius", DEFAULT_SOURCE_RADIUS_CM)
+    if raw_source_radius is None:
+        raw_source_radius = DEFAULT_SOURCE_RADIUS_CM
+    src_radius = float_or_default(raw_source_radius) * location_scale
     if hasattr(light_data, "shadow_soft_size"):
         light_data.shadow_soft_size = src_radius
 
@@ -299,6 +317,7 @@ def create_static_light_data(
 ) -> bpy.types.Light:
     """Create and configure Blender light data from static UE component props."""
     light_data = bpy.data.lights.new(name, light_type)
+    apply_default_light_options(light_data)
     apply_common_static_light_properties(
         light_data,
         props,

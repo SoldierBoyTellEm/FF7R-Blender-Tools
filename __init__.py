@@ -120,6 +120,14 @@ class FF7R_ImportPreferences(AddonPreferences):
         description="Import .umap files referenced by MassiveEnvironmentComponent entries during UMAP JSON import",
         default=True,
     )
+    offset_mec_opposite_faces: BoolProperty(
+        name="Offset MEC Opposite Faces",
+        description=(
+            "Directly offset overlapping opposite-facing Massive Environment faces "
+            "by 0.0005 during import; no modifiers or material changes"
+        ),
+        default=False,
+    )
     game_texture_root: StringProperty(
         name="Texture Content Root",
         description="Local folder corresponding to Unreal /Game texture paths",
@@ -159,6 +167,9 @@ class FF7R_ImportPreferences(AddonPreferences):
         external_row.enabled = self.recursive_import
         external_row.prop(self, "allow_external_recursive_json")
         json_box.prop(self, "import_massive_environment_umaps")
+        mec_offset_row = json_box.row()
+        mec_offset_row.enabled = self.import_massive_environment_umaps
+        mec_offset_row.prop(self, "offset_mec_opposite_faces")
 
         texture_box = layout.box()
         texture_box.label(text="Massive Environment Textures")
@@ -313,6 +324,14 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         description="Import .umap files referenced by MassiveEnvironmentComponent entries",
         default=True,
     )
+    offset_mec_opposite_faces: BoolProperty(
+        name="Offset MEC Opposite Faces",
+        description=(
+            "Directly offset overlapping opposite-facing Massive Environment faces "
+            "by 0.0005 during .umap import; no modifiers or material changes"
+        ),
+        default=False,
+    )
     asset_library_selection: EnumProperty(
         name="Prop Library",
         description="Prop library source to scan for linked collections and object assets",
@@ -370,6 +389,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
                         self.import_massive_environment_umaps
                         and map_import.is_umap_addon_available()
                     ),
+                    offset_mec_opposite_faces=self.offset_mec_opposite_faces,
                     imported_umap_paths=imported_umap_paths,
                     imported_world_sky_paths=imported_world_sky_paths,
                     texture_index_cache=texture_index_cache,
@@ -405,6 +425,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
             self.recursive_import = prefs.recursive_import
             self.allow_external_recursive_json = prefs.allow_external_recursive_json
             self.import_massive_environment_umaps = prefs.import_massive_environment_umaps
+            self.offset_mec_opposite_faces = prefs.offset_mec_opposite_faces
             self.asset_library_selection = prefs.asset_library_selection
             self.manual_asset_library_path = prefs.manual_asset_library_path
         if self.filepath:
@@ -425,6 +446,9 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         external_row.prop(self, "allow_external_recursive_json")
         if map_import.is_umap_addon_available():
             layout.prop(self, "import_massive_environment_umaps")
+            mec_offset_row = layout.row()
+            mec_offset_row.enabled = self.import_massive_environment_umaps
+            mec_offset_row.prop(self, "offset_mec_opposite_faces")
         layout.separator(factor=0.7)
         layout.prop(self, "exposure")
         layout.prop(self, "attenuation_radius_mult")
