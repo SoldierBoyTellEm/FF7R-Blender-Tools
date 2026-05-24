@@ -19,6 +19,7 @@ _LIGHT_FWD_FIX = (
     Matrix.Rotation(math.radians(90.0), 4, "X") @
     Matrix.Rotation(math.radians(-90.0), 4, "Y")
 )
+_EXTERNAL_EMISSIVE_CONTEXT_PROP = "ExternalEmissiveContext"
 
 def extract_static_mesh_name(object_name_str: str) -> str | None:
     if not object_name_str:
@@ -358,6 +359,22 @@ def _float_or_default(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _set_custom_property(
+    obj: bpy.types.ID,
+    name: str,
+    value,
+    *,
+    subtype: str | None = None,
+) -> None:
+    obj[name] = value
+    if subtype is None:
+        return
+    try:
+        obj.id_properties_ui(name).update(subtype=subtype)
+    except Exception:
+        pass
 
 
 def _bool_or_default(value, default: bool = False) -> bool:
@@ -705,9 +722,10 @@ def _apply_vector_parameter_props(obj: bpy.types.Object, props: dict):
         if not isinstance(name, str) or not isinstance(value, dict):
             continue
         color_value, hex_value = _color_prop_values(value)
-        prop_prefix = f"material_vector_{name}"
+        prop_prefix = name if name == _EXTERNAL_EMISSIVE_CONTEXT_PROP else f"material_vector_{name}"
         if color_value is not None:
-            obj[prop_prefix] = color_value
+            subtype = "COLOR" if name == _EXTERNAL_EMISSIVE_CONTEXT_PROP else None
+            _set_custom_property(obj, prop_prefix, color_value, subtype=subtype)
         if hex_value is not None:
             obj[f"{prop_prefix}_hex"] = hex_value
 

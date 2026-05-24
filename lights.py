@@ -28,6 +28,7 @@ UE_LIGHT_OBJECT_PROPS = (
 )
 
 DEFAULT_SOURCE_RADIUS_CM = 50.0
+DEFAULT_SPOT_FULL_CONE_ANGLE_DEG = 44.0
 
 
 def blender_light_type_from_name(name: str) -> str | None:
@@ -297,14 +298,19 @@ def apply_ue_light_object_properties(
 
 def apply_spot_cone_properties(light_data: bpy.types.Light, props: dict) -> None:
     """Apply UE full cone angles to a Blender spot light."""
-    outer_full_deg = float_or_default(props.get("OuterFullConeAngle", 0.0))
-    inner_full_deg = float_or_default(props.get("InnerFullConeAngle", 0.0))
+    outer_full_deg = float_or_default(
+        props.get("OuterFullConeAngle", DEFAULT_SPOT_FULL_CONE_ANGLE_DEG),
+        DEFAULT_SPOT_FULL_CONE_ANGLE_DEG,
+    )
+    inner_full_deg = float_or_default(
+        props.get("InnerFullConeAngle", DEFAULT_SPOT_FULL_CONE_ANGLE_DEG),
+        DEFAULT_SPOT_FULL_CONE_ANGLE_DEG,
+    )
     if outer_full_deg <= 0.0:
         return
 
     light_data.spot_size = math.radians(outer_full_deg)
-    if inner_full_deg > 0.0:
-        light_data.spot_blend = min(1.0, max(0.0, 1.0 - (inner_full_deg / outer_full_deg)))
+    light_data.spot_blend = min(1.0, max(0.0, 1.0 - (inner_full_deg / outer_full_deg)))
 
 
 def create_static_light_data(

@@ -1194,8 +1194,10 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
             _apply_interp(light_strip, light_slot, data_path, -1, keys)
 
         if light_type == "SPOT":
-            outer_deg: float | None = None
-            inner_deg: float | None = None
+            outer_deg = lights.DEFAULT_SPOT_FULL_CONE_ANGLE_DEG
+            inner_deg = lights.DEFAULT_SPOT_FULL_CONE_ANGLE_DEG
+            bl_light.spot_size = math.radians(outer_deg)
+            bl_light.spot_blend = 0.0
 
             for _track, sec, lo, hi in _find_prop_sections(
                     data, component_tracks,
@@ -1220,7 +1222,7 @@ def _import_lights(data: list, t: Timing, scene, scene_name: str) -> None:
                 elif prop == "InnerFullConeAngle":
                     inner_deg = keys[0]["value"]
 
-            if outer_deg is not None and inner_deg is not None and outer_deg > 0:
+            if outer_deg > 0:
                 blend = max(0.0, min(1.0, 1.0 - inner_deg / outer_deg))
                 bl_light.spot_blend = blend
 
