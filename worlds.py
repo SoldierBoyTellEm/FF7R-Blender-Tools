@@ -21,6 +21,7 @@ SKY_CUBE_FACE_NAMES = (
     "NegativeZ",
 )
 SKY_CUBE_FALLBACK_EXTENSIONS = ("hdr", "exr", "dds", "png", "tga", "jpg", "jpeg")
+DEFAULT_LOCATION_SCALE = 0.01
 MIN_FINITE_FOG_EXTENT = 500.0
 MAX_FINITE_FOG_EXTENT = 50000.0
 DEFAULT_FINITE_FOG_EXTENT = 10000.0
@@ -132,6 +133,16 @@ def location_from_relative(loc_dict: dict, scale_factor: float = 0.01) -> Vector
     y = -_float_or_default(loc_dict.get("Y", 0.0)) * scale_factor
     z = _float_or_default(loc_dict.get("Z", 0.0)) * scale_factor
     return Vector((x, y, z))
+
+
+def scale_from_relative(scale_dict: dict) -> Vector:
+    if not isinstance(scale_dict, dict):
+        scale_dict = {}
+    return Vector((
+        _float_or_default(scale_dict.get("X", 1.0), 1.0),
+        _float_or_default(scale_dict.get("Y", 1.0), 1.0),
+        _float_or_default(scale_dict.get("Z", 1.0), 1.0),
+    ))
 
 
 def _srgb_channel_to_linear(value: float) -> float:
@@ -662,7 +673,10 @@ def _create_or_update_world(
 
 
 def _finite_fog_extent_from_props(fog_props: dict, location_scale: float) -> float:
-    extent = DEFAULT_FINITE_FOG_EXTENT
+    scale_ratio = location_scale / DEFAULT_LOCATION_SCALE
+    min_extent = MIN_FINITE_FOG_EXTENT * scale_ratio
+    max_extent = MAX_FINITE_FOG_EXTENT * scale_ratio
+    extent = DEFAULT_FINITE_FOG_EXTENT * scale_ratio
     if not isinstance(fog_props, dict):
         return extent
 
@@ -680,9 +694,9 @@ def _finite_fog_extent_from_props(fog_props: dict, location_scale: float) -> flo
     if isinstance(context_a, dict):
         falloff = abs(_float_or_default(context_a.get("DensityFalloff", 0.0)))
         if falloff > 0.0:
-            extent = max(extent, min(MAX_FINITE_FOG_EXTENT, (1.0 / falloff) * location_scale))
+            extent = max(extent, min(max_extent, (1.0 / falloff) * location_scale))
 
-    return min(MAX_FINITE_FOG_EXTENT, max(MIN_FINITE_FOG_EXTENT, extent))
+    return min(max_extent, max(min_extent, extent))
 
 
 def _ensure_cube_mesh(mesh_name: str) -> bpy.types.Mesh:
@@ -825,7 +839,12 @@ def create_finite_fog_volume_from_level_data(
     loc_dict = fog_props.get("RelativeLocation", {})
     obj.location = location_from_relative(loc_dict, scale_factor=location_scale)
     extent = _finite_fog_extent_from_props(fog_props, location_scale)
-    obj.scale = (extent, extent, extent)
+    rel_scale = scale_from_relative(fog_props.get("RelativeScale3D", {}))
+    obj.scale = (
+        extent * rel_scale.x,
+        extent * rel_scale.y,
+        extent * rel_scale.z,
+    )
     try:
         obj.display_type = "TEXTURED"
     except Exception:
@@ -989,6 +1008,7 @@ def create_reflection_capture_probes(
 
         loc_dict = props.get("RelativeLocation", {})
         probe_obj.location = location_from_relative(loc_dict, scale_factor=location_scale)
+        probe_obj.scale = scale_from_relative(props.get("RelativeScale3D", {}))
 
         influence_radius = _float_or_default(props.get("InfluenceRadius", 0.0))
         probe_obj["ue_influence_radius"] = influence_radius

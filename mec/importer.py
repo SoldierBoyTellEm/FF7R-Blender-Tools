@@ -286,10 +286,10 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
     offset_opposite_faces: bpy.props.BoolProperty(
         name="Offset opposite overlapping faces",
         description=(
-            "Directly offset vertices on overlapping opposite-facing faces by 0.0005 "
+            "Directly offset vertices on overlapping opposite-facing faces by 0.0005 at 0.01 scale "
             "to reduce z-fighting; no modifiers or material changes"
         ),
-        default=False,
+        default=True,
     )
 
     lod_mode: bpy.props.EnumProperty(

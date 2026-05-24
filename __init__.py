@@ -105,6 +105,15 @@ class FF7R_ImportPreferences(AddonPreferences):
         subtype="DIR_PATH",
         default="",
     )
+    json_scale_factor: FloatProperty(
+        name="JSON Scale",
+        description="Uniform coordinate scale applied to JSON positions, lengths, radii, and referenced Massive Environment .umap imports",
+        default=0.01,
+        min=0.0001,
+        max=100.0,
+        soft_min=0.001,
+        soft_max=10.0,
+    )
     recursive_import: BoolProperty(
         name="Recursive Import",
         description="Import streaming levels referenced by EndStreamingVolume entries",
@@ -124,9 +133,9 @@ class FF7R_ImportPreferences(AddonPreferences):
         name="Offset MEC Opposite Faces",
         description=(
             "Directly offset overlapping opposite-facing Massive Environment faces "
-            "by 0.0005 during import; no modifiers or material changes"
+            "by 0.0005 at 0.01 scale during import"
         ),
-        default=False,
+        default=True,
     )
     game_texture_root: StringProperty(
         name="Texture Content Root",
@@ -162,6 +171,7 @@ class FF7R_ImportPreferences(AddonPreferences):
         json_box = layout.box()
         json_box.label(text="JSON Imports")
         json_box.prop(self, "game_root")
+        json_box.prop(self, "json_scale_factor")
         json_box.prop(self, "recursive_import")
         external_row = json_box.row()
         external_row.enabled = self.recursive_import
@@ -309,6 +319,15 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         subtype="DIR_PATH",
         default="",
     )
+    scale_factor: FloatProperty(
+        name="Scale",
+        description="Uniform coordinate scale applied to JSON positions, lengths, radii, and referenced Massive Environment .umap imports",
+        default=0.01,
+        min=0.0001,
+        max=100.0,
+        soft_min=0.001,
+        soft_max=10.0,
+    )
     recursive_import: BoolProperty(
         name="Recursive Import",
         description="Import streaming levels referenced by EndStreamingVolume entries",
@@ -328,7 +347,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         name="Offset MEC Opposite Faces",
         description=(
             "Directly offset overlapping opposite-facing Massive Environment faces "
-            "by 0.0005 during .umap import; no modifiers or material changes"
+            "by 0.0005 at 0.01 scale during .umap import; no modifiers or material changes"
         ),
         default=False,
     )
@@ -382,6 +401,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
                     exposure_mult=exposure_mult,
                     attenuation_radius_mult=self.attenuation_radius_mult,
                     game_root=game_root,
+                    location_scale=self.scale_factor,
                     visited_paths=visited_paths,
                     recursive_import=self.recursive_import,
                     allow_external_recursive_json=self.allow_external_recursive_json,
@@ -422,6 +442,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         if prefs is not None:
             if not self.game_root:
                 self.game_root = prefs.game_root
+            self.scale_factor = prefs.json_scale_factor
             self.recursive_import = prefs.recursive_import
             self.allow_external_recursive_json = prefs.allow_external_recursive_json
             self.import_massive_environment_umaps = prefs.import_massive_environment_umaps
@@ -440,6 +461,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
             layout.prop(self, "manual_asset_library_path")
         layout.separator(factor=0.7)
         layout.prop(self, "game_root")
+        layout.prop(self, "scale_factor")
         layout.prop(self, "recursive_import")
         external_row = layout.row()
         external_row.enabled = self.recursive_import

@@ -21,8 +21,17 @@ from .material import setup_material_nodes, resolve_hash
 
 
 OPPOSITE_FACE_OFFSET = 0.0005
+DEFAULT_SCALE_FACTOR = 0.01
 OPPOSITE_FACE_DOT_THRESHOLD = -0.99
 OPPOSITE_FACE_POSITION_DECIMALS = 6
+
+
+def scaled_opposite_face_offset(scale_factor: float) -> float:
+    try:
+        scale_ratio = abs(float(scale_factor)) / DEFAULT_SCALE_FACTOR
+    except (TypeError, ValueError):
+        scale_ratio = 1.0
+    return OPPOSITE_FACE_OFFSET * scale_ratio
 
 
 def offset_opposite_face_geometry(
@@ -668,7 +677,12 @@ def build_objects_from_component(
 
                 faces_arr = get_triangles(sub_s)                         # (N, 3) int32
                 if offset_opposite_faces:
-                    offset_count = offset_opposite_face_geometry(verts_slice, norms_slice, faces_arr)
+                    offset_count = offset_opposite_face_geometry(
+                        verts_slice,
+                        norms_slice,
+                        faces_arr,
+                        offset=scaled_opposite_face_offset(scale_factor),
+                    )
                     if offset_count:
                         print(f"    {mesh_name}: offset {offset_count} opposite-face vertices")
                 mesh.from_pydata(verts_slice.tolist(), [], faces_arr.tolist())

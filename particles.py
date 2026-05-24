@@ -63,6 +63,16 @@ def _location_from_relative(loc_dict: dict, scale_factor: float = 0.01) -> Vecto
     return Vector((x, y, z))
 
 
+def _scale_from_relative(scale_dict: dict) -> Vector:
+    if not isinstance(scale_dict, dict):
+        scale_dict = {}
+    return Vector((
+        _float_or_default(scale_dict.get("X", 1.0), 1.0),
+        _float_or_default(scale_dict.get("Y", 1.0), 1.0),
+        _float_or_default(scale_dict.get("Z", 1.0), 1.0),
+    ))
+
+
 def _rotation_from_relative(rot_dict: dict) -> Euler:
     pitch = math.radians(_float_or_default(rot_dict.get("Pitch", 0.0)))
     yaw = math.radians(_float_or_default(rot_dict.get("Yaw", 0.0)))
@@ -134,12 +144,14 @@ def _create_particle_empty(
 
     loc = _location_from_relative(props.get("RelativeLocation", {}), location_scale)
     rot = _rotation_from_relative(props.get("RelativeRotation", {}))
+    scale = _scale_from_relative(props.get("RelativeScale3D", {}))
 
     obj = bpy.data.objects.new(name, None)
     obj.empty_display_type = "SPHERE"
     obj.empty_display_size = 1.0
     obj.location = loc
     obj.rotation_euler = rot
+    obj.scale = scale
     obj["ff7r_source_json"] = filepath
     obj["ff7r_particle_component_name"] = entry.get("Name", "")
     obj["ff7r_particle_component_outer"] = _outer_name(entry)

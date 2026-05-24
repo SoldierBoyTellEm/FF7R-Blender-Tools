@@ -221,6 +221,7 @@ def create_collection_instance(
     location: Vector,
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
+    scale: Vector | None = None,
 ):
     obj = bpy.data.objects.new(name, None)
     obj.instance_type = "COLLECTION"
@@ -228,6 +229,8 @@ def create_collection_instance(
 
     obj.location = location
     obj.rotation_euler = rotation_euler
+    if scale is not None:
+        obj.scale = scale
 
     parent_collection.objects.link(obj)
     return obj
@@ -239,12 +242,15 @@ def create_linked_object_instance(
     location: Vector,
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
+    scale: Vector | None = None,
 ):
     obj = source_obj.copy()
     obj.name = name
     obj.rotation_mode = "XYZ"
     obj.location = location
     obj.rotation_euler = rotation_euler
+    if scale is not None:
+        obj.scale = _multiply_vectors(obj.scale, scale)
     parent_collection.objects.link(obj)
     return obj
 
@@ -255,8 +261,9 @@ def create_wrapped_linked_object_instance(
     location: Vector,
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
+    scale: Vector | None = None,
 ):
-    wrapper = create_mesh_empty(name, location, rotation_euler, parent_collection)
+    wrapper = create_mesh_empty(name, location, rotation_euler, parent_collection, scale=scale)
 
     instance_obj = source_obj.copy()
     instance_obj.name = f"{name}__INSTANCE"
@@ -275,6 +282,7 @@ def create_skeletal_wrapper_instance(
     location: Vector,
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
+    scale: Vector | None = None,
 ):
     return create_wrapped_collection_instance(
         collection=collection,
@@ -282,6 +290,7 @@ def create_skeletal_wrapper_instance(
         location=location,
         rotation_euler=rotation_euler,
         parent_collection=parent_collection,
+        scale=scale,
     )
 
 
@@ -291,8 +300,9 @@ def create_wrapped_collection_instance(
     location: Vector,
     rotation_euler: Euler,
     parent_collection: bpy.types.Collection,
+    scale: Vector | None = None,
 ):
-    wrapper = create_mesh_empty(name, location, rotation_euler, parent_collection)
+    wrapper = create_mesh_empty(name, location, rotation_euler, parent_collection, scale=scale)
 
     instance_obj = bpy.data.objects.new(f"{name}__INSTANCE", None)
     instance_obj.instance_type = "COLLECTION"
@@ -348,10 +358,37 @@ def _has_rotation_values(rot_dict: dict) -> bool:
 
 
 def location_from_relative(loc_dict: dict, scale_factor: float = 0.01) -> Vector:
-    x = float(loc_dict.get("X", 0.0)) * scale_factor
-    y = -float(loc_dict.get("Y", 0.0)) * scale_factor
-    z = float(loc_dict.get("Z", 0.0)) * scale_factor
+    if not isinstance(loc_dict, dict):
+        loc_dict = {}
+    x = _float_or_default(loc_dict.get("X", 0.0)) * scale_factor
+    y = -_float_or_default(loc_dict.get("Y", 0.0)) * scale_factor
+    z = _float_or_default(loc_dict.get("Z", 0.0)) * scale_factor
     return Vector((x, y, z))
+
+
+def scale_from_relative(scale_dict: dict) -> Vector:
+    if not isinstance(scale_dict, dict):
+        scale_dict = {}
+    return Vector((
+        _float_or_default(scale_dict.get("X", 1.0), 1.0),
+        _float_or_default(scale_dict.get("Y", 1.0), 1.0),
+        _float_or_default(scale_dict.get("Z", 1.0), 1.0),
+    ))
+
+
+def scale_from_entry(props: dict, entry: dict | None = None) -> Vector:
+    if not isinstance(props, dict):
+        props = {}
+    entry_scale = entry.get("RelativeScale3D", {}) if isinstance(entry, dict) else {}
+    return scale_from_relative(props.get("RelativeScale3D", entry_scale))
+
+
+def _multiply_vectors(lhs, rhs) -> Vector:
+    return Vector((
+        _float_or_default(lhs[0], 1.0) * _float_or_default(rhs[0], 1.0),
+        _float_or_default(lhs[1], 1.0) * _float_or_default(rhs[1], 1.0),
+        _float_or_default(lhs[2], 1.0) * _float_or_default(rhs[2], 1.0),
+    ))
 
 
 def _float_or_default(value, default: float = 0.0) -> float:
@@ -431,11 +468,13 @@ def create_point_light_from_entry(
     rot_dict = props.get("RelativeRotation", entry.get("RelativeRotation", {}))
     loc = location_from_relative(loc_dict, scale_factor=location_scale)
     rot = rotation_from_relative(rot_dict)
+    scale = scale_from_entry(props, entry)
     light_obj = bpy.data.objects.new(light_name, light_data)
     if attach_parent_obj is not None:
         light_obj.parent = attach_parent_obj
     light_obj.location = loc
     light_obj.rotation_euler = rot
+    light_obj.scale = scale
     lights.apply_ue_light_object_properties(light_obj)
     parent_collection.objects.link(light_obj)
     return light_obj
@@ -461,11 +500,13 @@ def create_spot_light_from_entry(
     rot_dict = props.get("RelativeRotation", entry.get("RelativeRotation", {}))
     loc = location_from_relative(loc_dict, scale_factor=location_scale)
     rot = light_rotation_from_relative(rot_dict)
+    scale = scale_from_entry(props, entry)
     light_obj = bpy.data.objects.new(light_name, light_data)
     if attach_parent_obj is not None:
         light_obj.parent = attach_parent_obj
     light_obj.location = loc
     light_obj.rotation_euler = rot
+    light_obj.scale = scale
     lights.apply_ue_light_object_properties(light_obj)
     parent_collection.objects.link(light_obj)
     return light_obj
@@ -808,12 +849,15 @@ def create_mesh_empty(
     loc: "Vector",
     rot: "Euler",
     parent_collection: "bpy.types.Collection",
+    scale: Vector | None = None,
 ):
     obj = bpy.data.objects.new(name, None)
     obj.empty_display_type = "PLAIN_AXES"
     obj.empty_display_size = 1.0
     obj.location = loc
     obj.rotation_euler = rot
+    if scale is not None:
+        obj.scale = scale
     parent_collection.objects.link(obj)
     return obj
 
@@ -912,6 +956,7 @@ def import_streaming_asset_paths(
     game_root: str,
     exposure_mult: float,
     attenuation_radius_mult: float,
+    location_scale: float,
     visited_paths: set[str],
     recursive_import: bool,
     allow_external_recursive_json: bool,
@@ -951,6 +996,7 @@ def import_streaming_asset_paths(
             exposure_mult=exposure_mult,
             attenuation_radius_mult=attenuation_radius_mult,
             game_root=game_root,
+            location_scale=location_scale,
             visited_paths=visited_paths,
             recursive_import=recursive_import,
             allow_external_recursive_json=allow_external_recursive_json,
@@ -1006,6 +1052,7 @@ def import_massive_environment_umap(
     imported_umap_paths: set[str],
     texture_index_cache: TextureIndexCache | None = None,
     offset_opposite_faces: bool = False,
+    scale_factor: float = 0.01,
 ) -> tuple[int, int, set[str]]:
     if not game_root:
         print("[End JSON Import]   MassiveEnvironmentComponent found but Game Root is not set - skipping .umap import.")
@@ -1039,7 +1086,7 @@ def import_massive_environment_umap(
             [umap_path],
             lod_mode="LEVEL",
             lod_level=0,
-            scale_factor=0.01,
+            scale_factor=scale_factor,
             texture_index_cache=texture_index_cache,
             offset_opposite_faces=offset_opposite_faces,
         )
@@ -1392,6 +1439,7 @@ def import_json_file(
     imported_world_sky_paths: set[str] | None = None,
     texture_index_cache: TextureIndexCache | None = None,
     offset_mec_opposite_faces: bool = False,
+    location_scale: float = 0.01,
 ) -> tuple[int, set[str]]:
     filepath = os.path.realpath(filepath)
     if recursive_root_dir is None:
@@ -1409,6 +1457,7 @@ def import_json_file(
         imported_world_sky_paths = set()
     if texture_index_cache is None:
         texture_index_cache = {}
+    location_scale = _float_or_default(location_scale, 0.01)
 
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Invalid file path: {filepath}")
@@ -1469,8 +1518,6 @@ def import_json_file(
     material_targets: dict[int, bpy.types.Object] = {}
     pending_material_parameter_lights: list[dict] = []
     pending_vector_parameters: list[tuple[int, dict]] = []
-    location_scale = 0.01
-
     created_count += particles.create_niagara_empties_from_effect_json(
         data,
         filepath,
@@ -1513,6 +1560,7 @@ def import_json_file(
                 game_root=game_root,
                 exposure_mult=exposure_mult,
                 attenuation_radius_mult=attenuation_radius_mult,
+                location_scale=location_scale,
                 visited_paths=visited_paths,
                 recursive_import=recursive_import,
                 allow_external_recursive_json=allow_external_recursive_json,
@@ -1544,6 +1592,7 @@ def import_json_file(
 
             rel_loc = props.get("RelativeLocation", {})
             rel_rot = props.get("RelativeRotation", {})
+            rel_scale = scale_from_entry(props, entry)
             loc = location_from_relative(rel_loc, scale_factor=location_scale)
             rot = rotation_from_relative(rel_rot)
 
@@ -1565,6 +1614,7 @@ def import_json_file(
                                 location=loc,
                                 rotation_euler=rot,
                                 parent_collection=static_collection,
+                                scale=rel_scale,
                             )
                             instance_obj = ensure_overrideable_collection_instance(
                                 instance_obj,
@@ -1579,6 +1629,7 @@ def import_json_file(
                             location=loc,
                             rotation_euler=rot,
                             parent_collection=static_collection,
+                            scale=rel_scale,
                         )
                 else:
                     new_obj = create_linked_object_instance(
@@ -1587,11 +1638,12 @@ def import_json_file(
                         location=loc,
                         rotation_euler=rot,
                         parent_collection=static_collection,
+                        scale=rel_scale,
                     )
             else:
                 missing_assets.add(asset_name)
                 placeholder_name = attach_name
-                new_obj = create_mesh_empty(placeholder_name, loc, rot, static_collection)
+                new_obj = create_mesh_empty(placeholder_name, loc, rot, static_collection, scale=rel_scale)
                 print(
                     f"[End JSON Import]   StaticMesh fallback empty '{placeholder_name}' | "
                     f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
@@ -1634,6 +1686,7 @@ def import_json_file(
             props = entry.get("Properties", {})
             loc_dict = props.get("RelativeLocation", entry.get("RelativeLocation", {}))
             rot_dict = props.get("RelativeRotation", entry.get("RelativeRotation", {}))
+            rel_scale = scale_from_entry(props, entry)
             loc = location_from_relative(loc_dict, scale_factor=location_scale)
             rot = rotation_from_relative(rot_dict)
 
@@ -1658,6 +1711,7 @@ def import_json_file(
                             location=loc,
                             rotation_euler=rot,
                             parent_collection=skeletal_collection,
+                            scale=rel_scale,
                         )
                         assign_skeletal_source_metadata(
                             obj,
@@ -1678,6 +1732,7 @@ def import_json_file(
                         location=loc,
                         rotation_euler=rot,
                         parent_collection=skeletal_collection,
+                        scale=rel_scale,
                     )
                     assign_skeletal_source_metadata(
                         obj,
@@ -1694,7 +1749,7 @@ def import_json_file(
             else:
                 if asset_name:
                     missing_assets.add(asset_name)
-                obj = create_mesh_empty(instance_name, loc, rot, skeletal_collection)
+                obj = create_mesh_empty(instance_name, loc, rot, skeletal_collection, scale=rel_scale)
                 obj["source_name"] = instance_name
                 if template_object_path:
                     obj["template_object_path"] = template_object_path
@@ -1805,6 +1860,7 @@ def import_json_file(
                 game_root=game_root,
                 exposure_mult=exposure_mult,
                 attenuation_radius_mult=attenuation_radius_mult,
+                location_scale=location_scale,
                 visited_paths=visited_paths,
                 recursive_import=recursive_import,
                 allow_external_recursive_json=allow_external_recursive_json,
@@ -1826,6 +1882,7 @@ def import_json_file(
                     imported_umap_paths,
                     texture_index_cache,
                     offset_opposite_faces=offset_mec_opposite_faces,
+                    scale_factor=location_scale,
                 )
                 created_count += processed
                 missing_assets |= child_missing

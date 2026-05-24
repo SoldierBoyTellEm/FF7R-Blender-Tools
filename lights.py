@@ -323,7 +323,7 @@ def create_static_light_data(
 ) -> bpy.types.Light:
     """Create and configure Blender light data from static UE component props."""
     light_data = bpy.data.lights.new(name, light_type)
-    apply_default_light_options(light_data)
+    apply_default_light_options(light_data, location_scale)
     apply_common_static_light_properties(
         light_data,
         props,
