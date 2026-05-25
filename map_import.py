@@ -677,6 +677,84 @@ def _register_actor_object(
         actor_objects.setdefault(alias, obj)
 
 
+def collect_imported_attach_parent_lookup_keys(data: list) -> set[str]:
+    """Return AttachParent keys whose parent transform should be preserved."""
+    parented_types = {
+        "EndEnvironmentStaticMeshComponent",
+        "StaticMeshComponent",
+        "EndStaticMeshPhysicsPartsComponent",
+        "EndSkeletalMeshComponent",
+        "PointLightComponent",
+        "SpotLightComponent",
+    }
+    keys: set[str] = set()
+
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("Type") not in parented_types:
+            continue
+        props = entry.get("Properties", {})
+        if not isinstance(props, dict):
+            continue
+        keys.update(_object_reference_lookup_keys(props.get("AttachParent", {})))
+
+    return {key for key in keys if key}
+
+
+def entry_is_referenced_attach_parent(
+    entry: dict,
+    attach_parent_lookup_keys: set[str],
+) -> bool:
+    """Return True if other imported entries attach to this component export."""
+    if not attach_parent_lookup_keys:
+        return False
+    return any(key in attach_parent_lookup_keys for key in _entry_component_reference_keys(entry))
+
+
+def intact_physics_asset_name_from_part_name(part_name: str) -> str | None:
+    """Map break-part names like Sofa_Multi_01A_1_Physics to Sofa_Multi_01A_0_Physics."""
+    if not isinstance(part_name, str):
+        return None
+    match = re.match(r"^(.+)_(\d+)_Physics$", part_name)
+    if not match:
+        return None
+    return f"{match.group(1)}_0_Physics"
+
+
+def collect_physics_root_fallback_asset_names(data: list) -> dict[str, str]:
+    """Map physics root component reference keys to their intact _0_Physics asset name."""
+    fallback_asset_names: dict[str, str] = {}
+
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("Type") != "EndStaticMeshPhysicsPartsComponent":
+            continue
+
+        asset_name = intact_physics_asset_name_from_part_name(entry.get("Name", ""))
+        if not asset_name:
+            continue
+
+        props = entry.get("Properties", {})
+        if not isinstance(props, dict):
+            continue
+
+        for key in _object_reference_lookup_keys(props.get("AttachParent", {})):
+            fallback_asset_names.setdefault(key, asset_name)
+
+    return fallback_asset_names
+
+
+def physics_root_fallback_asset_name_for_entry(
+    entry: dict,
+    physics_root_fallback_asset_names: dict[str, str],
+) -> str | None:
+    if not physics_root_fallback_asset_names:
+        return None
+    for key in _entry_component_reference_keys(entry):
+        asset_name = physics_root_fallback_asset_names.get(key)
+        if asset_name:
+            return asset_name
+    return None
+
+
 def _reference_export_index(ref: dict) -> int | None:
     """Return the numeric export index at the end of an ObjectPath, if present."""
     if not isinstance(ref, dict):
@@ -1401,9 +1479,60 @@ def process_deferred_attach(
         apply_deferred_object_parent(child_obj, props, target_instance, location_scale)
 
 
+def create_static_asset_instance_from_resolved_asset(
+    asset: asset_linking.LinkedAsset,
+    name: str,
+    loc: Vector,
+    rot: Euler,
+    static_collection: bpy.types.Collection,
+    rel_scale: Vector,
+    attach_socket: str | None = None,
+) -> bpy.types.Object:
+    if asset.kind == "COLLECTION":
+        collection = asset.datablock
+        file_collection_under_import_type(collection, static_collection)
+        if attach_socket:
+            with _scene_link_collection(collection, static_collection):
+                new_obj, instance_obj = create_wrapped_collection_instance(
+                    collection=collection,
+                    name=name,
+                    location=loc,
+                    rotation_euler=rot,
+                    parent_collection=static_collection,
+                    scale=rel_scale,
+                )
+                instance_obj = ensure_overrideable_collection_instance(
+                    instance_obj,
+                    static_collection,
+                )
+            ensure_top_level_object_overrides(instance_obj)
+            parent_override_roots_to_wrapper(new_obj, instance_obj)
+            return new_obj
+
+        return create_collection_instance(
+            collection=collection,
+            name=name,
+            location=loc,
+            rotation_euler=rot,
+            parent_collection=static_collection,
+            scale=rel_scale,
+        )
+
+    return create_linked_object_instance(
+        source_obj=asset.datablock,
+        name=name,
+        location=loc,
+        rotation_euler=rot,
+        parent_collection=static_collection,
+        scale=rel_scale,
+    )
+
+
 def collect_asset_names_for_import(data: list) -> tuple[set[str], set[str]]:
     static_asset_names: set[str] = set()
     skeletal_asset_names: set[str] = set()
+
+    static_asset_names.update(collect_physics_root_fallback_asset_names(data).values())
 
     for entry in data:
         if not isinstance(entry, dict):
@@ -1439,6 +1568,7 @@ def import_json_file(
     imported_world_sky_paths: set[str] | None = None,
     texture_index_cache: TextureIndexCache | None = None,
     offset_mec_opposite_faces: bool = False,
+    import_finite_fog: bool = False,
     location_scale: float = 0.01,
 ) -> tuple[int, set[str]]:
     filepath = os.path.realpath(filepath)
@@ -1474,6 +1604,9 @@ def import_json_file(
         raise ValueError("JSON root must be a list of objects")
 
     print(f"[End JSON Import] JSON parsed - {len(data)} top-level entries.")
+
+    attach_parent_lookup_keys = collect_imported_attach_parent_lookup_keys(data)
+    physics_root_fallback_asset_names = collect_physics_root_fallback_asset_names(data)
 
     static_asset_names, skeletal_asset_names = collect_asset_names_for_import(data)
     asset_linking.preload_assets(
@@ -1525,11 +1658,12 @@ def import_json_file(
     )
     if worlds.create_world_from_level_data(data, filepath):
         created_count += 1
-    created_count += worlds.create_finite_fog_volume_from_level_data(
-        data,
-        filepath,
-        location_scale=location_scale,
-    )
+    if import_finite_fog:
+        created_count += worlds.create_finite_fog_volume_from_level_data(
+            data,
+            filepath,
+            location_scale=location_scale,
+        )
     created_count += worlds.create_reflection_capture_probes(
         data,
         filepath,
@@ -1582,14 +1716,12 @@ def import_json_file(
 
         if t in {"EndEnvironmentStaticMeshComponent", "StaticMeshComponent"}:
             props = entry.get("Properties", {})
+            if not isinstance(props, dict):
+                props = {}
             static_mesh = props.get("StaticMesh", {})
-            object_name_str = static_mesh.get("ObjectName")
+            object_name_str = static_mesh.get("ObjectName") if isinstance(static_mesh, dict) else None
 
             asset_name = extract_static_mesh_name(object_name_str)
-            if not asset_name:
-                print(f"[End JSON Import]   StaticMesh entry has no parseable ObjectName - skipping. (raw: {object_name_str!r})")
-                continue
-
             rel_loc = props.get("RelativeLocation", {})
             rel_rot = props.get("RelativeRotation", {})
             rel_scale = scale_from_entry(props, entry)
@@ -1600,46 +1732,72 @@ def import_json_file(
 
             attach_socket = props.get("AttachSocketName")
             has_attach_socket = bool(attach_socket)
-            attach_name = _resolve_outer_name(entry) or asset_name
-            asset = static_asset_cache.get(asset_name)
-            if asset is not None:
-                if asset.kind == "COLLECTION":
-                    collection = asset.datablock
-                    file_collection_under_import_type(collection, static_collection)
-                    if attach_socket:
-                        with _scene_link_collection(collection, static_collection):
-                            new_obj, instance_obj = create_wrapped_collection_instance(
-                                collection=collection,
-                                name=attach_name,
-                                location=loc,
-                                rotation_euler=rot,
-                                parent_collection=static_collection,
-                                scale=rel_scale,
-                            )
-                            instance_obj = ensure_overrideable_collection_instance(
-                                instance_obj,
-                                static_collection,
-                            )
-                        ensure_top_level_object_overrides(instance_obj)
-                        parent_override_roots_to_wrapper(new_obj, instance_obj)
-                    else:
-                        new_obj = create_collection_instance(
-                            collection=collection,
-                            name=attach_name,
-                            location=loc,
-                            rotation_euler=rot,
-                            parent_collection=static_collection,
-                            scale=rel_scale,
-                        )
-                else:
-                    new_obj = create_linked_object_instance(
-                        source_obj=asset.datablock,
-                        name=attach_name,
-                        location=loc,
-                        rotation_euler=rot,
-                        parent_collection=static_collection,
-                        scale=rel_scale,
+            component_name = entry.get("Name", "StaticMeshComponent")
+            component_name = (
+                component_name
+                if isinstance(component_name, str) and component_name
+                else "StaticMeshComponent"
+            )
+            attach_name = _resolve_outer_name(entry) or asset_name or component_name
+            asset = static_asset_cache.get(asset_name) if asset_name else None
+            if not asset_name:
+                fallback_asset_name = physics_root_fallback_asset_name_for_entry(
+                    entry,
+                    physics_root_fallback_asset_names,
+                )
+                if not fallback_asset_name:
+                    print(
+                        f"[End JSON Import]   Warning: StaticMesh entry has no parseable ObjectName "
+                        f"for '{attach_name}' and no physics fallback - "
+                        "using transform empty."
                     )
+                    new_obj = create_mesh_empty(attach_name, loc, rot, static_collection, scale=rel_scale)
+                    new_obj["source_name"] = attach_name
+                    new_obj["source_type"] = t
+                    new_obj["component_empty_reason"] = "no_static_mesh_attach_parent"
+                else:
+                    asset = static_asset_cache.get(fallback_asset_name)
+                    if asset is not None:
+                        new_obj = create_static_asset_instance_from_resolved_asset(
+                            asset=asset,
+                            name=attach_name,
+                            loc=loc,
+                            rot=rot,
+                            static_collection=static_collection,
+                            rel_scale=rel_scale,
+                            attach_socket=attach_socket,
+                        )
+                        new_obj["source_name"] = attach_name
+                        new_obj["source_type"] = t
+                        new_obj["physics_root_fallback_asset_name"] = fallback_asset_name
+                        print(
+                            f"[End JSON Import]   Warning: StaticMesh entry has no parseable ObjectName "
+                            f"for '{attach_name}' - using physics fallback asset "
+                            f"'{fallback_asset_name}' | "
+                            f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
+                        )
+                    else:
+                        missing_assets.add(fallback_asset_name)
+                        new_obj = create_mesh_empty(attach_name, loc, rot, static_collection, scale=rel_scale)
+                        new_obj["source_name"] = attach_name
+                        new_obj["source_type"] = t
+                        new_obj["component_empty_reason"] = "missing_physics_root_fallback_asset"
+                        new_obj["physics_root_fallback_asset_name"] = fallback_asset_name
+                        print(
+                            f"[End JSON Import]   Warning: StaticMesh entry has no parseable ObjectName "
+                            f"and physics fallback asset is missing "
+                            f"for '{attach_name}': '{fallback_asset_name}' - using transform empty."
+                        )
+            elif asset is not None:
+                new_obj = create_static_asset_instance_from_resolved_asset(
+                    asset=asset,
+                    name=attach_name,
+                    loc=loc,
+                    rot=rot,
+                    static_collection=static_collection,
+                    rel_scale=rel_scale,
+                    attach_socket=attach_socket,
+                )
             else:
                 missing_assets.add(asset_name)
                 placeholder_name = attach_name

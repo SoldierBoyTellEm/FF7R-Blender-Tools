@@ -4,6 +4,7 @@ import os
 import json
 import bpy
 
+from .. import render_settings
 from .parser import BinReader, build_import_hash_table, build_objects_from_component
 from .material import load_hash_table, build_texture_index
 
@@ -72,6 +73,8 @@ def import_umap_paths(
     """
     if isinstance(paths, (str, bytes, os.PathLike)):
         paths = [paths]
+
+    render_settings.ensure_cycles_transparent_bounces(getattr(context, "scene", None))
 
     pref_tex_root, pref_tex_ext, pref_match_by_filename = _get_texture_settings(context)
     if tex_root is None:

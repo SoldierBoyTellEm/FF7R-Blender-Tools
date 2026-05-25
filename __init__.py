@@ -16,7 +16,7 @@ import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, StringProperty
 from bpy.types import AddonPreferences, Menu, Operator
 
-from . import asset_linking, cutscene_import, lights, map_import, particles, timeline_actions, worlds
+from . import asset_linking, cutscene_import, lights, map_import, particles, render_settings, timeline_actions, worlds
 from .mec import importer as mec_importer
 from .mec import material as mec_material
 from .mec import parser as mec_parser
@@ -25,6 +25,7 @@ for _module in (
     asset_linking,
     lights,
     particles,
+    render_settings,
     worlds,
     timeline_actions,
     cutscene_import,
@@ -234,6 +235,8 @@ class FF7R_REBIRTH_OT_import_cutscene_json(Operator):
     )
 
     def execute(self, _context):
+        render_settings.ensure_cycles_transparent_bounces()
+
         manual_path_error = _validate_manual_asset_library_path(
             self.asset_library_selection,
             self.manual_asset_library_path,
@@ -362,8 +365,15 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
         subtype="DIR_PATH",
         default="",
     )
+    import_finite_fog: BoolProperty(
+        name="Import Finite Fog",
+        description="Import FiniteFog volumes as Blender volume objects",
+        default=False,
+    )
 
     def execute(self, _context):
+        render_settings.ensure_cycles_transparent_bounces()
+
         manual_path_error = _validate_manual_asset_library_path(
             self.asset_library_selection,
             self.manual_asset_library_path,
@@ -410,6 +420,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
                         and map_import.is_umap_addon_available()
                     ),
                     offset_mec_opposite_faces=self.offset_mec_opposite_faces,
+                    import_finite_fog=self.import_finite_fog,
                     imported_umap_paths=imported_umap_paths,
                     imported_world_sky_paths=imported_world_sky_paths,
                     texture_index_cache=texture_index_cache,
@@ -471,6 +482,7 @@ class FF7R_REBIRTH_OT_import_umap_json(Operator):
             mec_offset_row = layout.row()
             mec_offset_row.enabled = self.import_massive_environment_umaps
             mec_offset_row.prop(self, "offset_mec_opposite_faces")
+        layout.prop(self, "import_finite_fog")
         layout.separator(factor=0.7)
         layout.prop(self, "exposure")
         layout.prop(self, "attenuation_radius_mult")
