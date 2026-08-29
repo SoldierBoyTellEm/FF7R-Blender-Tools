@@ -48,6 +48,13 @@ BONE_LENGTH_CLAMPS: tuple[tuple[str, float], ...] = (
     ("Kdi", 0.02),
 )
 
+# KDI helper bones and "_Spo" pose-space helpers exist to be moved independently
+# by KineDriver's generated drivers -- that is their entire purpose. Blender's
+# "connected" mode locks a bone's head to its parent's tail, which would fight
+# any driver trying to translate it. These must never be connected, regardless
+# of the connect_bones option or how close they measure to the threshold.
+NEVER_CONNECT_SUFFIXES: tuple[str, ...] = ("Kdi", "Spo")
+
 # How close a bone's head must sit to its parent's (cosmetic, computed) tail before
 # "connected" mode is allowed to snap them together. This is deliberately tight: a
 # bone whose length was set to reach a single dominant aligned child (see the tail
@@ -64,6 +71,12 @@ def max_length_for_bone(bone_name: str) -> float | None:
         if lowered.endswith(suffix.casefold()):
             return limit
     return None
+
+
+def allows_connect(bone_name: str) -> bool:
+    """Whether this bone may ever be switched into Blender's "connected" mode."""
+    lowered = bone_name.casefold()
+    return not any(lowered.endswith(suffix.casefold()) for suffix in NEVER_CONNECT_SUFFIXES)
 
 
 def ue_bone_transform_to_blender(
@@ -196,6 +209,9 @@ def build_armature_from_bones(
     to its parent) whenever its head already sits within ``CONNECT_DISTANCE_THRESHOLD``
     of the parent's tail. The parent's tail is moved to the imported head first, so
     enabling connected mode never changes the child's 1:1 game-space position.
+    KDI/"_Spo" bones are always excluded from this regardless of distance -- see
+    ``allows_connect`` -- since KineDriver needs to translate them independently
+    of their parent.
     """
 
     if not bones:
@@ -309,7 +325,7 @@ def _build_edit_bones(
         edit_bone.align_roll(basis @ Vector((0.0, 0.0, 1.0)))
         edit_bone.roll += math.pi * 0.5
 
-        if connect_bones and edit_bone.parent is not None:
+        if connect_bones and edit_bone.parent is not None and allows_connect(bones[index]["name"]):
             # Preserve the imported child head: move only the parent's tail before
             # enabling connected mode. Assigning use_connect first would snap the
             # child head onto the parent tail and lose its 1:1 game position.
