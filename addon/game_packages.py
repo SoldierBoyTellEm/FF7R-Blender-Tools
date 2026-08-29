@@ -303,6 +303,24 @@ def _browser_state(context):
     return context.window_manager.ff7r_package_browser
 
 
+def _highlighted_umap(context) -> str | None:
+    """The UMAP row the browser list is currently sitting on, if it is a file.
+
+    Used as a fallback when nothing has been ticked, so that pointing at a single
+    map and hitting OK does the obvious thing instead of erroring out.
+    """
+    try:
+        state = _browser_state(context)
+    except AttributeError:
+        return None
+    if not 0 <= state.active_index < len(state.entries):
+        return None
+    entry = state.entries[state.active_index]
+    if entry.is_directory or not entry.virtual_path:
+        return None
+    return entry.virtual_path
+
+
 def _populate_browser(context) -> None:
     state = _browser_state(context)
     state.entries.clear()
@@ -1072,10 +1090,11 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
         layout = self.layout
         state = _browser_state(context)
         header = layout.row(align=True)
-        header.label(
-            text=f"{len(_VIRTUAL_UMAPS):,} UMAPs available — {len(_SELECTED_UMAPS):,} selected",
-            icon='PACKAGE',
-        )
+        if _SELECTED_UMAPS:
+            header_text = f"{len(_VIRTUAL_UMAPS):,} UMAPs available — {len(_SELECTED_UMAPS):,} selected"
+        else:
+            header_text = f"{len(_VIRTUAL_UMAPS):,} UMAPs available — none ticked, will import the highlighted row"
+        header.label(text=header_text, icon='PACKAGE')
         header.operator(FF7R_REBIRTH_OT_package_browser_up.bl_idname, text="", icon='FILE_PARENT')
         header.label(text=state.current_directory)
         layout.prop(state, "filter_text", text="", icon='VIEWZOOM')
@@ -1128,12 +1147,18 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
         scripted_path = self.virtual_path.strip().replace("\\", "/")
         if not virtual_paths and scripted_path:
             virtual_paths = [scripted_path]
+        if not virtual_paths:
+            # Nothing ticked: fall back to whichever row the browser is on, so
+            # single-map imports do not require ticking a box first.
+            highlighted = _highlighted_umap(context)
+            if highlighted:
+                virtual_paths = [highlighted]
         invalid_paths = [path for path in virtual_paths if path not in _VIRTUAL_UMAPS]
         if invalid_paths:
             self.report({'ERROR'}, f"Package UMAP was not found: {invalid_paths[0]}")
             return {'CANCELLED'}
         if not virtual_paths:
-            self.report({'ERROR'}, "Select at least one UMAP from the package browser.")
+            self.report({'ERROR'}, "Highlight or tick at least one UMAP in the package browser.")
             return {'CANCELLED'}
         queued_paths = set(virtual_paths)
 
