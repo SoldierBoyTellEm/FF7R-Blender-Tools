@@ -1541,6 +1541,14 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         ),
         default=False,
     )
+    create_socket_empties: bpy.props.BoolProperty(
+        name="Create socket empties",
+        description=(
+            "Add a bone-parented Empty for each attachment socket, matching what "
+            "the UMAP importer looks for when resolving an actor's AttachSocketName"
+        ),
+        default=True,
+    )
     import_kdi: bpy.props.BoolProperty(
         name="Import associated KDI",
         description=(
@@ -1595,6 +1603,7 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         layout.prop(self, "armature_name")
         layout.prop(self, "scale_factor")
         layout.prop(self, "connect_bones")
+        layout.prop(self, "create_socket_empties")
         layout.prop(self, "import_kdi")
         layout.prop(self, "create_variant_bone_collections")
         layout.prop(self, "import_mesh_referenced_bones_only")
@@ -1679,6 +1688,7 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                     armature_name=self.armature_name,
                     scale_factor=self.scale_factor,
                     connect_bones=self.connect_bones,
+                    create_socket_empties=self.create_socket_empties,
                 )
                 if result != {'FINISHED'}:
                     raise RuntimeError("The skeleton importer could not complete.")

@@ -28,6 +28,8 @@ from bpy.props import BoolProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
+from ..ff7r_json.map_import import location_from_relative, rotation_from_relative
+
 MIN_BONE_LENGTH = 0.0005
 DEGENERATE_LENGTH = 1.0e-5
 DEFAULT_BONE_LENGTH = 0.05
@@ -192,6 +194,7 @@ def build_armature_from_bones(
         sockets: list[dict[str, Any]] | None = None,
         scale_factor: float = 0.01,
         connect_bones: bool = False,
+        create_socket_empties: bool = True,
 ) -> bpy.types.Object:
     """Create a new armature object with one edit-bone per entry in `bones`.
 
@@ -212,6 +215,11 @@ def build_armature_from_bones(
     KDI/"_Spo" bones are always excluded from this regardless of distance -- see
     ``allows_connect`` -- since KineDriver needs to translate them independently
     of their parent.
+
+    ``create_socket_empties`` additionally materializes each socket as a
+    bone-parented Empty, which is what ``ff7r_json/map_import``'s
+    ``find_attach_socket_empty`` looks for when resolving a UMAP actor's
+    AttachSocketName. The raw socket data is stored on the armature either way.
     """
 
     if not bones:
@@ -227,7 +235,7 @@ def build_armature_from_bones(
 
     bpy.ops.object.mode_set(mode="EDIT")
     try:
-        _build_edit_bones(armature_data, bones, scale_factor, connect_bones)
+        armature_space = _build_edit_bones(armature_data, bones, scale_factor, connect_bones)
     except Exception:
         # Never leave a half-built armature behind for the user to clean up.
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -239,8 +247,94 @@ def build_armature_from_bones(
     if sockets:
         armature_obj["ff7r_sockets"] = json.dumps(sockets, ensure_ascii=False)
         _tag_socket_bones(armature_obj, sockets)
+        if create_socket_empties:
+            _create_socket_empties(
+                armature_obj, sockets, bones, armature_space, scale_factor
+            )
 
     return armature_obj
+
+
+def _socket_local_matrix(socket: dict[str, Any], scale_factor: float) -> Matrix:
+    """Convert one socket's bone-relative UE offset into a Blender-space matrix.
+
+    Handles both export shapes: the bridge emits ``translation``/``rotation`` with
+    the rotation already converted to a quaternion by CUE4Parse's own
+    ``FRotator.Quaternion()``, while a raw FModel export carries
+    ``relativeLocation``/``relativeRotation`` as a Pitch/Yaw/Roll Rotator in
+    degrees. The Rotator path reuses ``ff7r_json/map_import``'s
+    ``rotation_from_relative``, which was verified against the quaternion path by
+    full rotation-matrix comparison rather than by decomposed Euler angles.
+    """
+    if "translation" in socket or "rotation" in socket:
+        return ue_bone_transform_to_blender(
+            tuple(socket.get("translation") or (0.0, 0.0, 0.0)),
+            tuple(socket.get("rotation") or (0.0, 0.0, 0.0, 1.0)),
+            scale_factor,
+        )
+
+    location = location_from_relative(socket.get("relativeLocation") or {}, scale_factor)
+    rotation = rotation_from_relative(socket.get("relativeRotation") or {})
+    return Matrix.Translation(location) @ rotation.to_matrix().to_4x4()
+
+
+def _create_socket_empties(
+        armature_obj: bpy.types.Object,
+        sockets: list[dict[str, Any]],
+        bones: list[dict[str, Any]],
+        armature_space: list[Matrix],
+        scale_factor: float,
+) -> int:
+    """Create one bone-parented Empty per socket. Must be called in Object mode.
+
+    The socket's offset is composed against ``armature_space`` -- the raw
+    UE-converted bind transform -- and never against the edit bone's *display*
+    matrix. That distinction matters: this importer aims bones down UE's local +X
+    and adds a 90 degree roll, so a bone's displayed local axes are a permutation
+    of the UE axes the socket offset is expressed in. Composing in UE-converted
+    space and only then rebasing onto the finished bone (via ``rest_matrix``
+    below, read back from Blender) keeps this correct without depending on what
+    that permutation currently is.
+    """
+    bone_index_by_name = {bone["name"]: index for index, bone in enumerate(bones)}
+    collection = armature_obj.users_collection[0] if armature_obj.users_collection else None
+    created = 0
+
+    for socket in sockets:
+        socket_name = socket.get("name")
+        bone_name = socket.get("boneName")
+        if not socket_name or not bone_name:
+            continue
+        bone_index = bone_index_by_name.get(bone_name)
+        bone = armature_obj.data.bones.get(bone_name)
+        if bone_index is None or bone is None:
+            print(f"[FF7R Skeleton] Socket '{socket_name}': bone '{bone_name}' not found; skipped.")
+            continue
+
+        socket_matrix = armature_space[bone_index] @ _socket_local_matrix(socket, scale_factor)
+
+        empty = bpy.data.objects.new(f"{armature_obj.name}_{socket_name}", None)
+        empty.empty_display_type = "PLAIN_AXES"
+        empty.empty_display_size = 0.02
+        empty["SocketName"] = socket_name
+        empty["ff7r_socket_bone"] = bone_name
+        if collection is not None:
+            collection.objects.link(empty)
+
+        # Blender parents to a bone's TAIL, so the effective parent frame is the
+        # bone's rest matrix shifted down its own +Y by the bone's length. Undo
+        # exactly that shift so the Empty lands on the socket's true position;
+        # leaving matrix_parent_inverse at identity keeps the resulting local
+        # transform visible (and editable) in the N panel.
+        parent_frame = bone.matrix_local @ Matrix.Translation((0.0, bone.length, 0.0))
+        empty.parent = armature_obj
+        empty.parent_type = "BONE"
+        empty.parent_bone = bone_name
+        empty.matrix_parent_inverse = Matrix.Identity(4)
+        empty.matrix_basis = parent_frame.inverted() @ socket_matrix
+        created += 1
+
+    return created
 
 
 def _tag_socket_bones(armature_obj: bpy.types.Object, sockets: list[dict[str, Any]]) -> None:
@@ -267,8 +361,13 @@ def _build_edit_bones(
         bones: list[dict[str, Any]],
         scale_factor: float,
         connect_bones: bool,
-) -> None:
-    """Populate an armature's edit bones. Must be called in Edit mode."""
+) -> list[Matrix]:
+    """Populate an armature's edit bones. Must be called in Edit mode.
+
+    Returns each bone's armature-space bind matrix in UE-converted axes (before
+    the display-frame aim/roll applied to the edit bones), which socket placement
+    needs in order to compose bone-relative UE offsets correctly.
+    """
     edit_bones = armature_data.edit_bones
     created = []
     for bone in bones:
@@ -353,6 +452,8 @@ def _build_edit_bones(
                 edit_bone.parent.tail = head
                 edit_bone.use_connect = True
 
+    return armature_space
+
 
 class FF7R_OT_import_skeleton_json(bpy.types.Operator, ImportHelper):
     """Build an armature from a Skeleton/SkeletalMesh JSON export"""
@@ -377,6 +478,14 @@ class FF7R_OT_import_skeleton_json(bpy.types.Operator, ImportHelper):
         ),
         default=False,
     )
+    create_socket_empties: BoolProperty(
+        name="Create socket empties",
+        description=(
+            "Add a bone-parented Empty for each attachment socket, matching what "
+            "the UMAP importer looks for when resolving an actor's AttachSocketName"
+        ),
+        default=True,
+    )
 
     def execute(self, context):
         path = Path(self.filepath)
@@ -389,6 +498,7 @@ class FF7R_OT_import_skeleton_json(bpy.types.Operator, ImportHelper):
                 sockets=sockets,
                 scale_factor=self.scale_factor,
                 connect_bones=self.connect_bones,
+                create_socket_empties=self.create_socket_empties,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Skeleton import failed: {exc}")
