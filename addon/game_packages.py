@@ -19,6 +19,7 @@ from .ff7r_json import map_import
 from .kdi.drivers import (
     AXIS_ORDER_ITEMS,
     COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
+    SWAP_BEND_ST_DESCRIPTION,
     COORDINATE_PROFILE_REFERENCE,
 )
 
@@ -1453,6 +1454,11 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
         items=AXIS_ORDER_ITEMS,
         default="YZX",
     )
+    swap_bend_st: bpy.props.BoolProperty(
+        name="Swap BendS/BendT interpretation",
+        description=SWAP_BEND_ST_DESCRIPTION,
+        default=False,
+    )
 
     def invoke(self, context, _event):
         prefs = _preferences(context)
@@ -1491,6 +1497,9 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
         layout.label(text="Experimental target-axis mapping")
         layout.prop(self, "translation_axis_order")
         layout.prop(self, "scale_axis_order")
+        layout.separator()
+        layout.label(text="Debug")
+        layout.prop(self, "swap_bend_st")
 
     def execute(self, context):
         prefs = _preferences(context)
@@ -1530,6 +1539,7 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
                         if context.active_object and context.active_object.type == "ARMATURE"
                         else COORDINATE_PROFILE_REFERENCE
                     ),
+                    swap_bend_st=self.swap_bend_st,
                 )
         except Exception as exc:
             self.report({'ERROR'}, f"Package KDI import failed: {exc}")
@@ -1677,6 +1687,11 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         ),
         default=False,
     )
+    swap_bend_st: bpy.props.BoolProperty(
+        name="Swap BendS/BendT interpretation",
+        description=SWAP_BEND_ST_DESCRIPTION,
+        default=False,
+    )
     create_socket_empties: bpy.props.BoolProperty(
         name="Create socket empties",
         description=(
@@ -1741,6 +1756,9 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         layout.prop(self, "connect_bones")
         layout.prop(self, "create_socket_empties")
         layout.prop(self, "import_kdi")
+        kdi_debug = layout.row()
+        kdi_debug.enabled = self.import_kdi
+        kdi_debug.prop(self, "swap_bend_st")
         layout.prop(self, "create_variant_bone_collections")
         layout.prop(self, "import_mesh_referenced_bones_only")
 
@@ -1864,6 +1882,7 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                             translation_axis_order="YZX",
                             scale_axis_order="YZX",
                             coordinate_profile=COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
+                            swap_bend_st=self.swap_bend_st,
                         )
                         kdi_note = (
                             f"; also imported KDI drivers from {kdi_virtual_path}"

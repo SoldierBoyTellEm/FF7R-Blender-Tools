@@ -42,6 +42,24 @@ bl_info = {
 
 SCRIPT_VERSION = "0.3.1"
 REGISTRY_PROPERTY = "kdi_scalar_registry_json"
+
+# Debug toggle for an unresolved naming question. The stereographic decomposition
+# itself is settled -- our formulas match CEDEC slide 24 term for term -- but
+# which of the two resulting angles the data calls BendS and which BendT is a
+# labelling convention we inferred rather than confirmed. We read BendS as the
+# up-axis angle and BendT as the cross-axis angle; a third-party reference reads
+# them the other way round (though its phrasing is ambiguous). Our assignment is
+# self-consistent between decomposition and recomposition, which is why rigs work,
+# so this cannot be settled by reasoning -- only by looking at a shoulder or hip
+# deform with it on and off. Enabling it swaps the interpretation on both sides at
+# once, which is a pure relabel; it is NOT a no-op, because a BendS->BendS link
+# then transports the cross-axis angle where it used to transport the up-axis one.
+SWAP_BEND_ST_DESCRIPTION = (
+    "Debug: reinterpret BendS as the cross-axis angle and BendT as the up-axis "
+    "angle (the opposite of this add-on's default reading). Swaps both the source "
+    "decomposition and the target recomposition together. Leave off unless you are "
+    "specifically testing which convention matches the game"
+)
 GENERATED_PROPERTY = "kdi_scalar_generated_json"
 SOURCE_PROPERTY = "kdi_scalar_source_audit"
 KDI_BONE_COLLECTION = "KDI Helpers (Hidden)"
@@ -328,6 +346,12 @@ def rotation_parameter(config: dict[str, Any], q: list[float]) -> float:
         roll -= 2.0 * math.pi
     elif roll < -math.pi:
         roll += 2.0 * math.pi
+
+    if config.get("swap_bend_st"):
+        # Debug relabel: reinterpret which physical angle each channel name
+        # denotes. See the note on SWAP_BEND_ST_DESCRIPTION. The target side
+        # (kdi_rotation) swaps in step, so this stays a pure relabel.
+        bend_from_up, bend_from_cross = bend_from_cross, bend_from_up
 
     if parameter == "BendS":
         return bend_from_up
@@ -639,9 +663,16 @@ def kdi_rotation(config_id: int, component: int, *values: float) -> float:
         rotation_type = config["rotation_type"]
         if rotation_type == "TargetBendSTRoll":
             target_body = config["target_body"]
+            bend_s = channels.get("BendS", 0.0)
+            bend_t = channels.get("BendT", 0.0)
+            if config.get("swap_bend_st"):
+                # compose_bend_roll's first argument is always the up-axis angle
+                # and its second the cross-axis angle, so under the swapped
+                # labelling the channels feed the opposite slots.
+                bend_s, bend_t = bend_t, bend_s
             quaternion = compose_bend_roll(
-                channels.get("BendS", 0.0),
-                channels.get("BendT", 0.0),
+                bend_s,
+                bend_t,
                 channels.get("Roll", 0.0),
                 converted_axis(target_body, "AimVector", (1.0, 0.0, 0.0)),
                 converted_axis(target_body, "UpVector", (0.0, 1.0, 0.0)),
@@ -1280,12 +1311,33 @@ def hide_noninteractive_bones(armature: Any, node_by_index: dict[int, dict[str, 
     }
 
 
+def _stamp_swap_bend_st(configs: list[dict[str, Any]]) -> None:
+    """Mark every config, including the ones nested inside rotation targets.
+
+    Rotation configs carry their own scalar configs in ``scalar_inputs`` and
+    ``direct_source``; those are the dicts ``rotation_parameter`` actually
+    receives, so stamping only the top level would swap the target side without
+    the source side and produce a genuinely wrong rig rather than a relabel.
+    """
+    for config in configs:
+        if not isinstance(config, dict):
+            continue
+        config["swap_bend_st"] = True
+        nested = list(config.get("scalar_inputs") or [])
+        direct = config.get("direct_source")
+        if isinstance(direct, dict):
+            nested.append(direct)
+        if nested:
+            _stamp_swap_bend_st(nested)
+
+
 def build_scalar_drivers(
     armature: Any,
     audit: dict[str, Any],
     translation_axis_order: str = "XZY",
     scale_axis_order: str = "XZY",
     coordinate_profile: str = COORDINATE_PROFILE_REFERENCE,
+    swap_bend_st: bool = False,
 ) -> dict[str, Any]:
     for axis_order in (translation_axis_order, scale_axis_order):
         if sorted(axis_order) != ["X", "Y", "Z"]:
@@ -1449,11 +1501,19 @@ def build_scalar_drivers(
                 armature.data.collections.remove(collection)
         raise
 
+    all_configs = configs + rotation_configs + anchor_configs
+    if swap_bend_st:
+        # Stamped onto the serialized configs rather than held in a module global
+        # so the choice travels with the .blend and survives a reload -- otherwise
+        # reopening the file would silently evaluate the drivers the other way.
+        _stamp_swap_bend_st(all_configs)
+
     registry = {
         "schema_version": 1,
         "script_version": SCRIPT_VERSION,
         "source_sha256": graph["source"]["sha256"],
-        "configs": configs + rotation_configs + anchor_configs,
+        "swap_bend_st": bool(swap_bend_st),
+        "configs": all_configs,
     }
     ownership = {
         "schema_version": 1,
@@ -1521,6 +1581,11 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
         default=COORDINATE_PROFILE_REFERENCE,
         options={"HIDDEN", "SKIP_SAVE"},
     )
+    swap_bend_st: BoolProperty(
+        name="Swap BendS/BendT interpretation",
+        description=SWAP_BEND_ST_DESCRIPTION,
+        default=False,
+    )
 
     def draw(self, _context: Any) -> None:
         layout = self.layout
@@ -1529,6 +1594,9 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
         layout.label(text="Experimental target-axis mapping")
         layout.prop(self, "translation_axis_order")
         layout.prop(self, "scale_axis_order")
+        layout.separator()
+        layout.label(text="Debug")
+        layout.prop(self, "swap_bend_st")
 
     def execute(self, context: Any) -> set[str]:
         armature = context.active_object
@@ -1560,6 +1628,7 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
                 translation_axis_order=self.translation_axis_order,
                 scale_axis_order=self.scale_axis_order,
                 coordinate_profile=self.coordinate_profile,
+                swap_bend_st=self.swap_bend_st,
             )
             armature[SOURCE_PROPERTY] = str(source_path.resolve())
             success_message = (
@@ -1571,7 +1640,8 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
                 f"{result['hidden_helper_bone_count']} helper/physics/leaf bones"
                 f"; translate {self.translation_axis_order}, scale {self.scale_axis_order}"
                 f"; frame {self.coordinate_profile}"
-                f"; audit: {text_name}"
+                + ("; BendS/BendT SWAPPED" if self.swap_bend_st else "")
+                + f"; audit: {text_name}"
             )
             self.report({"INFO"}, success_message)
             return {"FINISHED"}
