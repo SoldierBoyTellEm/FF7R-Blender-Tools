@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,7 @@ def _run_bridge(
         asset_path: str = "",
         raw_output: str = "",
         summary: bool = False,
+        needs_mappings: bool = True,
 ) -> dict:
     output_handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     output_path = output_handle.name
@@ -86,6 +88,12 @@ def _run_bridge(
         os.path.abspath(raw_output) if raw_output else "",
         "summary" if summary else "",
     ]
+    if not needs_mappings:
+        # Enumerating virtual paths only reads the mounted pak indices; the .usmap
+        # is used solely to deserialize package properties. Truncating the argument
+        # list here leaves the bridge's usmap argument absent so it skips that load
+        # entirely, and lets the browsers work before a .usmap has been configured.
+        command = command[:6]
     try:
         completed = subprocess.run(
             command,
@@ -161,6 +169,92 @@ def _package_config_key(game_root: str, oodle_dll: str, usmap_path: str) -> tupl
     )
 
 
+# Listing an index means mounting ~140 GiB of paks, which dominates the cost and
+# costs the same whether one asset type is being listed or all of them. The result
+# only changes when the game itself is patched, so it is cached on disk and keyed
+# by a fingerprint of the pak files -- making every later cold start a file read
+# rather than a mount. Bump the version to invalidate every cached index.
+_INDEX_CACHE_VERSION = 1
+
+
+def _pak_signature(game_root: str) -> str | None:
+    """Fingerprint the mounted paks. Cheap (~3 ms for Rebirth's 153 files)."""
+    pak_directory = os.path.join(game_root, "End", "Content", "Paks")
+    if not os.path.isdir(pak_directory):
+        pak_directory = game_root
+    entries: list[str] = []
+    try:
+        for root, _directories, names in os.walk(pak_directory):
+            for name in names:
+                try:
+                    stat = os.stat(os.path.join(root, name))
+                except OSError:
+                    continue
+                entries.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
+    except OSError:
+        return None
+    if not entries:
+        return None
+    entries.sort()
+    return hashlib.sha1("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def _index_cache_file() -> Path | None:
+    try:
+        directory = bpy.utils.user_resource("DATAFILES", path="ff7r_rebirth_tools", create=True)
+    except Exception:
+        return None
+    return Path(directory) / "package_index_cache.json" if directory else None
+
+
+def _load_disk_index(kind: str, signature: str | None) -> list[str] | None:
+    """Return a previously cached index, or None if absent or stale."""
+    if not signature:
+        return None
+    path = _index_cache_file()
+    if path is None or not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            cache = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    if cache.get("version") != _INDEX_CACHE_VERSION or cache.get("signature") != signature:
+        return None
+    cached = cache.get("indices", {}).get(kind)
+    return cached if isinstance(cached, list) else None
+
+
+def _store_disk_index(kind: str, signature: str | None, paths: list[str]) -> None:
+    """Cache one index. A stale signature drops every other kind with it."""
+    if not signature:
+        return
+    path = _index_cache_file()
+    if path is None:
+        return
+    cache = {"version": _INDEX_CACHE_VERSION, "signature": signature, "indices": {}}
+    if path.is_file():
+        try:
+            with open(path, encoding="utf-8") as stream:
+                existing = json.load(stream)
+            if (existing.get("version") == _INDEX_CACHE_VERSION
+                    and existing.get("signature") == signature
+                    and isinstance(existing.get("indices"), dict)):
+                cache["indices"] = existing["indices"]
+        except (OSError, ValueError):
+            pass
+    cache["indices"][kind] = paths
+    try:
+        # Write via a sibling temp file so an interrupted write cannot leave a
+        # truncated cache that later reads would treat as authoritative.
+        temporary = path.with_suffix(".json.tmp")
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(cache, stream)
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
 def _search_virtual_paths(paths: list[str], edit_text: str, empty_limit=256, result_limit=512):
     query = edit_text.casefold().replace("\\", "/").strip()
     if not query:
@@ -169,22 +263,49 @@ def _search_virtual_paths(paths: list[str], edit_text: str, empty_limit=256, res
     return [path for path in paths if all(term in path.casefold() for term in terms)][:result_limit]
 
 
+def _build_index(
+        kind: str,
+        game_root: str,
+        oodle_dll: str,
+        usmap_path: str,
+        path_filter: str,
+        keep,
+        force: bool,
+) -> list[str]:
+    """Return the virtual paths for one asset kind, cheapest source first.
+
+    Falls back through the on-disk cache before paying for a pak mount, and
+    stores whatever it had to build. Listing never needs type mappings, so the
+    bridge is told to skip loading the .usmap.
+    """
+    signature = _pak_signature(game_root)
+    if not force:
+        cached = _load_disk_index(kind, signature)
+        if cached is not None:
+            return cached
+    result = _run_bridge(
+        game_root, oodle_dll, usmap_path,
+        path_filter=path_filter,
+        needs_mappings=False,
+    )
+    paths = [
+        path for path in result.get("files", [])
+        if keep(path) and "/autogencollision/" not in path.replace("\\", "/").casefold()
+    ]
+    _store_disk_index(kind, signature, paths)
+    return paths
+
+
 def refresh_umap_index(game_root: str, oodle_dll: str, usmap_path: str, *, force=False) -> list[str]:
     global _VIRTUAL_UMAPS, _CACHE_KEY
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _CACHE_KEY:
-        result = _run_bridge(
-            game_root,
-            oodle_dll,
-            usmap_path,
-            path_filter=".umap",
+        _VIRTUAL_UMAPS = _build_index(
+            "umap", game_root, oodle_dll, usmap_path, ".umap",
+            lambda path: path.lower().endswith(".umap"),
+            force,
         )
-        _VIRTUAL_UMAPS = [
-            path for path in result.get("files", [])
-            if path.lower().endswith(".umap")
-            and "/autogencollision/" not in path.replace("\\", "/").casefold()
-        ]
         _CACHE_KEY = cache_key
     return _VIRTUAL_UMAPS
 
@@ -194,16 +315,11 @@ def refresh_kdi_index(game_root: str, oodle_dll: str, usmap_path: str, *, force=
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _KDI_CACHE_KEY:
-        result = _run_bridge(
-            game_root, oodle_dll, usmap_path,
-            path_filter="_KDI",
+        _VIRTUAL_KDIS = _build_index(
+            "kdi", game_root, oodle_dll, usmap_path, "_KDI",
+            lambda path: os.path.basename(path).lower().endswith("_kdi.uasset"),
+            force,
         )
-        _VIRTUAL_KDIS = [
-            path for path in result.get("files", [])
-            if path.lower().endswith(".uasset")
-            and os.path.basename(path).lower().endswith("_kdi.uasset")
-            and "/autogencollision/" not in path.replace("\\", "/").casefold()
-        ]
         _KDI_CACHE_KEY = cache_key
     return _VIRTUAL_KDIS
 
@@ -217,16 +333,11 @@ def refresh_skeleton_index(game_root: str, oodle_dll: str, usmap_path: str, *, f
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _SKELETON_CACHE_KEY:
-        result = _run_bridge(
-            game_root, oodle_dll, usmap_path,
-            path_filter="_Skeleton",
+        _VIRTUAL_SKELETONS = _build_index(
+            "skeleton", game_root, oodle_dll, usmap_path, "_Skeleton",
+            lambda path: os.path.basename(path).lower().endswith("_skeleton.uasset"),
+            force,
         )
-        _VIRTUAL_SKELETONS = [
-            path for path in result.get("files", [])
-            if path.lower().endswith(".uasset")
-            and os.path.basename(path).lower().endswith("_skeleton.uasset")
-            and "/autogencollision/" not in path.replace("\\", "/").casefold()
-        ]
         _SKELETON_CACHE_KEY = cache_key
     return _VIRTUAL_SKELETONS
 
