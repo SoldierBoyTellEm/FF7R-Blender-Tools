@@ -5,8 +5,14 @@ import json
 import bpy
 
 from .. import render_settings
-from .parser import BinReader, build_import_hash_table, build_objects_from_component
-from .material import load_hash_table, build_texture_index
+from .parser import (
+    BinReader,
+    build_import_hash_table,
+    build_objects_from_component,
+    clear_unresolved_texture_hashes,
+    get_unresolved_texture_hashes,
+)
+from .material import build_texture_index, has_image_loader_override, load_hash_table
 
 
 TextureIndexCache = dict[tuple[str, str], dict[str, str]]
@@ -58,11 +64,13 @@ def import_umap_paths(
         lod_level=0,
         import_originals=False,
         offset_opposite_faces=False,
+        import_sway=True,
         scale_factor=0.01,
         tex_root=None,
         tex_ext=None,
         tex_match_by_filename=None,
         texture_index_cache: TextureIndexCache | None = None,
+        import_names_by_path: dict[str, list[str | None]] | None = None,
 ):
     """Import one or more .umap files from Python.
 
@@ -73,6 +81,8 @@ def import_umap_paths(
     """
     if isinstance(paths, (str, bytes, os.PathLike)):
         paths = [paths]
+
+    clear_unresolved_texture_hashes()
 
     render_settings.ensure_cycles_transparent_bounces(getattr(context, "scene", None))
 
@@ -86,6 +96,8 @@ def import_umap_paths(
 
     if tex_root:
         print(f"Texture root: {tex_root!r}  ext: {tex_ext!r}  match_by_filename: {tex_match_by_filename}")
+    elif has_image_loader_override():
+        print("Package texture streaming enabled - DDS images will be packed into the Blend file.")
     else:
         print("No texture root set - materials will have empty image nodes.")
 
@@ -95,8 +107,10 @@ def import_umap_paths(
         else None
     )
 
-    # Reload CSV on every import run so edits take effect without restarting Blender
-    load_hash_table()
+    # Loose exports may need the legacy hash CSV. Package-backed imports supply
+    # CUE4Parse's exact import map and deliberately bypass that lookup table.
+    if import_names_by_path is None:
+        load_hash_table()
 
     processed = 0
     skipped = 0
@@ -197,9 +211,16 @@ def import_umap_paths(
                 if name_table[export_type_idx[exp_idx]].lower() != "massiveenvironmentcomponent0":
                     continue
 
-                import_names = None
+                normalized_path = os.path.normcase(os.path.realpath(umap_path))
+                import_names = (
+                    import_names_by_path.get(normalized_path)
+                    if import_names_by_path is not None
+                    else None
+                )
                 meta_path = os.path.splitext(umap_path)[0] + ".metadata.json"
-                if os.path.isfile(meta_path):
+                if import_names is not None:
+                    print(f"CUE4Parse metadata: {len(import_names)} import names")
+                elif os.path.isfile(meta_path):
                     try:
                         with open(meta_path, encoding="utf-8") as meta_file:
                             meta = json.load(meta_file)
@@ -229,6 +250,7 @@ def import_umap_paths(
                     tex_ext=tex_ext,
                     tex_index=tex_index,
                     offset_opposite_faces=offset_opposite_faces,
+                    import_sway=import_sway,
                 )
                 found = True
                 break
@@ -244,7 +266,11 @@ def import_umap_paths(
             import traceback; traceback.print_exc()
             skipped += 1
 
-    return processed, skipped
+    unresolved_count = len(get_unresolved_texture_hashes())
+    if unresolved_count:
+        print(f"Unknown texture hashes: {unresolved_count}")
+
+    return processed, skipped, unresolved_count
 
 
 # ============================================================
@@ -291,6 +317,15 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
         description=(
             "Directly offset vertices on overlapping opposite-facing faces by 0.0005 at 0.01 scale "
             "to reduce z-fighting; no modifiers or material changes"
+        ),
+        default=True,
+    )
+
+    import_sway: bpy.props.BoolProperty(
+        name="Import wind sway as shape keys",
+        description=(
+            "Bake the DeformContext wind animation into one shape key per frame. "
+            "Only affects groups that carry sway data (roughly a third of them)"
         ),
         default=True,
     )
@@ -348,6 +383,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, "import_originals")
         layout.prop(self, "offset_opposite_faces")
+        layout.prop(self, "import_sway")
         layout.label(text="LOD Level")
         layout.prop(self, "lod_mode", expand=True)
         if self.lod_mode == "QUALITY":
@@ -384,7 +420,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
 
         prefs_available = _get_addon_preferences(context) is not None
 
-        processed, skipped = import_umap_paths(
+        processed, skipped, unresolved_count = import_umap_paths(
             context,
             paths,
             lod_mode=self.lod_mode,
@@ -392,6 +428,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
             lod_level=self.lod_level,
             import_originals=self.import_originals,
             offset_opposite_faces=self.offset_opposite_faces,
+            import_sway=self.import_sway,
             scale_factor=self.scale_factor,
             tex_root=None if prefs_available else self.fallback_tex_root,
             tex_ext=None if prefs_available else self.fallback_tex_ext,
@@ -404,6 +441,12 @@ class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
             if skipped:
                 msg += f" ({skipped} skipped)"
             self.report({'INFO'}, msg)
+
+        if unresolved_count:
+            self.report(
+                {'WARNING'},
+                f"{unresolved_count} unknown texture hash(es) - see console for details",
+            )
 
         return {'FINISHED'}
 

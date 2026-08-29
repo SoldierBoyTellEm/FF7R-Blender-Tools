@@ -11,9 +11,11 @@ from bpy_extras import anim_utils
 from . import asset_linking, lights, timeline_actions
 
 
+# Only used when this module is run directly (Blender Text Editor "Run Script"),
+# not during normal addon operation. Point it at your own FModel cutscene export.
 FILE_PREFIX: str = (
-    r"O:\Games\Rebirth Tools\FModel\Output\Exports"
-    r"\End\Content\Cut\Game\8400-GOLDE\EV_GOLDE_4840\EV_GOLDE_4840"
+    r"C:\path\to\FModel\Output\Exports"
+    r"\End\Content\Cut\Game\<sequence-folder>\<sequence-name>"
 )
 
 CLEAR_EXISTING_CAMERAS: bool  = False

@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "FF7 Rebirth map importer",
+    "name": "FF7R Rebirth Tools",
     "author": "GargoyleTech",
-    "version": (2, 0, 4),
+    "version": (1, 3, 1),
     "blender": (4, 0, 0),
-    "location": "File > Import > FF7R Rebirth",
-    "description": "Imports FF7R Rebirth cutscene JSON, UMAP JSON, and Massive Environment .umap files",
+    "location": "File > Import > FF7R Rebirth; Object > Retrilogy tools",
+    "description": "FF7R package/static-mesh, UMAP, KineDriver, and cleanup tools",
     "category": "Import-Export",
 }
 
@@ -16,10 +16,14 @@ import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, StringProperty
 from bpy.types import AddonPreferences, Menu, Operator
 
-from . import asset_linking, cutscene_import, lights, map_import, particles, render_settings, timeline_actions, worlds
+from . import game_packages, render_settings, z_fighting
+from .kdi import audit as kdi_audit
+from .kdi import drivers as kdi_drivers
+from .ff7r_json import asset_linking, cutscene_import, lights, map_import, particles, timeline_actions, worlds
 from .mec import importer as mec_importer
 from .mec import material as mec_material
 from .mec import parser as mec_parser
+from .skeleton import importer as skeleton_importer
 
 for _module in (
     asset_linking,
@@ -29,15 +33,23 @@ for _module in (
     worlds,
     timeline_actions,
     cutscene_import,
+    kdi_audit,
+    kdi_drivers,
+    z_fighting,
     mec_material,
     mec_parser,
     mec_importer,
     map_import,
+    skeleton_importer,
+    game_packages,
 ):
     importlib.reload(_module)
 
 FF7R_REBIRTH_OT_import_mec_umap = mec_importer.FF7R_REBIRTH_OT_import_mec_umap
 FF7R_REBIRTH_FH_import_mec_umap = mec_importer.FF7R_REBIRTH_FH_import_mec_umap
+FF7R_REBIRTH_OT_import_mec_game_packages = game_packages.FF7R_REBIRTH_OT_import_mec_game_packages
+FF7R_OT_import_skeleton_json = skeleton_importer.FF7R_OT_import_skeleton_json
+MESH_OT_find_opposite_faces = z_fighting.MESH_OT_find_opposite_faces
 
 FileHandler = getattr(bpy.types, "FileHandler", None)
 
@@ -104,6 +116,24 @@ class FF7R_ImportPreferences(AddonPreferences):
         name="Game Content Root",
         description="Default exported Unreal /Game directory for recursive JSON and .umap imports. Subfolders such as 'level'",
         subtype="DIR_PATH",
+        default="",
+    )
+    rebirth_install_root: StringProperty(
+        name="Rebirth Install Folder",
+        description="FINAL FANTASY VII REBIRTH installation containing End/Content/Paks",
+        subtype="DIR_PATH",
+        default="",
+    )
+    rebirth_usmap_path: StringProperty(
+        name="Rebirth Mapping File",
+        description="UE 4.26 .usmap used by CUE4Parse to deserialize Rebirth packages",
+        subtype="FILE_PATH",
+        default="",
+    )
+    rebirth_oodle_dll: StringProperty(
+        name="Oodle DLL",
+        description="Compatible oo2core DLL used to decompress package content (found in a Final Fantasy VII Remake Intergrade install, e.g. Engine/Binaries/ThirdParty/Oodle/Win64/oo2core_7_win64.dll)",
+        subtype="FILE_PATH",
         default="",
     )
     json_scale_factor: FloatProperty(
@@ -189,6 +219,12 @@ class FF7R_ImportPreferences(AddonPreferences):
         row.label(text="Extension:")
         row.prop(self, "texture_extension", text="")
         texture_box.prop(self, "texture_match_by_filename")
+
+        package_box = layout.box()
+        package_box.label(text="Direct Rebirth Package Imports")
+        package_box.prop(self, "rebirth_install_root")
+        package_box.prop(self, "rebirth_usmap_path")
+        package_box.prop(self, "rebirth_oodle_dll")
 
 
 class FF7R_REBIRTH_OT_import_cutscene_json(Operator):
@@ -506,13 +542,107 @@ class TOPBAR_MT_file_import_ff7r_rebirth(Menu):
         op.filepath = ""
         op = layout.operator(
             FF7R_REBIRTH_OT_import_mec_umap.bl_idname,
-            text="Massive Environment UMAP",
+            text="Massive Environment UMAP (Loose Files)",
         )
         op.filepath = ""
+        layout.operator(
+            FF7R_REBIRTH_OT_import_mec_game_packages.bl_idname,
+            text="UMAP (Rebirth Packages)",
+        )
+        layout.operator(
+            game_packages.FF7R_REBIRTH_OT_import_static_mesh_game_packages.bl_idname,
+            text="Static Mesh (Rebirth Packages)",
+        )
+        layout.operator(
+            game_packages.FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages.bl_idname,
+            text="Skeletal Mesh (Rebirth Packages)",
+        )
+        layout.separator()
+        layout.operator(
+            kdi_drivers.KDI_OT_step2_scalar_drivers.bl_idname,
+            text="KineDriver JSON",
+        )
+        layout.operator(
+            game_packages.FF7R_REBIRTH_OT_import_kdi_game_packages.bl_idname,
+            text="KineDriver JSON (Rebirth Packages)",
+        )
+        layout.separator()
+        op = layout.operator(
+            FF7R_OT_import_skeleton_json.bl_idname,
+            text="Skeleton JSON",
+        )
+        op.filepath = ""
+        layout.operator(
+            game_packages.FF7R_REBIRTH_OT_import_skeleton_game_packages.bl_idname,
+            text="Skeleton (Rebirth Packages)",
+        )
 
 
 def menu_func_import(self, _context):
     self.layout.menu(TOPBAR_MT_file_import_ff7r_rebirth.bl_idname)
+
+
+class OBJECT_MT_ff7r_rebirth_tools(Menu):
+    """The deliberately small replacement for the former FF7R Actions menu."""
+
+    bl_idname = "OBJECT_MT_ff7r_rebirth_tools"
+    bl_label = "Retrilogy tools"
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.operator(MESH_OT_find_opposite_faces.bl_idname)
+        layout.separator()
+        layout.operator(kdi_drivers.KDI_OT_remove_scalar_drivers.bl_idname)
+
+
+def menu_func_object(self, _context):
+    self.layout.menu(OBJECT_MT_ff7r_rebirth_tools.bl_idname)
+
+
+class ARMATURE_MT_ff7r_rebirth_tools(Menu):
+    """Edit-mode helpers for the active armature bone."""
+
+    bl_idname = "ARMATURE_MT_ff7r_rebirth_tools"
+    bl_label = "Retrilogy tools"
+
+    def draw(self, _context):
+        self.layout.operator(
+            ARMATURE_OT_connect_parent_tail_to_bone.bl_idname,
+        )
+
+
+class ARMATURE_OT_connect_parent_tail_to_bone(Operator):
+    bl_idname = "armature.connect_parent_tail_to_bone"
+    bl_label = "Move Parent Tail Here and Connect"
+    bl_description = (
+        "Move the active bone's parent's tail to this bone's head, then connect "
+        "the active bone without moving its head"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        armature = context.object
+        bone = context.active_bone
+        return (
+            armature is not None
+            and armature.type == "ARMATURE"
+            and armature.mode == "EDIT"
+            and bone is not None
+            and bone.parent is not None
+        )
+
+    def execute(self, context):
+        bone = context.active_bone
+        parent = bone.parent
+        parent.tail = bone.head
+        bone.use_connect = True
+        self.report({"INFO"}, f"Connected '{bone.name}' to '{parent.name}' without moving its head")
+        return {"FINISHED"}
+
+
+def menu_func_edit_armature(self, _context):
+    self.layout.menu(ARMATURE_MT_ff7r_rebirth_tools.bl_idname)
 
 
 if FileHandler is not None:
@@ -546,22 +676,35 @@ classes = tuple(cls for cls in (
     FF7R_REBIRTH_OT_import_cutscene_json,
     FF7R_REBIRTH_OT_import_umap_json,
     FF7R_REBIRTH_OT_import_mec_umap,
+    FF7R_OT_import_skeleton_json,
+    *game_packages.CLASSES,
     TOPBAR_MT_file_import_ff7r_rebirth,
     FF7R_REBIRTH_FH_import_cutscene_json,
     FF7R_REBIRTH_FH_import_umap_json,
     FF7R_REBIRTH_FH_import_mec_umap,
+    MESH_OT_find_opposite_faces,
+    OBJECT_MT_ff7r_rebirth_tools,
+    ARMATURE_OT_connect_parent_tail_to_bone,
+    ARMATURE_MT_ff7r_rebirth_tools,
 ) if cls is not None)
 
 
 def register():
-    mec_material.load_hash_table()
     for cls in classes:
         bpy.utils.register_class(cls)
+    game_packages.register_runtime_properties()
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.VIEW3D_MT_object.append(menu_func_object)
+    bpy.types.VIEW3D_MT_edit_armature.append(menu_func_edit_armature)
+    kdi_drivers.register()
 
 
 def unregister():
+    kdi_drivers.unregister()
+    bpy.types.VIEW3D_MT_edit_armature.remove(menu_func_edit_armature)
+    bpy.types.VIEW3D_MT_object.remove(menu_func_object)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    game_packages.unregister_runtime_properties()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 

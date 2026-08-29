@@ -1,1 +1,15 @@
+# Python
 __pycache__/
+*.pyc
+
+# .NET build output (bridge/ is source-only; build artifacts land here, not in addon/bridge)
+bin/
+obj/
+*.user
+
+# Editor/OS cruft
+.vs/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

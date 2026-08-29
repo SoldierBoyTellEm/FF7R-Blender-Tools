@@ -1,0 +1,1 @@
+"""Bundled MassiveEnvironmentComponent .umap importer."""

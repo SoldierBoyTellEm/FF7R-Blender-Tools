@@ -7,15 +7,19 @@ Sections
 1. Hash lookup (texture_hashes.csv fallback table)
 2. Texture path constants and helpers
 3. Node-tree builders:
-     _setup_nodes_standard   — ≤ 9 slots (classic 7-slot layout)
-     _setup_nodes_10slot     -> 10 slots (UV1 base + LayeredColor + UV2 detail)
-     _setup_nodes_extended   — 11-12 slots (UV1 base + UV2 detail)
+     _setup_nodes_standard   — 7-slot single-layer layout
+     _setup_nodes_two_layer  — the real 14-slot layout, transcribed from the
+                               MEC base-pass pixel shader
+     _setup_nodes_9slot      — legacy, de-duplicated slot lists (fallback only)
+     _setup_nodes_10slot     — legacy (fallback only)
+     _setup_nodes_extended   — legacy 11/12-slot (fallback only)
    Dispatcher:
      setup_material_nodes
 """
 
 import os
 import csv
+from contextlib import contextmanager
 import bpy
 
 
@@ -27,6 +31,23 @@ _CSV_NAME = "texture_hashes.csv"
 
 # Module-level table; populated by load_hash_table()
 _hash_table: dict[str, str] = {}
+_image_loader_override = None
+
+
+@contextmanager
+def image_loader_override(loader):
+    """Temporarily resolve UE texture paths with *loader* instead of disk lookup."""
+    global _image_loader_override
+    previous = _image_loader_override
+    _image_loader_override = loader
+    try:
+        yield
+    finally:
+        _image_loader_override = previous
+
+
+def has_image_loader_override() -> bool:
+    return _image_loader_override is not None
 
 
 def load_hash_table(addon_dir: str | None = None) -> None:
@@ -134,9 +155,13 @@ def load_image(game_path: str, tex_root: str, tex_ext: str,
     ignored and the basename is looked up directly in the pre-built index.
     Returns None when tex_root is empty or the file cannot be found.
     """
-    if not game_path or not tex_root:
+    if not game_path:
         return None
     if _strip_ue_suffix(game_path).lower().startswith('/game/renderer/texture/'):
+        return None
+    if _image_loader_override is not None:
+        return _image_loader_override(game_path)
+    if not tex_root:
         return None
 
     if tex_index is not None:
@@ -259,6 +284,60 @@ def _mix_rgb(nt, links, left, right, loc, label: str, blend_type: str = 'MULTIPL
     links.new(left, mix.inputs['Color1'])
     links.new(right, mix.inputs['Color2'])
     return mix.outputs['Color']
+
+
+def _base_color_texture(nt):
+    """The Image Texture node that supplies Base Color, or None.
+
+    Walks back from the Principled BSDF depth-first, following each node's
+    inputs in socket order. Order matters: the colour path is always wired to
+    the first colour input of whatever mix sits in front of it, so a
+    depth-first walk lands on the base-colour map rather than on the AO or
+    detail map that feeds the same mix's second input.
+    """
+    bsdf = next((n for n in nt.nodes
+                 if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
+    if bsdf is None:
+        return None
+
+    seen = set()
+
+    def walk(socket):
+        for link in socket.links:
+            node = link.from_node
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if node.bl_idname == 'ShaderNodeTexImage':
+                return node
+            for inp in node.inputs:
+                found = walk(inp)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(bsdf.inputs['Base Color'])
+
+
+def _set_active_texture(nt, node) -> None:
+    """Make *node* the active/selected node.
+
+    Solid shading with Color set to Texture displays the material's active
+    image texture node, so pointing it at the base-colour map is what makes
+    that viewport mode show something recognisable.
+    """
+    if node is None:
+        return
+    for n in nt.nodes:
+        try:
+            n.select = False
+        except Exception:
+            pass
+    node.select = True
+    try:
+        nt.nodes.active = node
+    except Exception:
+        pass
 
 
 # -- Standard layout (≤ 9 slots) -----------------------------
@@ -752,7 +831,13 @@ _EX_CX_OUT  =   600
 
 def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str,
                            tex_index=None) -> None:
-    """11/12-slot layout: UV1 base textures + UV2 detail textures.
+    """LEGACY 11/12-slot layout: UV1 base textures + UV2 detail textures.
+
+    These index sets describe *de-duplicated* slot lists, which is what the
+    importer used to produce. They are shifted relative to the real
+    FMassiveEnvironmentMaterialInfo slots and cannot reach the detail layer's
+    base colour, so they are reachable only through the dispatcher's fallback
+    branches. The accurate two-layer path is _setup_nodes_two_layer.
 
     Shared base indices (UV1):
       0  Base Color      → Base Color
@@ -804,11 +889,13 @@ def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str,
         )
 
     if is_12:
+        IDX_OVERRIDE  = 6
         IDX_DET_METAL = 8
         IDX_DET_NRM   = 9
         IDX_DET_RGH   = 10
         IDX_DET_AO    = 11
     else:
+        IDX_OVERRIDE  = 6
         IDX_DET_METAL = None
         IDX_DET_NRM   = 8
         IDX_DET_RGH   = 9
@@ -849,8 +936,10 @@ def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str,
             bc_node.label = 'Base Color'
             bc_out = bc_node.outputs['Color']
 
-    # Slot 6: Color Override — replaces slot 0
-    ov_path = slot(6)
+    # Color Override — replaces slot 0. In the true 14-slot layout this is
+    # slot 7, the base layer's _CM map: slot 0 is a constant white in every
+    # sampled two-layer mesh type, so the colour genuinely lives here.
+    ov_path = slot(IDX_OVERRIDE)
     if _is_const_white(ov_path):
         bc_out = None
         bsdf.inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)
@@ -975,6 +1064,317 @@ def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str,
         links.new(rgh_out, bsdf.inputs['Roughness'])
 
 
+# -- Two-layer layout (14 slots) -----------------------------
+
+_TL_UV2  = -2100
+_TL_TEX  = -1700
+_TL_A    = -1250
+_TL_B    =  -900
+_TL_C    =  -550
+_TL_D    =  -200
+_TL_BSDF =   250
+_TL_OUT   =  650
+
+
+def _setup_nodes_two_layer(mat, hashes: list, tex_root: str, tex_ext: str,
+                           tex_index=None) -> None:
+    """The real 14-slot layout, transcribed from the MEC base-pass pixel shader.
+
+    Identification note: ``RMI_Surface_Standard_Wide_Detail`` is our current
+    best guess for the RMI equivalent of this specific larger texture-slot-count
+    (14-slot) Massive Environment material variant. Its enabled static switches
+    are Color_, Metallic_, Normal_, Roughness_, Occlusion_, Detail_,
+    WideOcclusion_, DetailNormal_, DetailRoughness_, DetailOcclusion_,
+    Coordinate0_/1_/2_, and Standard_. That inference comes from the rock
+    materials that use this RMI_Surface variant. The shader interpretation and
+    flag correspondence remain evidence-based rather than a confirmed one-to-
+    one mapping; do not generalize it to other RMI_Surface materials.
+
+    Slots (FMassiveEnvironmentMaterialInfo order). Layer 1 samples with UV1,
+    layer 2 with UV2 - the shader takes them from COLOR.xy and COLOR.zw:
+
+        0  layer 1 base colour   (constant white in ~99% of mesh types)
+        1  layer 1 metalness     2  layer 1 normal
+        3  layer 1 roughness     4  layer 1 AO
+        5  alpha                 - never sampled by the shader
+        6  mask                  - written straight to a GBuffer channel we
+                                   have no equivalent for; left unwired
+        7  _CM                   layer 1's actual colour map
+        8  reserved              - never even loaded by the shader
+        9  layer 2 base colour  10  layer 2 metalness  11 layer 2 normal
+       12  layer 2 roughness    13  layer 2 AO
+
+    Combines, exactly as the shader computes them:
+
+        albedo    = sRGB_decode( Overlay( base = sRGB(slot7),
+                                          blend = sRGB(sat(slot9 * slot0)) ) )
+        metallic  = sat(slot1 + slot10)
+        roughness = sqrt(sat(slot3^2 + slot12^2))
+        AO        = let m = slot4*slot13, n = min(slot4, slot13),
+                        t = m + 1 - n
+                    in  (1 - t^5)^5 * (m - n) + n
+        normal    = reoriented normal mapping of layer 2 onto layer 1
+
+    Three deliberate divergences, all noted at their node:
+      * The shader rotates layer 2's normal into layer 1's tangent frame using
+        screen-space UV derivatives. Blender's node graph has no ddx/ddy, so
+        the reorientation is done with the frames assumed aligned.
+      * The shader keeps AO in its own GBuffer channel; Principled has no AO
+        input, so it is multiplied into base colour as the usual stand-in.
+      * The gamma round-trip uses a Gamma node (2.2) rather than the exact
+        piecewise sRGB curve, which would need ~20 nodes per channel.
+    """
+    _activate_nodes(mat)
+    nt = mat.node_tree
+    nt.nodes.clear()
+    links = nt.links
+
+    out_node = nt.nodes.new('ShaderNodeOutputMaterial')
+    out_node.location = (_TL_OUT, 0)
+    bsdf = _make_bsdf(nt, links, out_node, "FF7R Two-Layer", ior=1.2)
+    bsdf.location = (_TL_BSDF, 0)
+
+    uv2 = nt.nodes.new('ShaderNodeUVMap')
+    uv2.uv_map   = "UVMap2"
+    uv2.label    = "UV Channel 2"
+    uv2.location = (_TL_UV2, -700)
+
+    def raw(i):
+        """Unfiltered slot value, so constant textures stay distinguishable."""
+        return hashes[i] if i < len(hashes) else None
+
+    def tex(i, color_space, loc, label, use_uv2=False):
+        """Texture node for a slot, or None if the slot is empty/constant."""
+        path = _slot(hashes, i)
+        if not path:
+            return None
+        node = _make_tex_node(nt, path, tex_root, tex_ext, color_space, loc,
+                              links=links if use_uv2 else None,
+                              uv_node=uv2 if use_uv2 else None,
+                              tex_index=tex_index)
+        if node is not None:
+            node.label = label
+        return node
+
+    def const_of(i):
+        """1.0 / 0.0 for a constant slot, else None."""
+        p = raw(i)
+        if _is_const_white(p):
+            return 1.0
+        if _is_const_black(p):
+            return 0.0
+        return None
+
+    def out_of(node):
+        return node.outputs['Color'] if node is not None else None
+
+    def math(op, loc, label, a=None, b=None, clamp=False):
+        n = nt.nodes.new('ShaderNodeMath')
+        n.operation = op
+        n.location  = loc
+        n.label     = label
+        n.use_clamp = clamp
+        for idx, val in ((0, a), (1, b)):
+            if val is None:
+                continue
+            if hasattr(val, 'is_output'):
+                links.new(val, n.inputs[idx])
+            else:
+                n.inputs[idx].default_value = val
+        return n.outputs['Value']
+
+    def vmath(op, loc, label, a=None, b=None, c=None, scale=None):
+        n = nt.nodes.new('ShaderNodeVectorMath')
+        n.operation = op
+        n.location  = loc
+        n.label     = label
+        for idx, val in ((0, a), (1, b), (2, c)):
+            if val is None:
+                continue
+            if hasattr(val, 'is_output'):
+                links.new(val, n.inputs[idx])
+            else:
+                n.inputs[idx].default_value = val
+        if scale is not None:
+            if hasattr(scale, 'is_output'):
+                links.new(scale, n.inputs['Scale'])
+            else:
+                n.inputs['Scale'].default_value = scale
+        return n.outputs['Value'] if op == 'DOT_PRODUCT' else n.outputs['Vector']
+
+    # ---- Base colour -------------------------------------------------
+    # Both halves are loaded Non-Color deliberately: the shader re-encodes the
+    # sampled values to sRGB before blending, and a Non-Color image node hands
+    # back exactly those stored gamma values, so the encode is free and exact.
+    cm_node = tex(7,  'Non-Color', (_TL_TEX, 1500), 'Layer 1 Colour (_CM)')
+    l2_node = tex(9,  'Non-Color', (_TL_TEX, 1150), 'Layer 2 Colour (UV2)', True)
+    l1_node = tex(0,  'Non-Color', (_TL_TEX,  800), 'Layer 1 Base Colour')
+
+    blend_out = out_of(l2_node)
+    if l1_node is not None:
+        if blend_out is not None:
+            # The shader multiplies these in linear space and encodes after;
+            # doing it in gamma space diverges slightly. Slot 0 is a constant
+            # white in ~99% of mesh types, where this multiply vanishes.
+            blend_out = _mix_rgb(nt, links, blend_out, out_of(l1_node),
+                                 (_TL_A, 1000), 'Layer2 x Layer1 Colour')
+        else:
+            blend_out = out_of(l1_node)
+
+    cm_out = out_of(cm_node)
+    if cm_out is not None and blend_out is not None:
+        # Blender's OVERLAY branches on Color1, matching the shader's branch on
+        # the _CM value - so _CM must be Color1.
+        albedo_gamma = _mix_rgb(nt, links, cm_out, blend_out,
+                                (_TL_B, 1300), 'Overlay(_CM, Layer2)', 'OVERLAY')
+    else:
+        albedo_gamma = cm_out if cm_out is not None else blend_out
+
+    bc_out = None
+    if albedo_gamma is not None:
+        gam = nt.nodes.new('ShaderNodeGamma')
+        gam.location = (_TL_C, 1300)
+        gam.label = 'sRGB -> Linear'
+        gam.inputs['Gamma'].default_value = 2.2
+        links.new(albedo_gamma, gam.inputs['Color'])
+        bc_out = gam.outputs['Color']
+
+    # ---- AO ----------------------------------------------------------
+    ao1 = tex(4,  'Non-Color', (_TL_TEX,  450), 'Layer 1 AO')
+    ao2 = tex(13, 'Non-Color', (_TL_TEX,  100), 'Layer 2 AO (UV2)', True)
+    a_out, b_out = out_of(ao1), out_of(ao2)
+    ao_out = None
+    if a_out is not None and b_out is not None:
+        m = math('MULTIPLY', (_TL_A, 450), 'AO m = a*b', a_out, b_out)
+        n = math('MINIMUM',  (_TL_A, 280), 'AO n = min(a,b)', a_out, b_out)
+        t = math('SUBTRACT', (_TL_B, 450), 'AO t = m+1-n',
+                 math('ADD', (_TL_A, 110), 'm + 1', m, 1.0), n)
+        t5 = math('POWER', (_TL_B, 280), 't^5', t, 5.0)
+        u5 = math('POWER', (_TL_B, 110), '(1-t^5)^5',
+                  math('SUBTRACT', (_TL_B, -60), '1 - t^5', 1.0, t5), 5.0)
+        d = math('SUBTRACT', (_TL_C, 280), 'm - n', m, n)
+        ao_out = math('ADD', (_TL_C, 110), 'AO combine',
+                      math('MULTIPLY', (_TL_C, -60), '(1-t^5)^5 * (m-n)', u5, d),
+                      n, clamp=True)
+    elif a_out is not None:
+        ao_out = a_out          # shader's b would be constant white -> passthrough
+    elif b_out is not None:
+        ao_out = b_out
+
+    if bc_out is not None and ao_out is not None:
+        # Stand-in for the shader's separate AO GBuffer channel (see docstring).
+        bc_out = _mix_rgb(nt, links, bc_out, ao_out, (_TL_D, 1300), 'Colour x AO')
+    if bc_out is not None:
+        links.new(bc_out, bsdf.inputs['Base Color'])
+
+    # ---- Metalness: sat(slot1 + slot10) ------------------------------
+    met1 = tex(1,  'Non-Color', (_TL_TEX, -250), 'Layer 1 Metalness')
+    met2 = tex(10, 'Non-Color', (_TL_TEX, -600), 'Layer 2 Metalness (UV2)', True)
+    m1_out, m2_out = out_of(met1), out_of(met2)
+    m1_const, m2_const = const_of(1), const_of(10)
+    if m1_out is not None and m2_out is not None:
+        links.new(math('ADD', (_TL_A, -400), 'Metal 1 + 2', m1_out, m2_out,
+                       clamp=True), bsdf.inputs['Metallic'])
+    elif m1_out is not None or m2_out is not None:
+        only = m1_out if m1_out is not None else m2_out
+        other = m2_const if m1_out is not None else m1_const
+        if other:                       # constant white on the other half
+            bsdf.inputs['Metallic'].default_value = 1.0
+        else:
+            links.new(only, bsdf.inputs['Metallic'])
+    else:
+        total = (m1_const or 0.0) + (m2_const or 0.0)
+        bsdf.inputs['Metallic'].default_value = min(1.0, total)
+
+    # ---- Roughness: sqrt(sat(slot3^2 + slot12^2)) --------------------
+    rgh1 = tex(3,  'Non-Color', (_TL_TEX, -950),  'Layer 1 Roughness')
+    rgh2 = tex(12, 'Non-Color', (_TL_TEX, -1300), 'Layer 2 Roughness (UV2)', True)
+    r1_out, r2_out = out_of(rgh1), out_of(rgh2)
+    if r1_out is not None and r2_out is not None:
+        sq1 = math('MULTIPLY', (_TL_A, -950),  'r1^2', r1_out, r1_out)
+        sq2 = math('MULTIPLY', (_TL_A, -1120), 'r2^2', r2_out, r2_out)
+        links.new(math('SQRT', (_TL_C, -1000), 'sqrt(r1^2 + r2^2)',
+                       math('ADD', (_TL_B, -1000), 'r1^2 + r2^2', sq1, sq2,
+                            clamp=True)),
+                  bsdf.inputs['Roughness'])
+    elif r1_out is not None or r2_out is not None:
+        # sqrt(sat(r^2)) == r for r in [0,1], so a lone map passes through.
+        links.new(r1_out if r1_out is not None else r2_out,
+                  bsdf.inputs['Roughness'])
+    else:
+        const = const_of(3)
+        if const is None:
+            const = const_of(12)
+        if const is not None:
+            bsdf.inputs['Roughness'].default_value = const
+
+    # ---- Normal: reoriented normal mapping ---------------------------
+    nrm1 = tex(2,  'Non-Color', (_TL_TEX, -1650), 'Layer 1 Normal')
+    nrm2 = tex(11, 'Non-Color', (_TL_TEX, -2100), 'Layer 2 Normal (UV2)', True)
+
+    def unpack_normal(node, y, tag):
+        """Texel -> unit tangent-space normal, Z rebuilt like the shader does."""
+        signed = vmath('MULTIPLY_ADD', (_TL_A, y), tag + ' *2-1',
+                       node.outputs['Color'], (2.0, 2.0, 2.0), (-1.0, -1.0, -1.0))
+        flat = vmath('MULTIPLY', (_TL_A, y - 170), tag + ' xy', signed,
+                     (1.0, 1.0, 0.0))
+        dot = vmath('DOT_PRODUCT', (_TL_B, y - 170), tag + ' dot(xy,xy)',
+                    flat, flat)
+        z = math('SQRT', (_TL_C, y - 170), tag + ' z',
+                 math('MAXIMUM', (_TL_B, y - 340), 'max(0, 1-d)',
+                      math('SUBTRACT', (_TL_B, y - 510), '1 - d', 1.0, dot), 0.0))
+        sep = nt.nodes.new('ShaderNodeSeparateXYZ')
+        sep.location = (_TL_B, y)
+        links.new(flat, sep.inputs['Vector'])
+        comb = nt.nodes.new('ShaderNodeCombineXYZ')
+        comb.location = (_TL_C, y)
+        comb.label = tag + ' xyz'
+        links.new(sep.outputs['X'], comb.inputs['X'])
+        links.new(sep.outputs['Y'], comb.inputs['Y'])
+        links.new(z, comb.inputs['Z'])
+        return vmath('NORMALIZE', (_TL_C, y + 170), tag + ' normalize',
+                     comb.outputs['Vector'])
+
+    n_out = None
+    if nrm1 is not None and nrm2 is not None:
+        n1 = unpack_normal(nrm1, -1650, 'L1')
+        n2 = unpack_normal(nrm2, -2600, 'L2')
+        # Reoriented normal mapping: r = normalize(t*dot(t,u) - u*t.z),
+        # with t = n1 + (0,0,1) and u = n2 * (-1,-1,1). The shader first
+        # rotates n2 from UV2's tangent frame into UV1's using screen-space
+        # derivatives; no node-graph equivalent exists, so the frames are
+        # assumed aligned here.
+        t = vmath('ADD', (_TL_D, -1800), 'RNM t = n1 + Z', n1, (0.0, 0.0, 1.0))
+        u = vmath('MULTIPLY', (_TL_D, -1970), 'RNM u = n2 * (-1,-1,1)', n2,
+                  (-1.0, -1.0, 1.0))
+        dot_tu = vmath('DOT_PRODUCT', (_TL_D, -2140), 'RNM dot(t,u)', t, u)
+        t_sep = nt.nodes.new('ShaderNodeSeparateXYZ')
+        t_sep.location = (_TL_D, -2310)
+        links.new(t, t_sep.inputs['Vector'])
+        n_out = vmath('NORMALIZE', (_TL_D, -2650), 'RNM normalize',
+                      vmath('SUBTRACT', (_TL_D, -2480), 'RNM t*dot - u*t.z',
+                            vmath('SCALE', (_TL_C, -2820), 't * dot', t,
+                                  scale=dot_tu),
+                            vmath('SCALE', (_TL_C, -2990), 'u * t.z', u,
+                                  scale=t_sep.outputs['Z'])))
+    elif nrm1 is not None:
+        n_out = unpack_normal(nrm1, -1650, 'L1')
+    elif nrm2 is not None:
+        n_out = unpack_normal(nrm2, -2100, 'L2')
+
+    if n_out is not None:
+        # Back to [0,1] with Y negated, which converts UE's DirectX-convention
+        # green channel to the OpenGL convention a default Normal Map node
+        # expects. Doing it here keeps this builder free of the version-gated
+        # DIRECTX/curves branch the other builders need.
+        packed = vmath('MULTIPLY_ADD', (_TL_BSDF - 120, -2000), 'Pack to [0,1]',
+                       n_out, (0.5, -0.5, 0.5), (0.5, 0.5, 0.5))
+        nm = nt.nodes.new('ShaderNodeNormalMap')
+        nm.location = (_TL_BSDF - 120, -1800)
+        links.new(packed, nm.inputs['Color'])
+        links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+
+
 # ============================================================
 #  Dispatcher
 # ============================================================
@@ -983,16 +1383,35 @@ def setup_material_nodes(mat, hashes: list, tex_root: str, tex_ext: str,
                           tex_index=None) -> None:
     """Choose and run the correct node-setup function for *hashes*.
 
-    >= 11 -> _setup_nodes_extended   (UV1 base + UV2 detail)
-    == 10 -> _setup_nodes_10slot     (UV1 base fields + LayeredColor + UV2 detail)
-    ==  9 -> _setup_nodes_9slot      (slots 0-5 standard + override/detail on 6,8,9)
-    <=  8 -> _setup_nodes_standard   (classic layout, slots 0-6)
+    *hashes* is index-aligned with FMassiveEnvironmentMaterialInfo's texture
+    slots, so its length is the mesh type's valid-slot count. Measured over
+    43,315 mesh types across both game builds, that count is only ever:
+
+        7  -> single layer            (_setup_nodes_standard)
+        14 -> base layer + world-tiling detail layer (_setup_nodes_extended)
+
+    The intermediate counts the older branches keyed on (9/10/11/12) were an
+    artefact of de-duplicating the slot list, which also shifted slots onto the
+    wrong sockets - 36 of 437 two-layer mesh types were being routed to the
+    wrong tree. Those branches are kept below purely as a fallback, in case a
+    layout exists outside the sampled corpus.
     """
-    if len(hashes) >= 11:
+    n = len(hashes)
+    if n == 14:
+        _setup_nodes_two_layer(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
+    elif n <= 7:
+        _setup_nodes_standard(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
+    # --- fallbacks for unobserved slot counts ---
+    elif n >= 11:
         _setup_nodes_extended(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
-    elif len(hashes) == 10:
+    elif n == 10:
         _setup_nodes_10slot(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
-    elif len(hashes) == 9:
+    elif n == 9:
         _setup_nodes_9slot(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
     else:
         _setup_nodes_standard(mat, hashes, tex_root, tex_ext, tex_index=tex_index)
+
+    # Done centrally rather than per-builder so every layout gets it, including
+    # the legacy fallbacks.
+    nt = mat.node_tree
+    _set_active_texture(nt, _base_color_texture(nt))

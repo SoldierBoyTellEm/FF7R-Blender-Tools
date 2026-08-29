@@ -5,7 +5,7 @@ import math
 import re
 import importlib
 from contextlib import contextmanager as _contextmanager
-from mathutils import Vector, Euler, Matrix
+from mathutils import Vector, Euler, Matrix, Quaternion
 
 from . import asset_linking, lights, particles, worlds
 
@@ -13,6 +13,8 @@ from . import asset_linking, lights, particles, worlds
 ASSET_LIBRARY_SELECTION = asset_linking.ASSET_LIBRARY_ALL
 VERBOSE_OVERRIDE_LOGGING = False
 TextureIndexCache = dict[tuple[str, str], dict[str, str]]
+_SETPOS_MARKER = "_setpos_"
+_SETPOS_ASSET_PREFIX_LENGTH = 10
 
 # Blender spot lights emit along local -Z, while UE components use +X forward.
 _LIGHT_FWD_FIX = (
@@ -383,6 +385,28 @@ def scale_from_entry(props: dict, entry: dict | None = None) -> Vector:
     return scale_from_relative(props.get("RelativeScale3D", entry_scale))
 
 
+def rotation_from_quaternion(rot_dict: dict) -> Euler:
+    if not isinstance(rot_dict, dict):
+        rot_dict = {}
+    quat = Quaternion((
+        _float_or_default(rot_dict.get("W", 1.0), 1.0),
+        _float_or_default(rot_dict.get("X", 0.0)),
+        -_float_or_default(rot_dict.get("Y", 0.0)),
+        -_float_or_default(rot_dict.get("Z", 0.0)),
+    ))
+    quat.normalize()
+    return quat.to_euler("XYZ")
+
+
+def transform_location_rotation_scale(transform: dict, scale_factor: float = 0.01) -> tuple[Vector, Euler, Vector]:
+    if not isinstance(transform, dict):
+        transform = {}
+    loc = location_from_relative(transform.get("Translation", {}), scale_factor=scale_factor)
+    rot = rotation_from_quaternion(transform.get("Rotation", {}))
+    scale = scale_from_relative(transform.get("Scale3D", {}))
+    return loc, rot, scale
+
+
 def _multiply_vectors(lhs, rhs) -> Vector:
     return Vector((
         _float_or_default(lhs[0], 1.0) * _float_or_default(rhs[0], 1.0),
@@ -537,6 +561,97 @@ def _resolve_outer_name(entry: dict) -> str:
     return outer_raw.strip()
 
 
+def extract_setpos_lookup_name(name: str) -> str | None:
+    """Return the suffix after _setpos_ from a UE actor/component name."""
+    if not isinstance(name, str) or not name:
+        return None
+
+    marker_index = name.casefold().find(_SETPOS_MARKER)
+    if marker_index < 0:
+        return None
+
+    lookup_name = name[marker_index + len(_SETPOS_MARKER):].strip()
+    return lookup_name or None
+
+
+def extract_setpos_lookup_name_from_entry(entry: dict) -> str | None:
+    """Extract a setpos lookup token, preferring the owning actor name."""
+    outer_lookup_name = extract_setpos_lookup_name(_resolve_outer_name(entry))
+    if outer_lookup_name:
+        return outer_lookup_name
+
+    entry_name = entry.get("Name", "")
+    return extract_setpos_lookup_name(entry_name)
+
+
+def setpos_asset_name_matches_lookup(asset_name: str, lookup_name: str) -> bool:
+    """Match FA0726_00_TonberryRobotBase to tonberryRobotBase."""
+    if not isinstance(asset_name, str) or not isinstance(lookup_name, str):
+        return False
+    if len(asset_name) <= _SETPOS_ASSET_PREFIX_LENGTH:
+        return False
+    return asset_name[_SETPOS_ASSET_PREFIX_LENGTH:].casefold() == lookup_name.casefold()
+
+
+def resolve_setpos_asset_name(lookup_name: str) -> str | None:
+    """Find a linked asset-library ID whose first ten chars are a naming prefix."""
+    if not lookup_name or ASSET_LIBRARY_SELECTION == asset_linking.ASSET_LIBRARY_NONE:
+        return None
+
+    indexes = (
+        asset_linking.get_collection_asset_index(ASSET_LIBRARY_SELECTION),
+        asset_linking.get_object_asset_index(ASSET_LIBRARY_SELECTION),
+    )
+    for index in indexes:
+        for asset_name in sorted(index):
+            if setpos_asset_name_matches_lookup(asset_name, lookup_name):
+                return asset_name
+    return None
+
+
+def collect_setpos_asset_names_for_import(data: list) -> dict[str, str]:
+    """Map casefolded setpos lookup tokens to resolved asset names."""
+    lookup_names: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Type") == "SceneComponent":
+            lookup_name = extract_setpos_lookup_name_from_entry(entry)
+            if lookup_name:
+                lookup_names.add(lookup_name)
+        elif entry.get("Type") == "EndLayoutObjectPack":
+            for key, _value in iter_layout_object_pack_objects(entry):
+                lookup_name = extract_setpos_lookup_name(key)
+                if lookup_name:
+                    lookup_names.add(lookup_name)
+
+    resolved: dict[str, str] = {}
+    for lookup_name in sorted(lookup_names, key=str.casefold):
+        asset_name = resolve_setpos_asset_name(lookup_name)
+        if asset_name:
+            resolved[lookup_name.casefold()] = asset_name
+    return resolved
+
+
+def iter_layout_object_pack_objects(entry: dict):
+    props = entry.get("Properties", {})
+    if not isinstance(props, dict):
+        return
+
+    objects = props.get("Objects", [])
+    if not isinstance(objects, list):
+        return
+
+    for obj_entry in objects:
+        if not isinstance(obj_entry, dict):
+            continue
+        key = obj_entry.get("Key", "")
+        value = obj_entry.get("Value", {})
+        if not isinstance(key, str) or not key or not isinstance(value, dict):
+            continue
+        yield key, value
+
+
 def _object_reference_keys(ref: dict) -> set[str]:
     keys: set[str] = set()
     if not isinstance(ref, dict):
@@ -675,39 +790,6 @@ def _register_actor_object(
     actor_objects[actor_name] = obj
     for alias in _xengine_reference_aliases(actor_name):
         actor_objects.setdefault(alias, obj)
-
-
-def collect_imported_attach_parent_lookup_keys(data: list) -> set[str]:
-    """Return AttachParent keys whose parent transform should be preserved."""
-    parented_types = {
-        "EndEnvironmentStaticMeshComponent",
-        "StaticMeshComponent",
-        "EndStaticMeshPhysicsPartsComponent",
-        "EndSkeletalMeshComponent",
-        "PointLightComponent",
-        "SpotLightComponent",
-    }
-    keys: set[str] = set()
-
-    for entry in data:
-        if not isinstance(entry, dict) or entry.get("Type") not in parented_types:
-            continue
-        props = entry.get("Properties", {})
-        if not isinstance(props, dict):
-            continue
-        keys.update(_object_reference_lookup_keys(props.get("AttachParent", {})))
-
-    return {key for key in keys if key}
-
-
-def entry_is_referenced_attach_parent(
-    entry: dict,
-    attach_parent_lookup_keys: set[str],
-) -> bool:
-    """Return True if other imported entries attach to this component export."""
-    if not attach_parent_lookup_keys:
-        return False
-    return any(key in attach_parent_lookup_keys for key in _entry_component_reference_keys(entry))
 
 
 def intact_physics_asset_name_from_part_name(part_name: str) -> str | None:
@@ -1108,7 +1190,7 @@ def resolve_massive_environment_umap_path(entry: dict, game_root: str) -> str | 
 
 def get_umap_import_function():
     try:
-        importer_module = importlib.import_module(f"{__package__}.mec.importer")
+        importer_module = importlib.import_module(f"{__package__.rsplit('.', 1)[0]}.mec.importer")
     except Exception as exc:
         print(f"[End JSON Import]   Bundled FF7R .umap importer is not available: {exc}")
         return None
@@ -1118,7 +1200,7 @@ def get_umap_import_function():
 def is_umap_addon_available() -> bool:
     """Return True when the bundled Massive Environment .umap importer can be called."""
     try:
-        importer_module = importlib.import_module(f"{__package__}.mec.importer")
+        importer_module = importlib.import_module(f"{__package__.rsplit('.', 1)[0]}.mec.importer")
     except Exception:
         return False
     return callable(getattr(importer_module, "import_umap_paths", None))
@@ -1159,7 +1241,7 @@ def import_massive_environment_umap(
     print(f"[End JSON Import]   Importing MassiveEnvironment .umap: {umap_path}")
     imported_umap_paths.add(umap_path)
     try:
-        processed, skipped = import_umap_paths(
+        processed, skipped, _unresolved_count = import_umap_paths(
             bpy.context,
             [umap_path],
             lod_mode="LEVEL",
@@ -1554,6 +1636,107 @@ def collect_asset_names_for_import(data: list) -> tuple[set[str], set[str]]:
     return static_asset_names, skeletal_asset_names
 
 
+def create_setpos_object_from_entry(
+    entry: dict,
+    lookup_name: str,
+    asset_name: str | None,
+    asset: asset_linking.LinkedAsset | None,
+    parent_collection: bpy.types.Collection,
+    location_scale: float,
+) -> bpy.types.Object:
+    props = entry.get("Properties", {})
+    if not isinstance(props, dict):
+        props = {}
+
+    loc_dict = props.get("RelativeLocation", entry.get("RelativeLocation", {}))
+    rot_dict = props.get("RelativeRotation", entry.get("RelativeRotation", {}))
+    loc = location_from_relative(loc_dict, scale_factor=location_scale)
+    rot = rotation_from_relative(rot_dict)
+    rel_scale = scale_from_entry(props, entry)
+
+    instance_name = _resolve_outer_name(entry)
+    if not instance_name:
+        component_name = entry.get("Name", "SceneComponent")
+        instance_name = component_name if isinstance(component_name, str) and component_name else "SceneComponent"
+
+    if asset is not None:
+        obj = create_static_asset_instance_from_resolved_asset(
+            asset=asset,
+            name=instance_name,
+            loc=loc,
+            rot=rot,
+            static_collection=parent_collection,
+            rel_scale=rel_scale,
+        )
+        obj["setpos_asset_name"] = asset_name or ""
+        print(
+            f"[End JSON Import]   SetPos asset '{instance_name}' "
+            f"(lookup: '{lookup_name}', asset: '{asset_name}', kind: {asset.kind}) | "
+            f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
+        )
+    else:
+        obj = create_mesh_empty(instance_name, loc, rot, parent_collection, scale=rel_scale)
+        obj["component_empty_reason"] = "missing_setpos_asset"
+        print(
+            f"[End JSON Import]   SetPos empty '{instance_name}' "
+            f"(lookup: '{lookup_name}', no matching asset after 10-char prefix trim) | "
+            f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
+        )
+
+    obj["source_name"] = instance_name
+    obj["source_type"] = entry.get("Type", "")
+    obj["setpos_lookup_name"] = lookup_name
+    return obj
+
+
+def create_layout_object_pack_object(
+    key: str,
+    value: dict,
+    asset_name: str | None,
+    asset: asset_linking.LinkedAsset | None,
+    parent_collection: bpy.types.Collection,
+    location_scale: float,
+) -> bpy.types.Object:
+    transform = value.get("Transform", {}) if isinstance(value, dict) else {}
+    loc, rot, rel_scale = transform_location_rotation_scale(transform, scale_factor=location_scale)
+
+    lookup_name = extract_setpos_lookup_name(key)
+    if lookup_name and asset is not None:
+        obj = create_static_asset_instance_from_resolved_asset(
+            asset=asset,
+            name=key,
+            loc=loc,
+            rot=rot,
+            static_collection=parent_collection,
+            rel_scale=rel_scale,
+        )
+        obj["setpos_asset_name"] = asset_name or ""
+        print(
+            f"[End JSON Import]   LayoutObjectPack asset '{key}' "
+            f"(lookup: '{lookup_name}', asset: '{asset_name}', kind: {asset.kind}) | "
+            f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
+        )
+    else:
+        obj = create_mesh_empty(key, loc, rot, parent_collection, scale=rel_scale)
+        if lookup_name:
+            obj["component_empty_reason"] = "missing_setpos_asset"
+        print(
+            f"[End JSON Import]   LayoutObjectPack empty '{key}' | "
+            f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
+        )
+
+    obj["source_name"] = key
+    obj["source_type"] = "EndLayoutObjectPack"
+    if isinstance(value, dict):
+        if "TypeHash" in value:
+            obj["layout_object_type_hash"] = value["TypeHash"]
+        if "IndexToAppendParam" in value:
+            obj["layout_object_index_to_append_param"] = value["IndexToAppendParam"]
+    if lookup_name:
+        obj["setpos_lookup_name"] = lookup_name
+    return obj
+
+
 def import_json_file(
     filepath: str,
     exposure_mult: float,
@@ -1605,12 +1788,12 @@ def import_json_file(
 
     print(f"[End JSON Import] JSON parsed - {len(data)} top-level entries.")
 
-    attach_parent_lookup_keys = collect_imported_attach_parent_lookup_keys(data)
     physics_root_fallback_asset_names = collect_physics_root_fallback_asset_names(data)
 
     static_asset_names, skeletal_asset_names = collect_asset_names_for_import(data)
+    setpos_asset_names = collect_setpos_asset_names_for_import(data)
     asset_linking.preload_assets(
-        static_asset_names | skeletal_asset_names,
+        static_asset_names | skeletal_asset_names | set(setpos_asset_names.values()),
         ASSET_LIBRARY_SELECTION,
         include_objects=True,
     )
@@ -1621,6 +1804,10 @@ def import_json_file(
     skeletal_asset_cache = {
         asset_name: find_or_load_asset_cached(asset_name)
         for asset_name in skeletal_asset_names
+    }
+    setpos_asset_cache = {
+        asset_name: find_or_load_asset_cached(asset_name)
+        for asset_name in set(setpos_asset_names.values())
     }
 
     parent_collection = None
@@ -1639,6 +1826,12 @@ def import_json_file(
 
     def ensure_lights_collection() -> bpy.types.Collection:
         return ensure_typed_import_collection(ensure_root_collection(), "_Lights")
+
+    def ensure_setpos_collection() -> bpy.types.Collection:
+        return ensure_typed_import_collection(ensure_root_collection(), "_SetPos")
+
+    def ensure_layout_objects_collection() -> bpy.types.Collection:
+        return ensure_typed_import_collection(ensure_root_collection(), "_LayoutObjects")
 
     created_count = 0
     missing_assets: set[str] = set()
@@ -1941,6 +2134,69 @@ def import_json_file(
                     pending_parent_attaches.append((obj, props, instance_name))
 
             created_count += 1
+
+        elif t == "SceneComponent" and extract_setpos_lookup_name_from_entry(entry):
+            lookup_name = extract_setpos_lookup_name_from_entry(entry)
+            asset_name = setpos_asset_names.get(lookup_name.casefold()) if lookup_name else None
+            asset = setpos_asset_cache.get(asset_name) if asset_name else None
+            if lookup_name and asset is None:
+                missing_assets.add(lookup_name)
+            setpos_collection = ensure_setpos_collection()
+            obj = create_setpos_object_from_entry(
+                entry=entry,
+                lookup_name=lookup_name or "",
+                asset_name=asset_name,
+                asset=asset,
+                parent_collection=setpos_collection,
+                location_scale=location_scale,
+            )
+
+            register_component_object(component_objects, entry, obj)
+            _register_actor_object(actor_objects, _resolve_outer_name(entry) or obj.name, obj)
+
+            props = entry.get("Properties", {})
+            if not isinstance(props, dict):
+                props = {}
+            if props.get("AttachParent"):
+                parent_obj = resolve_attach_parent_object(
+                    props,
+                    component_objects,
+                    obj.name,
+                    report_missing=False,
+                )
+                if parent_obj is not None:
+                    apply_deferred_object_parent(
+                        obj,
+                        props,
+                        parent_obj,
+                        location_scale,
+                    )
+                else:
+                    pending_parent_attaches.append((obj, props, obj.name))
+
+            created_count += 1
+
+        elif t == "EndLayoutObjectPack":
+            layout_collection = ensure_layout_objects_collection()
+            pack_created_count = 0
+            for key, value in iter_layout_object_pack_objects(entry):
+                lookup_name = extract_setpos_lookup_name(key)
+                asset_name = setpos_asset_names.get(lookup_name.casefold()) if lookup_name else None
+                asset = setpos_asset_cache.get(asset_name) if asset_name else None
+                if lookup_name and asset is None:
+                    missing_assets.add(lookup_name)
+                obj = create_layout_object_pack_object(
+                    key=key,
+                    value=value,
+                    asset_name=asset_name,
+                    asset=asset,
+                    parent_collection=layout_collection,
+                    location_scale=location_scale,
+                )
+                _register_actor_object(actor_objects, key, obj)
+                pack_created_count += 1
+
+            created_count += pack_created_count
 
         elif t == "PointLightComponent":
             lights_collection = ensure_lights_collection()
