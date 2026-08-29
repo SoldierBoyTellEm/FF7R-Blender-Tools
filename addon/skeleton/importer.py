@@ -238,8 +238,28 @@ def build_armature_from_bones(
 
     if sockets:
         armature_obj["ff7r_sockets"] = json.dumps(sockets, ensure_ascii=False)
+        _tag_socket_bones(armature_obj, sockets)
 
     return armature_obj
+
+
+def _tag_socket_bones(armature_obj: bpy.types.Object, sockets: list[dict[str, Any]]) -> None:
+    """Tag each socket's owning pose bone with a SocketName custom property.
+
+    ``ff7r_json/map_import.py``'s ``find_bone_by_socket_name`` already looks for
+    this property when resolving a UMAP actor's AttachSocketName against a
+    skeletal actor -- it predates this importer and had nothing populating it
+    until now, so package-sourced skeletons never resolved a socket attach.
+    """
+    pose_bones = armature_obj.pose.bones
+    for socket in sockets:
+        bone_name = socket.get("boneName")
+        socket_name = socket.get("name")
+        if not bone_name or not socket_name:
+            continue
+        pose_bone = pose_bones.get(bone_name)
+        if pose_bone is not None:
+            pose_bone["SocketName"] = socket_name
 
 
 def _build_edit_bones(
