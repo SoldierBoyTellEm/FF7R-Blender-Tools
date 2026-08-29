@@ -1,4 +1,4 @@
-# FF7R Rebirth Tools
+# Final Fantasy VII Retrilogy Tools (Mostly Rebirth, presently)
 
 A Blender add-on for importing FINAL FANTASY VII REMAKE series content — maps,
 static meshes, skeletons, and the game's KineDriver (KDI) procedural rigging
