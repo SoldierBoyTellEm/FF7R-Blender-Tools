@@ -7,6 +7,9 @@ bin/
 obj/
 *.user
 
+# Built add-on zips (release artifacts, rebuilt from addon/ on demand)
+dist/
+
 # Editor/OS cruft
 .vs/
 .vscode/

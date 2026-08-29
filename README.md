@@ -22,8 +22,8 @@ is read live from a copy of the game you already own; see
 
 ## Installing the add-on
 
-1. Zip the `addon/` folder's *contents* (not the folder itself) into
-   `ff7r_rebirth_tools.zip`, or point Blender at the `addon/` folder directly.
+1. Grab `ff7r_rebirth_tools-<version>.zip` from the releases page, or build one
+   yourself with `python build_addon_zip.py` (writes into `dist/`).
 2. In Blender: **Edit > Preferences > Add-ons > Install from Disk**, select
    the zip, then enable **FF7R Rebirth Tools**.
 3. For reading data directly from game install to function, in the add-on preferences fill in your own paths for the following — none are prefilled:
