@@ -31,8 +31,7 @@ This project does **not** bundle Oodle's proprietary decompression library.
 `addon/bridge/OodleSharp.dll` / `addon/bridge/Oodle.NET.dll` are open-source
 P/Invoke wrapper libraries only — at runtime you must point the add-on's
 "Oodle DLL" preference at a real `oo2core_*.dll` you already legitimately have
-(e.g. one shipped inside your own installed copy of an Unreal Engine 4.26
-title, such as FINAL FANTASY VII REMAKE INTERGRADE or REBIRTH itself). No such
+(e.g. one shipped inside your own installed copy of FINAL FANTASY VII REMAKE INTERGRADE). No such
 file is included here.
 
 ## Game assets
