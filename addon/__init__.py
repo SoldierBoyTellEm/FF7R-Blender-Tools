@@ -19,6 +19,7 @@ from bpy.types import AddonPreferences, Menu, Operator
 from . import game_packages, render_settings, z_fighting
 from .kdi import audit as kdi_audit
 from .kdi import drivers as kdi_drivers
+from .kdi import nodetree as kdi_nodetree
 from .ff7r_json import asset_linking, cutscene_import, lights, map_import, particles, timeline_actions, worlds
 from .mec import importer as mec_importer
 from .mec import material as mec_material
@@ -35,6 +36,7 @@ for _module in (
     cutscene_import,
     kdi_audit,
     kdi_drivers,
+    kdi_nodetree,
     z_fighting,
     mec_material,
     mec_parser,
@@ -592,6 +594,7 @@ class OBJECT_MT_ff7r_rebirth_tools(Menu):
         layout = self.layout
         layout.operator(MESH_OT_find_opposite_faces.bl_idname)
         layout.separator()
+        layout.operator(kdi_nodetree.FF7R_KDI_OT_visualize.bl_idname)
         layout.operator(kdi_drivers.KDI_OT_remove_scalar_drivers.bl_idname)
 
 
@@ -678,6 +681,7 @@ classes = tuple(cls for cls in (
     FF7R_REBIRTH_OT_import_mec_umap,
     FF7R_OT_import_skeleton_json,
     *game_packages.CLASSES,
+    *kdi_nodetree.CLASSES,
     TOPBAR_MT_file_import_ff7r_rebirth,
     FF7R_REBIRTH_FH_import_cutscene_json,
     FF7R_REBIRTH_FH_import_umap_json,
