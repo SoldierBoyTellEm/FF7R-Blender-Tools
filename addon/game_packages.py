@@ -175,7 +175,8 @@ def _package_config_key(game_root: str, oodle_dll: str, usmap_path: str) -> tupl
 # only changes when the game itself is patched, so it is cached on disk and keyed
 # by a fingerprint of the pak files -- making every later cold start a file read
 # rather than a mount. Bump the version to invalidate every cached index.
-_INDEX_CACHE_VERSION = 1
+# v2: the KDI index widened to include secondary *_KDI_<suffix> assets.
+_INDEX_CACHE_VERSION = 2
 
 
 def _pak_signature(game_root: str) -> str | None:
@@ -318,7 +319,7 @@ def refresh_kdi_index(game_root: str, oodle_dll: str, usmap_path: str, *, force=
     if force or cache_key != _KDI_CACHE_KEY:
         _VIRTUAL_KDIS = _build_index(
             "kdi", game_root, oodle_dll, usmap_path, "_KDI",
-            lambda path: os.path.basename(path).lower().endswith("_kdi.uasset"),
+            lambda path: _KDI_ASSET_PATTERN.search(os.path.basename(path)) is not None,
             force,
         )
         _KDI_CACHE_KEY = cache_key
@@ -1551,6 +1552,76 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# A character's KineDriver rig can span several assets: the main pre-physics
+# ``<stem>_KDI.uasset`` plus optional secondary passes named ``<stem>_KDI_<suffix>``
+# -- Extra1, Head, Hood, StBody, StHair, Extra_Hand are the suffixes Rebirth ships.
+# Per a third-party UE4SS capture of the KBD asset user data, the ``_Extra1`` pass is
+# the game's *post-physics* KineDriver list (it runs after Bonamik, which this add-on
+# does not simulate), so treat these as a best-effort extra layer rather than an
+# exact reproduction of the in-game result.
+# The suffix may itself contain underscores (Rebirth ships _KDI_Extra_Hand).
+_KDI_ASSET_PATTERN = re.compile(r"_KDI(_[A-Za-z0-9_]+)?\.uasset$", re.IGNORECASE)
+
+
+def _import_secondary_kdi_passes(
+        session,
+        secondary_paths: list[str],
+        temp_dir: str,
+        *,
+        swap_bend_st: bool,
+) -> str:
+    """Stack a character's secondary KDI passes onto the main layer.
+
+    Each is imported additively, so a pass that re-drives a channel the main
+    layer already owns has that channel skipped rather than clobbering it. A
+    failure here only shortens the report -- it must never fail the import,
+    since the skeleton and the main KDI layer are already in place.
+    """
+    imported, skipped = [], []
+    for secondary_path in secondary_paths:
+        label = os.path.basename(secondary_path)
+        try:
+            asset = session.kdi_asset(secondary_path)
+            if not (asset and asset.get("Properties")):
+                skipped.append(label)
+                continue
+            path = os.path.join(temp_dir, label + ".json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump([asset], stream, ensure_ascii=False, indent=2)
+            result = bpy.ops.import_scene.ff7r_kinedriver_json(
+                filepath=path,
+                replace_previous_generated=False,
+                additive=True,
+                translation_axis_order="YZX",
+                scale_axis_order="YZX",
+                coordinate_profile=COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
+                swap_bend_st=swap_bend_st,
+            )
+            (imported if result == {'FINISHED'} else skipped).append(label)
+        except Exception as exc:
+            print(f"  Warning: secondary KDI '{secondary_path}' was not imported: {exc}")
+            skipped.append(label)
+    note = ""
+    if imported:
+        note += f"; stacked {len(imported)} secondary KDI pass(es): {', '.join(imported)}"
+    if skipped:
+        note += f"; {len(skipped)} secondary pass(es) skipped: {', '.join(skipped)}"
+    return note
+
+
+def _secondary_kdi_paths_for_skeleton(virtual_path: str, available: list[str]) -> list[str]:
+    """Sibling ``<stem>_KDI_<suffix>.uasset`` passes for a Skeleton, if any."""
+    main = _kdi_path_for_skeleton(virtual_path)
+    if main is None:
+        return []
+    prefix = main[: -len(".uasset")] + "_"
+    lowered = prefix.casefold()
+    return sorted(
+        path for path in available
+        if path.casefold().startswith(lowered) and path.casefold().endswith(".uasset")
+    )
+
+
 def _kdi_path_for_skeleton(virtual_path: str) -> str | None:
     """Derive the associated KDI asset's virtual path from a Skeleton's, if any.
 
@@ -1687,6 +1758,16 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         ),
         default=False,
     )
+    import_secondary_kdi: bpy.props.BoolProperty(
+        name="Also import secondary KDI passes",
+        description=(
+            "Stack any sibling _KDI_Extra1/_Head/_Hood/_StBody/_StHair passes onto the "
+            "main KDI layer. In-game _Extra1 runs after Bonamik physics, which this "
+            "add-on does not simulate, so it is an approximation; channels the main "
+            "layer already drives are left alone"
+        ),
+        default=True,
+    )
     swap_bend_st: bpy.props.BoolProperty(
         name="Swap BendS/BendT interpretation",
         description=SWAP_BEND_ST_DESCRIPTION,
@@ -1756,6 +1837,9 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         layout.prop(self, "connect_bones")
         layout.prop(self, "create_socket_empties")
         layout.prop(self, "import_kdi")
+        secondary = layout.row()
+        secondary.enabled = self.import_kdi
+        secondary.prop(self, "import_secondary_kdi")
         kdi_debug = layout.row()
         kdi_debug.enabled = self.import_kdi
         kdi_debug.prop(self, "swap_bend_st")
@@ -1776,6 +1860,7 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
             return {'CANCELLED'}
 
         kdi_virtual_path = _kdi_path_for_skeleton(virtual_path) if self.import_kdi else None
+        secondary_kdi_paths: list[str] = []
         if kdi_virtual_path is not None:
             try:
                 if not _VIRTUAL_KDIS:
@@ -1784,10 +1869,15 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                         bpy.path.abspath(prefs.rebirth_oodle_dll),
                         bpy.path.abspath(prefs.rebirth_usmap_path),
                     )
+                if self.import_secondary_kdi:
+                    secondary_kdi_paths = _secondary_kdi_paths_for_skeleton(
+                        virtual_path, _VIRTUAL_KDIS
+                    )
                 if kdi_virtual_path not in _VIRTUAL_KDIS:
                     kdi_virtual_path = None  # no matching KDI asset for this character
             except Exception:
                 kdi_virtual_path = None  # non-fatal: proceed with the skeleton alone
+                secondary_kdi_paths = []
 
         try:
             with tempfile.TemporaryDirectory(prefix="ff7r_skeleton_") as temp_dir:
@@ -1889,6 +1979,13 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                             if kdi_result == {'FINISHED'}
                             else "; the associated KDI could not be imported"
                         )
+                        if kdi_result == {'FINISHED'} and secondary_kdi_paths:
+                            kdi_note += _import_secondary_kdi_passes(
+                                session,
+                                secondary_kdi_paths,
+                                temp_dir,
+                                swap_bend_st=self.swap_bend_st,
+                            )
                     except RuntimeError as exc:
                         kdi_note = f"; the associated KDI could not be imported: {exc}"
         except Exception as exc:

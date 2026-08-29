@@ -1338,6 +1338,7 @@ def build_scalar_drivers(
     scale_axis_order: str = "XZY",
     coordinate_profile: str = COORDINATE_PROFILE_REFERENCE,
     swap_bend_st: bool = False,
+    additive: bool = False,
 ) -> dict[str, Any]:
     for axis_order in (translation_axis_order, scale_axis_order):
         if sorted(axis_order) != ["X", "Y", "Z"]:
@@ -1351,6 +1352,17 @@ def build_scalar_drivers(
         in {"TargetTranslate", "TargetScale"}
     ]
     occupied: set[int] = set()
+    previous_registry: dict[str, Any] = {}
+    previous_ownership: dict[str, Any] = {}
+    if additive:
+        if REGISTRY_PROPERTY in armature:
+            previous_registry = json.loads(armature[REGISTRY_PROPERTY])
+        if GENERATED_PROPERTY in armature:
+            previous_ownership = json.loads(armature[GENERATED_PROPERTY])
+        # Config ids are salted with the source file's hash so cross-layer
+        # collisions are already unlikely, but the RUNTIME map is keyed by id
+        # alone -- a collision would make one layer evaluate the other's config.
+        occupied.update(int(config["id"]) for config in previous_registry.get("configs", []))
     configs = [
         build_config(link, node_by_index, armature, config_identifier(audit, link, occupied))
         for link in scalar_links
@@ -1405,6 +1417,29 @@ def build_scalar_drivers(
         if config["direct_source"] is not None:
             config["direct_source"]["coordinate_profile"] = coordinate_profile
 
+    existing = {
+        (curve.data_path, curve.array_index)
+        for curve in (armature.animation_data.drivers if armature.animation_data else [])
+    }
+    skipped_conflicts = 0
+    if additive:
+        # A secondary KDI pass may re-drive channels the main pass already owns
+        # (real for the hair _Phy chains on PC0010). Blender allows only one
+        # driver per channel, and the pre-physics layer is the one we can
+        # evaluate faithfully, so the incumbent wins and the newcomer is dropped.
+        # Rotation and anchor configs are dropped whole: a quaternion driven on
+        # only some of its components would be worse than not driving it at all.
+        def _keep(channels: list[tuple[str, int]]) -> bool:
+            nonlocal skipped_conflicts
+            if any(channel in existing for channel in channels):
+                skipped_conflicts += 1
+                return False
+            return True
+
+        configs = [c for c in configs if _keep([target_path_and_index(c)])]
+        rotation_configs = [c for c in rotation_configs if _keep(rotation_channels(c))]
+        anchor_configs = [c for c in anchor_configs if _keep(anchor_channels(c))]
+
     desired_channels = [target_path_and_index(config) for config in configs]
     for config in anchor_configs:
         desired_channels.extend(anchor_channels(config))
@@ -1412,10 +1447,6 @@ def build_scalar_drivers(
         desired_channels.extend(rotation_channels(config))
     if len(desired_channels) != len(set(desired_channels)):
         raise ValueError("Generated scalar, rotation, and anchor layers request the same target channel")
-    existing = {
-        (curve.data_path, curve.array_index)
-        for curve in (armature.animation_data.drivers if armature.animation_data else [])
-    }
     collisions = [channel for channel in desired_channels if channel in existing]
     if collisions:
         raise ValueError(f"Existing drivers occupy {len(collisions)} requested KDI channels")
@@ -1508,20 +1539,37 @@ def build_scalar_drivers(
         # reopening the file would silently evaluate the drivers the other way.
         _stamp_swap_bend_st(all_configs)
 
+    def _merge(previous: list[Any], added: list[Any]) -> list[Any]:
+        """Union, order-preserving, for the ownership lists remove_generated walks."""
+        merged = list(previous)
+        seen = {json.dumps(item, sort_keys=True) for item in merged}
+        for item in added:
+            key = json.dumps(item, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+        return merged
+
     registry = {
         "schema_version": 1,
         "script_version": SCRIPT_VERSION,
         "source_sha256": graph["source"]["sha256"],
         "swap_bend_st": bool(swap_bend_st),
-        "configs": all_configs,
+        "configs": previous_registry.get("configs", []) + all_configs,
     }
     ownership = {
         "schema_version": 1,
         "script_version": SCRIPT_VERSION,
-        "drivers": generated,
-        "scale_compensated_children": compensated_children,
-        "hidden_helper_bones": hidden_helper_bones,
-        "hidden_bone_collections": hidden_info["collections"],
+        "drivers": previous_ownership.get("drivers", []) + generated,
+        "scale_compensated_children": _merge(
+            previous_ownership.get("scale_compensated_children", []), compensated_children
+        ),
+        "hidden_helper_bones": _merge(
+            previous_ownership.get("hidden_helper_bones", []), hidden_helper_bones
+        ),
+        "hidden_bone_collections": _merge(
+            previous_ownership.get("hidden_bone_collections", []), hidden_info["collections"]
+        ),
         "translation_axis_order": translation_axis_order,
         "scale_axis_order": scale_axis_order,
         "coordinate_profile": coordinate_profile,
@@ -1532,6 +1580,7 @@ def build_scalar_drivers(
     bpy.context.view_layer.update()
     return {
         "driver_count": len(generated),
+        "skipped_conflict_count": skipped_conflicts,
         "scalar_driver_count": len(configs),
         "rotation_driver_count": sum(len(rotation_channels(config)) for config in rotation_configs),
         "rotation_target_count": len(rotation_configs),
@@ -1586,6 +1635,16 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
         description=SWAP_BEND_ST_DESCRIPTION,
         default=False,
     )
+    additive: BoolProperty(
+        name="Add to the existing KDI layer",
+        description=(
+            "Keep any KDI layer already on this armature and add this one beside it, "
+            "skipping channels the existing layer already drives. Used to stack a "
+            "character's secondary _KDI_Extra1/_Head/_Hood passes onto the main one"
+        ),
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
 
     def draw(self, _context: Any) -> None:
         layout = self.layout
@@ -1618,7 +1677,9 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
             if not audit.get("ready_for_driver_generation"):
                 blocker_count = len(audit.get("blockers", []))
                 raise ValueError(f"KDI audit found {blocker_count} blocker(s); see Blender Text {text_name}")
-            if GENERATED_PROPERTY in armature:
+            if GENERATED_PROPERTY in armature and not self.additive:
+                # Additive imports deliberately keep the existing layer; the
+                # merge in build_scalar_drivers is what stacks onto it.
                 if not self.replace_previous_generated:
                     raise ValueError("A generated KDI layer already exists")
                 remove_generated(armature)
@@ -1629,6 +1690,7 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
                 scale_axis_order=self.scale_axis_order,
                 coordinate_profile=self.coordinate_profile,
                 swap_bend_st=self.swap_bend_st,
+                additive=self.additive,
             )
             armature[SOURCE_PROPERTY] = str(source_path.resolve())
             success_message = (
@@ -1641,6 +1703,10 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
                 f"; translate {self.translation_axis_order}, scale {self.scale_axis_order}"
                 f"; frame {self.coordinate_profile}"
                 + ("; BendS/BendT SWAPPED" if self.swap_bend_st else "")
+                + (
+                    f"; skipped {result['skipped_conflict_count']} already-driven channel(s)"
+                    if result["skipped_conflict_count"] else ""
+                )
                 + f"; audit: {text_name}"
             )
             self.report({"INFO"}, success_message)
