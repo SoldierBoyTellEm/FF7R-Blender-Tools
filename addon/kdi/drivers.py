@@ -394,6 +394,13 @@ def apply_effector(config: dict[str, Any], value: float) -> float:
             result = bezier(float(body["PY1"]), float(body["PY1A"]), float(body["PY1B"]), float(body["PY2"]), t)
         else:
             result = float(body["PY2"]) + float(body["Grad1"]) * (value - x2)
+        if body.get("ByCoef"):
+            # The curve yields a dimensionless coefficient scaling the input
+            # rather than an absolute output value -- see the note on
+            # ByCoef above build_config. Multiply by the same (already
+            # input_coefficient-scaled) value the curve was evaluated at, so the
+            # wire's unit conversion cancels against output_coefficient.
+            result *= value
     else:
         raise ValueError(f"Unsupported scalar effector: {effector_type}")
     return result * float(config.get("output_coefficient", 1.0))
@@ -817,8 +824,19 @@ def build_config(link: dict[str, Any], node_by_index: dict[int, dict[str, Any]],
     target_body = target_node["body"]
     if effector_node["operator_type"] not in {"EffectorEZParamLink", "EffectorEZParamLinkLinear"}:
         raise ValueError(f"Unsupported scalar effector {effector_node['operator_type']}")
-    if effector_node["body"].get("ByCoef"):
-        raise ValueError(f"Unresolved ByCoef behavior on effector {effector_node['operator_index']}")
+    # ByCoef makes the effector's curve return a coefficient that scales its own
+    # input (output = input * curve(input)) instead of an absolute output value.
+    # Inferred from the corpus rather than from documentation, but the evidence
+    # is uniform across all 932 occurrences in 239 of 531 sampled KDI files:
+    # every one is same-channel (BendS->BendS or BendT->BendT), every one has
+    # input_coefficient * output_coefficient == 1.0 exactly (so the effector is
+    # operating on a unitless ratio), and every curve value lies within
+    # [-1.0, 0.6] -- fractions, never the absolute angles seen elsewhere (which
+    # reach 600). The rigs read correctly too: the usual shape is
+    # "L_UpperArm_a BendS -> L_Bust_Spo BendS at 0.3", i.e. secondary motion
+    # following its driver at a fraction of the angle. The flag never appears on
+    # EffectorEZParamLinkLinear (0 of 18,036 bodies), hence it is handled only in
+    # the Bezier branch of apply_effector.
     if target_node["operator_type"] == "TargetScale":
         if target_body.get("InputAsLogarithm") or target_body.get("ClampZero"):
             raise ValueError(f"Unsupported special scale mode on target node {target_node['operator_index']}")
