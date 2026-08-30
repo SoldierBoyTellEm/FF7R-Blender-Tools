@@ -432,7 +432,19 @@ def apply_effector(config: dict[str, Any], value: float) -> float:
 
 def target_value(config: dict[str, Any], value: float) -> float:
     if config["target_type"] == "TargetScale":
-        return value * float(config.get("target_axis_sign", 1.0))
+        scale = value * float(config.get("target_axis_sign", 1.0))
+        if config.get("clamp_zero"):
+            # A TargetScale drives the bone's scale channel directly (its
+            # ScaleX/Y/Z fields are the neutral 1.0), so a negative result would
+            # invert the bone rather than shrink it. Measured across the corpus,
+            # every one of the 1205 curves feeding a ClampZero target stays
+            # positive throughout its authored domain -- the clamp is inert in
+            # the intended operating range and only engages under the linear
+            # extrapolation past a curve's edge that 563 of them carry, which is
+            # exactly the degenerate case the flag names. Scale targets never
+            # take a negative target_axis_sign, so clamping after it is safe.
+            scale = max(scale, 0.0)
+        return scale
     if config["target_type"] == "TargetTranslate":
         sign = -1.0 if config["target_parameter"] == "TranslateY" else 1.0
         return sign * float(config.get("target_axis_sign", 1.0)) * value * 0.01
@@ -947,9 +959,12 @@ def build_config(link: dict[str, Any], node_by_index: dict[int, dict[str, Any]],
     # following its driver at a fraction of the angle. The flag never appears on
     # EffectorEZParamLinkLinear (0 of 18,036 bodies), hence it is handled only in
     # the Bezier branch of apply_effector.
-    if target_node["operator_type"] == "TargetScale":
-        if target_body.get("InputAsLogarithm") or target_body.get("ClampZero"):
-            raise ValueError(f"Unsupported special scale mode on target node {target_node['operator_index']}")
+    # InputAsLogarithm has no occurrence anywhere in the corpus, so its semantics
+    # are still unknown and it keeps failing loudly rather than being guessed at.
+    if target_node["operator_type"] == "TargetScale" and target_body.get("InputAsLogarithm"):
+        raise ValueError(
+            f"TargetScale {target_node['operator_index']} uses unsupported InputAsLogarithm"
+        )
     config = build_source_config(source_node, armature)
     config.update({
         "id": config_id,
@@ -962,6 +977,7 @@ def build_config(link: dict[str, Any], node_by_index: dict[int, dict[str, Any]],
         "target_bone": link["target_bone"],
         "target_parameter": link["target"]["parameter"],
         "target_operator_index": target_node["operator_index"],
+        "clamp_zero": bool(target_body.get("ClampZero")),
     })
     return config
 
