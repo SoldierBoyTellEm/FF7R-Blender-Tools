@@ -595,55 +595,121 @@ def quaternion_to_matrix3(q: list[float]) -> list[list[float]]:
     ]
 
 
+def config_source_bones(config: dict[str, Any]) -> list[str]:
+    """The source bones of a scalar config, newest key first.
+
+    Registries written before multi-source support only carry the singular
+    ``source_bone``/``source_weight``, so fall back to those: an existing .blend
+    keeps evaluating exactly as it did.
+    """
+    bones = config.get("source_bones")
+    if bones:
+        return list(bones)
+    return [config["source_bone"]]
+
+
+def config_source_weights(config: dict[str, Any]) -> list[float]:
+    weights = config.get("source_weights")
+    if weights:
+        return [float(weight) for weight in weights]
+    return [float(config.get("source_weight", 1.0))]
+
+
+def blend_weights(weights: list[float]) -> tuple[list[float], float]:
+    """Split authored weights into a normalized mix and an overall magnitude.
+
+    KineDriver's weights carry two meanings at once. Their *ratio* picks the
+    blend between sources, and their *total* scales how much of the resulting
+    rotation is applied -- a lone source at 0.25 yields a quarter of its
+    rotation. The corpus authors both styles: 134 multi-source nodes have
+    weights summing to 1.0 (true skin-style weights, e.g. [0.2, 0.8]) while 133
+    are all-ones summing to 2.0/3.0/4.0, which plainly means "average these
+    equally" rather than "apply it three times". Clamping the magnitude at 1.0
+    satisfies both, and since no single-source weight in the corpus exceeds 1.0
+    it reproduces the previous single-source behaviour exactly.
+    """
+    total = sum(weights)
+    if total <= 0.0:
+        count = len(weights) or 1
+        return [1.0 / count] * count, 0.0
+    return [weight / total for weight in weights], min(total, 1.0)
+
+
 def source_value_count(config: dict[str, Any]) -> int:
+    count = len(config_source_bones(config))
+    # Per source, plus the base-space bone's data once where the mode needs it.
     return {
-        "PARENT_ROTATION": 4,
-        "NODE_ROTATION": 18,
-        "PARENT_TRANSLATION": 3,
-        "NODE_TRANSLATION": 15,
+        "PARENT_ROTATION": 4 * count,
+        "NODE_ROTATION": 9 * count + 9,
+        "PARENT_TRANSLATION": 3 * count,
+        "NODE_TRANSLATION": 3 * count + 12,
     }[config["source_mode"]]
 
 
 def source_rotation_delta(config: dict[str, Any], values: tuple[float, ...] | list[float]) -> list[float]:
+    """Blend every source bone's rotation delta into the node's single output.
+
+    A Source operator exposes one set of output ports, so it must resolve its
+    sources into one rotation before decomposing into BendS/BendT/Roll -- the
+    blend happens here, on the transforms, not afterwards on the decomposed
+    angles (which would not be equivalent, the decomposition being non-linear).
+    """
     mode = config["source_mode"]
-    source_weight = float(config.get("source_weight", 1.0))
+    count = len(config_source_bones(config))
+    mix, magnitude = blend_weights(config_source_weights(config))
+
     if mode == "PARENT_ROTATION":
-        return source_quaternion_in_reference_frame(
-            config,
-            weighted_quaternion(list(values[:4]), source_weight),
-        )
-    if mode == "NODE_ROTATION":
-        source_matrix = normalized_rows(values, 0)
-        base_matrix = normalized_rows(values, 9)
-        current_relative = multiply3(transpose3(base_matrix), source_matrix)
-        rest_relative = config["rest_relative_rotation"]
-        delta = multiply3(transpose3(rest_relative), current_relative)
-        return source_quaternion_in_reference_frame(
-            config,
-            weighted_quaternion(matrix3_to_quaternion(delta), source_weight),
-        )
-    raise ValueError(f"Source mode {mode} does not produce a quaternion")
+        deltas = [list(values[index * 4:index * 4 + 4]) for index in range(count)]
+    elif mode == "NODE_ROTATION":
+        base_matrix = normalized_rows(values, 9 * count)
+        rest_relatives = config.get("rest_relative_rotations") or [config["rest_relative_rotation"]]
+        deltas = []
+        for index in range(count):
+            source_matrix = normalized_rows(values, 9 * index)
+            current_relative = multiply3(transpose3(base_matrix), source_matrix)
+            rest_relative = rest_relatives[min(index, len(rest_relatives) - 1)]
+            deltas.append(matrix3_to_quaternion(multiply3(transpose3(rest_relative), current_relative)))
+    else:
+        raise ValueError(f"Source mode {mode} does not produce a quaternion")
+
+    blended = deltas[0] if count == 1 else weighted_quaternion_average(deltas, mix)
+    return source_quaternion_in_reference_frame(config, weighted_quaternion(blended, magnitude))
+
+
+def blended_source_vector(
+        config: dict[str, Any],
+        per_source: list[list[float]],
+) -> list[float]:
+    """Weighted average of each source's translation delta, scaled by magnitude."""
+    mix, magnitude = blend_weights(config_source_weights(config))
+    return [
+        magnitude * sum(mix[index] * per_source[index][axis] for index in range(len(per_source)))
+        for axis in range(3)
+    ]
 
 
 def scalar_source_value(config: dict[str, Any], values: tuple[float, ...] | list[float]) -> float:
     mode = config["source_mode"]
-    source_weight = float(config.get("source_weight", 1.0))
     if mode in {"PARENT_ROTATION", "NODE_ROTATION"}:
         return rotation_parameter(config, source_rotation_delta(config, values))
+    count = len(config_source_bones(config))
     if mode == "PARENT_TRANSLATION":
+        per_source = [list(values[index * 3:index * 3 + 3]) for index in range(count)]
         return translation_parameter(
             config,
-            source_vector_in_reference_frame(config, [value * source_weight for value in values[:3]]),
+            source_vector_in_reference_frame(config, blended_source_vector(config, per_source)),
         )
     if mode == "NODE_TRANSLATION":
-        source_position = list(values[:3])
-        base_position = list(values[3:6])
-        base_matrix = normalized_rows(values, 6)
-        delta = [source_position[index] - base_position[index] for index in range(3)]
-        relative = multiply3_vector(transpose3(base_matrix), delta)
+        base_position = list(values[3 * count:3 * count + 3])
+        base_matrix = normalized_rows(values, 3 * count + 3)
+        per_source = []
+        for index in range(count):
+            source_position = list(values[index * 3:index * 3 + 3])
+            delta = [source_position[axis] - base_position[axis] for axis in range(3)]
+            per_source.append(multiply3_vector(transpose3(base_matrix), delta))
         return translation_parameter(
             config,
-            source_vector_in_reference_frame(config, [value * source_weight for value in relative]),
+            source_vector_in_reference_frame(config, blended_source_vector(config, per_source)),
         )
     raise ValueError(f"Unsupported source mode: {mode}")
 
@@ -818,10 +884,15 @@ def matrix4_from_blender(matrix: Any) -> list[list[float]]:
 
 def build_source_config(source_node: dict[str, Any], armature: Any) -> dict[str, Any]:
     source_body = source_node["body"]
-    source_bones = source_body.get("SourceBoneNameArray") or []
-    weights = source_body.get("WeightArray") or []
-    if len(source_bones) != 1:
-        raise ValueError(f"Scalar stage does not yet support multi-source node {source_node['operator_index']}")
+    source_bones = list(source_body.get("SourceBoneNameArray") or [])
+    weights = [float(weight) for weight in (source_body.get("WeightArray") or [])]
+    if not source_bones:
+        raise ValueError(f"Source node {source_node['operator_index']} names no source bone")
+    if len(weights) != len(source_bones):
+        # Weights are optional in principle; an equal mix is the only sane
+        # reading when the arrays disagree, and it matches the all-ones
+        # authoring style that half the corpus's multi-source nodes use.
+        weights = [1.0] * len(source_bones)
     if source_body.get("MirrorParams", {}).get("EnableMirroring"):
         raise ValueError(f"Scalar stage does not yet support mirrored source node {source_node['operator_index']}")
     if source_body.get("ReverseOrder"):
@@ -833,8 +904,12 @@ def build_source_config(source_node: dict[str, Any], armature: Any) -> dict[str,
     config = {
         "source_mode": source_mode,
         "source_type": source_type,
+        "source_bones": source_bones,
+        "source_weights": weights,
+        # Retained so a registry written by this version stays readable by the
+        # single-source accessors, and vice versa.
         "source_bone": source_bones[0],
-        "source_weight": float(weights[0]) if weights else 1.0,
+        "source_weight": weights[0],
         "base_bone": base_info.get("BoneName"),
         "source_body": source_body,
         "source_operator_index": source_node["operator_index"],
@@ -842,9 +917,13 @@ def build_source_config(source_node: dict[str, Any], armature: Any) -> dict[str,
     if source_mode.startswith("NODE_") and not config["base_bone"]:
         raise ValueError(f"Source node {source_node['operator_index']} has NODE base space without a base bone")
     if source_mode == "NODE_ROTATION":
-        source_rest = armature.data.bones[source_bones[0]].matrix_local.to_3x3()
         base_rest = armature.data.bones[config["base_bone"]].matrix_local.to_3x3()
-        config["rest_relative_rotation"] = matrix3_from_matrix4(base_rest.inverted() @ source_rest)
+        rest_relatives = [
+            matrix3_from_matrix4(base_rest.inverted() @ armature.data.bones[bone].matrix_local.to_3x3())
+            for bone in source_bones
+        ]
+        config["rest_relative_rotations"] = rest_relatives
+        config["rest_relative_rotation"] = rest_relatives[0]
     return config
 
 
@@ -1050,61 +1129,84 @@ def target_path_and_index(config: dict[str, Any]) -> tuple[str, int]:
     return escaped_bone_path(config["target_bone"], prop), axis
 
 
+VARIABLE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def add_ordered_variables(driver: Any, armature: Any, data_paths: list[str]) -> list[str]:
+    """One driver variable per distinct property; names returned in call order.
+
+    The binding constraint on a generated driver is Blender's ~256 character
+    limit on the expression itself, so both halves of this matter:
+
+    - **Deduplicating.** A rotation target reads the same bones from several of
+      its scalar inputs -- most often the shared base-space bone's whole matrix.
+      Repeating a name in the argument list is free, so the values the evaluator
+      slices stay identical while the distinct-variable count collapses, which
+      in turn keeps every name inside the single-character alphabet.
+    - **Single-character names.** Multi-source reads cost 9 values per source,
+      and Tifa's heaviest rotation target takes 81 arguments; as ``v10,v11,...``
+      that alone would overrun the limit, where ``a,b,c,...`` fits.
+    """
+    assigned: dict[str, str] = {}
+    names: list[str] = []
+    for data_path in data_paths:
+        name = assigned.get(data_path)
+        if name is None:
+            index = len(assigned)
+            # Two-character fallbacks cannot collide with the one-character names.
+            name = (
+                VARIABLE_ALPHABET[index] if index < len(VARIABLE_ALPHABET)
+                else f"v{index - len(VARIABLE_ALPHABET)}"
+            )
+            assigned[data_path] = name
+            add_single_property_variable(driver, name, armature, data_path)
+        names.append(name)
+    return names
+
+
 def add_source_variables(driver: Any, config: dict[str, Any], armature: Any) -> list[str]:
-    source = config["source_bone"]
-    mode = config["source_mode"]
-    if mode == "PARENT_ROTATION":
-        names = []
-        for index, name in enumerate(("qw", "qx", "qy", "qz")):
-            add_single_property_variable(driver, name, armature, escaped_bone_path(source, f"rotation_quaternion[{index}]"))
-            names.append(name)
-        return names
-    if mode == "PARENT_TRANSLATION":
-        names = []
-        for index, name in enumerate(("lx", "ly", "lz")):
-            add_single_property_variable(driver, name, armature, escaped_bone_path(source, f"location[{index}]"))
-            names.append(name)
-        return names
-    if mode == "NODE_TRANSLATION":
-        source_names = []
-        for row, suffix in enumerate(("x", "y", "z")):
-            name = f"sp{suffix}"
-            add_single_property_variable(driver, name, armature, pose_matrix_component_path(source, row, 3))
-            source_names.append(name)
-        base_names = []
-        base = config["base_bone"]
-        for row, suffix in enumerate(("x", "y", "z")):
-            name = f"bp{suffix}"
-            add_single_property_variable(driver, name, armature, pose_matrix_component_path(base, row, 3))
-            base_names.append(name)
-        matrix_names = add_matrix_variables(driver, armature, base, "b", True)
-        return source_names + base_names + matrix_names
-    if mode == "NODE_ROTATION":
-        return (
-            add_matrix_variables(driver, armature, source, "s", True)
-            + add_matrix_variables(driver, armature, config["base_bone"], "b", True)
-        )
-    raise ValueError(f"Unsupported source mode {mode}")
+    """Create this config's driver variables, in ``source_data_paths`` order.
+
+    Generated straight from that function so the variable order cannot drift
+    from the order ``scalar_source_value`` slices ``values`` in -- which the
+    per-mode branches this replaced had to keep in sync by hand, and which
+    multi-source made considerably easier to get wrong.
+    """
+    return add_ordered_variables(driver, armature, source_data_paths(config))
 
 
 def source_data_paths(config: dict[str, Any]) -> list[str]:
-    source = config["source_bone"]
+    """Driver data paths for a scalar config, in the order the evaluator slices.
+
+    Layout is every source's own data first, then the shared base-space bone's,
+    matching ``source_value_count`` and the ``values`` indexing in
+    ``source_rotation_delta``/``scalar_source_value``.
+    """
+    sources = config_source_bones(config)
     mode = config["source_mode"]
     if mode == "PARENT_ROTATION":
-        return [escaped_bone_path(source, f"rotation_quaternion[{index}]") for index in range(4)]
+        return [
+            escaped_bone_path(source, f"rotation_quaternion[{index}]")
+            for source in sources
+            for index in range(4)
+        ]
     if mode == "PARENT_TRANSLATION":
-        return [escaped_bone_path(source, f"location[{index}]") for index in range(3)]
+        return [
+            escaped_bone_path(source, f"location[{index}]")
+            for source in sources
+            for index in range(3)
+        ]
     if mode == "NODE_ROTATION":
         return [
             pose_matrix_component_path(bone_name, row, column)
-            for bone_name in (source, config["base_bone"])
+            for bone_name in (*sources, config["base_bone"])
             for row in range(3)
             for column in range(3)
         ]
     if mode == "NODE_TRANSLATION":
         base = config["base_bone"]
         return (
-            [pose_matrix_component_path(source, row, 3) for row in range(3)]
+            [pose_matrix_component_path(source, row, 3) for source in sources for row in range(3)]
             + [pose_matrix_component_path(base, row, 3) for row in range(3)]
             + [pose_matrix_component_path(base, row, column) for row in range(3) for column in range(3)]
         )
@@ -1112,21 +1214,15 @@ def source_data_paths(config: dict[str, Any]) -> list[str]:
 
 
 def add_rotation_variables(driver: Any, config: dict[str, Any], armature: Any) -> list[str]:
-    names: list[str] = []
     source_configs = list(config["scalar_inputs"])
     if config.get("direct_source"):
         source_configs.append(config["direct_source"])
-    for source_config in source_configs:
-        for data_path in source_data_paths(source_config):
-            name = f"v{len(names)}"
-            add_single_property_variable(driver, name, armature, data_path)
-            names.append(name)
-    if len(names) > 64:
-        raise ValueError(
-            f"Rotation target {config['target_operator_index']} needs {len(names)} driver variables; "
-            "Blender supports at most 64"
-        )
-    return names
+    data_paths = [
+        data_path
+        for source_config in source_configs
+        for data_path in source_data_paths(source_config)
+    ]
+    return add_ordered_variables(driver, armature, data_paths)
 
 
 def add_anchor_matrix_component(
@@ -1172,10 +1268,6 @@ def add_anchor_variables(driver: Any, config: dict[str, Any], armature: Any) -> 
             for row in range(3):
                 for column in range(3):
                     add_anchor_matrix_component(driver, armature, config["parent_bone"], row, column, names)
-    if len(names) > 64:
-        raise ValueError(
-            f"Anchor {config['target_operator_index']} needs {len(names)} driver variables; Blender supports at most 64"
-        )
     return names
 
 
@@ -1463,6 +1555,11 @@ def build_scalar_drivers(
             driver.type = "SCRIPTED"
             arguments = add_source_variables(driver, config, armature)
             driver.expression = f"kdi_scalar({config['id']},{','.join(arguments)})"
+            if len(driver.expression) > 255:
+                raise ValueError(
+                    f"Scalar driver on bone {config['target_bone']} needs a "
+                    f"{len(driver.expression)}-character expression; Blender's limit is 255"
+                )
             generated.append({
                 "data_path": data_path,
                 "array_index": array_index,

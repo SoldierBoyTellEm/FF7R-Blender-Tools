@@ -1564,13 +1564,16 @@ _KDI_ASSET_PATTERN = re.compile(r"_KDI(_[A-Za-z0-9_]+)?\.uasset$", re.IGNORECASE
 
 
 def _import_secondary_kdi_passes(
-        session,
-        secondary_paths: list[str],
+        secondary_assets: list[tuple[str, dict]],
         temp_dir: str,
         *,
         swap_bend_st: bool,
 ) -> str:
     """Stack a character's secondary KDI passes onto the main layer.
+
+    Takes assets already fetched from the bridge rather than a live session:
+    drivers are built after the session block has closed, so anything read
+    lazily here would find the bridge gone.
 
     Each is imported additively, so a pass that re-drives a channel the main
     layer already owns has that channel skipped rather than clobbering it. A
@@ -1578,10 +1581,9 @@ def _import_secondary_kdi_passes(
     since the skeleton and the main KDI layer are already in place.
     """
     imported, skipped = [], []
-    for secondary_path in secondary_paths:
+    for secondary_path, asset in secondary_assets:
         label = os.path.basename(secondary_path)
         try:
-            asset = session.kdi_asset(secondary_path)
             if not (asset and asset.get("Properties")):
                 skipped.append(label)
                 continue
@@ -1889,12 +1891,23 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                 with session:
                     skeleton_asset = session.skeleton_asset(virtual_path)
                     kdi_asset = None
+                    secondary_kdi_assets: list[tuple[str, dict]] = []
                     variant_bone_usage = None
                     if kdi_virtual_path is not None:
                         try:
                             kdi_asset = session.kdi_asset(kdi_virtual_path)
                         except Exception as exc:
                             print(f"  Warning: associated KDI '{kdi_virtual_path}' could not be fetched: {exc}")
+                        # Fetch the secondary passes here too: the drivers are
+                        # built after this block, by which point the bridge
+                        # session has already been torn down.
+                        for secondary_path in secondary_kdi_paths:
+                            try:
+                                secondary_kdi_assets.append(
+                                    (secondary_path, session.kdi_asset(secondary_path))
+                                )
+                            except Exception as exc:
+                                print(f"  Warning: secondary KDI '{secondary_path}' could not be fetched: {exc}")
                     family_search_path = _character_family_search_path(virtual_path)
                     needs_variant_usage = (
                         (self.create_variant_bone_collections or self.import_mesh_referenced_bones_only)
@@ -1979,10 +1992,9 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                             if kdi_result == {'FINISHED'}
                             else "; the associated KDI could not be imported"
                         )
-                        if kdi_result == {'FINISHED'} and secondary_kdi_paths:
+                        if kdi_result == {'FINISHED'} and secondary_kdi_assets:
                             kdi_note += _import_secondary_kdi_passes(
-                                session,
-                                secondary_kdi_paths,
+                                secondary_kdi_assets,
                                 temp_dir,
                                 swap_bend_st=self.swap_bend_st,
                             )
