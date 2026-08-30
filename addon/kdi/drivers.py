@@ -1024,6 +1024,29 @@ def rotation_identifier(audit: dict[str, Any], node: dict[str, Any], occupied: s
     return identifier
 
 
+def resolve_quaternion_source(
+        body: dict[str, Any],
+        node_by_index: dict[int, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The SourceRotate feeding a rotation target's ``SourceQuat``, if any.
+
+    ``SourceQuat`` is only a real reference when it lands on a SourceRotate.
+    Across the corpus every one of the 730 values greater than zero does, but
+    ``0`` is the field's unset default rather than an index: of its 1,045
+    occurrences, 901 point at a Target operator (Oricns, Poscns, Scale,
+    BendSTRoll), which cannot supply a quaternion. Resolving by the referenced
+    operator's type covers both readings without having to guess which zeros
+    were meant literally.
+    """
+    index = body.get("SourceQuat", -1)
+    if not isinstance(index, int) or index < 0:
+        return None
+    source_node = node_by_index.get(index)
+    if not source_node or source_node.get("operator_type") != "SourceRotate":
+        return None
+    return source_node
+
+
 def build_rotation_config(
     node: dict[str, Any],
     incoming_links: list[dict[str, Any]],
@@ -1061,13 +1084,10 @@ def build_rotation_config(
         seen_parameters.add(parameter)
         scalar_inputs.append(build_config(link, node_by_index, armature, -1))
 
-    source_quat_index = int(body.get("SourceQuat", -1))
-    direct_source = None
-    if source_quat_index >= 0:
-        source_node = node_by_index.get(source_quat_index)
-        if not source_node or source_node["operator_type"] != "SourceRotate":
-            raise ValueError(f"Rotation target {node['operator_index']} has invalid SourceQuat {source_quat_index}")
-        direct_source = build_source_config(source_node, armature)
+    quaternion_source = resolve_quaternion_source(body, node_by_index)
+    direct_source = (
+        build_source_config(quaternion_source, armature) if quaternion_source else None
+    )
     if rotation_type == "TargetRotate" and direct_source is None:
         raise ValueError(f"TargetRotate {node['operator_index']} has no quaternion source")
     if rotation_type == "TargetBendSTRoll" and direct_source is not None:
@@ -1094,8 +1114,14 @@ def build_anchor_config(node: dict[str, Any], armature: Any, config_id: int) -> 
     target_name = body["TargetObjectBoneName"]
     source_names = list(body.get("SourceBoneNameArray") or [])
     weights = [float(value) for value in (body.get("WeightArray") or [])]
+    # Source-less constraints are filtered out before reaching here, so this is
+    # now only an integrity check on the paired arrays -- which no operator in
+    # the 530-file corpus violates.
     if not source_names or len(source_names) != len(weights):
-        raise ValueError(f"Invalid anchor sources/weights on operator {node['operator_index']}")
+        raise ValueError(
+            f"Constraint {node['operator_index']} on bone {target_name} has "
+            f"{len(source_names)} source bone(s) but {len(weights)} weight(s)"
+        )
     target_bone = armature.data.bones[target_name]
     target_rest = target_bone.matrix_local.copy()
     parent = target_bone.parent
@@ -1495,6 +1521,28 @@ def build_scalar_drivers(
         node for node in graph["nodes"]
         if node["operator_type"] in {"TargetPoscns", "TargetOricns"}
     ]
+    # A constraint that names no source bone has nothing to track, so it can
+    # only be inert -- skip it rather than failing the whole rig. Rare and
+    # plainly vestigial: 3 occurrences across the 530-file corpus, all
+    # TargetOricns on a bone named C_HipWOsKdi, each still carrying a
+    # non-identity OffsetRotate left over from authoring. Three samples on one
+    # bone is far too little to justify inventing a "hold this fixed
+    # orientation" reading, which would pose the bone on a guess.
+    sourceless_anchors = [
+        node for node in anchor_nodes
+        if not (node.get("body") or {}).get("SourceBoneNameArray")
+    ]
+    if sourceless_anchors:
+        anchor_nodes = [node for node in anchor_nodes if node not in sourceless_anchors]
+        print(
+            "[FF7R KDI] Skipped "
+            f"{len(sourceless_anchors)} constraint operator(s) with no source bone: "
+            + ", ".join(
+                f"{node['operator_type']} #{node['operator_index']} -> "
+                f"{(node.get('body') or {}).get('TargetObjectBoneName')}"
+                for node in sourceless_anchors
+            )
+        )
     anchor_configs = [
         build_anchor_config(node, armature, anchor_identifier(audit, node, occupied))
         for node in anchor_nodes
@@ -1505,6 +1553,26 @@ def build_scalar_drivers(
         node for node in graph["nodes"]
         if node["operator_type"] in {"TargetBendSTRoll", "TargetBendRoll", "TargetRotate"}
     ]
+    # A TargetRotate is driven purely by its quaternion source -- it accepts no
+    # scalar inputs -- so one whose SourceQuat resolves to nothing has no way to
+    # move and is inert. 125 such operators across 56 corpus files, all from the
+    # unset-zero case above. Skip them for the same reason as the source-less
+    # constraints: an operator that cannot do anything should not fail the rig.
+    undrivable_rotations = [
+        node for node in rotation_nodes
+        if node["operator_type"] == "TargetRotate"
+        and resolve_quaternion_source(node.get("body") or {}, node_by_index) is None
+    ]
+    if undrivable_rotations:
+        rotation_nodes = [node for node in rotation_nodes if node not in undrivable_rotations]
+        print(
+            "[FF7R KDI] Skipped "
+            f"{len(undrivable_rotations)} TargetRotate operator(s) with no quaternion source: "
+            + ", ".join(
+                f"#{node['operator_index']} -> {(node.get('body') or {}).get('TargetObjectBoneName')}"
+                for node in undrivable_rotations
+            )
+        )
     rotation_configs = [
         build_rotation_config(
             node,
@@ -1707,6 +1775,8 @@ def build_scalar_drivers(
             config["rotation_type"] == "TargetRotate" for config in rotation_configs
         ),
         "anchor_driver_count": sum(len(anchor_channels(config)) for config in anchor_configs),
+        "sourceless_anchor_count": len(sourceless_anchors),
+        "undrivable_rotation_count": len(undrivable_rotations),
         "position_anchor_count": sum(config["anchor_type"] == "POSITION" for config in anchor_configs),
         "orientation_anchor_count": sum(config["anchor_type"] == "ORIENTATION" for config in anchor_configs),
         "scale_compensated_child_count": len(compensated_children),
@@ -1816,6 +1886,14 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
                 f"; translate {self.translation_axis_order}, scale {self.scale_axis_order}"
                 f"; frame {self.coordinate_profile}"
                 + ("; BendS/BendT SWAPPED" if self.swap_bend_st else "")
+                + (
+                    f"; skipped {result['sourceless_anchor_count']} source-less constraint(s)"
+                    if result["sourceless_anchor_count"] else ""
+                )
+                + (
+                    f"; skipped {result['undrivable_rotation_count']} sourceless TargetRotate(s)"
+                    if result["undrivable_rotation_count"] else ""
+                )
                 + (
                     f"; skipped {result['skipped_conflict_count']} already-driven channel(s)"
                     if result["skipped_conflict_count"] else ""
