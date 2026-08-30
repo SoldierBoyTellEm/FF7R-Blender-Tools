@@ -430,6 +430,67 @@ def apply_effector(config: dict[str, Any], value: float) -> float:
     return result * float(config.get("output_coefficient", 1.0))
 
 
+# EffectorExpr carries a compiled Maya expression as RPN bytecode: `var N` pushes
+# input slot N, `push V` a literal, `op OP` pops and combines. CEDEC 2019 slides
+# 51-54 describe the compile pipeline but not the operator set; these ten are the
+# complete set actually used across the corpus's 913 expression bodies -- no
+# transcendentals appear at all. The arities were confirmed by simulation: every
+# one of those bodies leaves exactly one value on the stack, and no `var N` ever
+# exceeds its body's input count.
+EXPR_BINARY_OPS = {
+    "add": lambda a, b: a + b,
+    "sub": lambda a, b: a - b,
+    "mul": lambda a, b: a * b,
+    "div": lambda a, b: a / b if b else 0.0,
+    "max": max,
+    "min": min,
+    "lt": lambda a, b: 1.0 if a < b else 0.0,
+    "gte": lambda a, b: 1.0 if a >= b else 0.0,
+}
+
+
+def parse_expr_program(code: str) -> list[tuple[str, Any]]:
+    """Compile an EffectorExpr Code string into an instruction list."""
+    program: list[tuple[str, Any]] = []
+    for statement in (code or "").split(";"):
+        parts = statement.split()
+        if not parts:
+            continue
+        mnemonic = parts[0]
+        if mnemonic == "var":
+            program.append(("var", int(parts[1])))
+        elif mnemonic == "push":
+            program.append(("push", float(parts[1])))
+        elif mnemonic == "op":
+            operator = parts[1]
+            if operator not in EXPR_BINARY_OPS and operator not in ("abs", "iif"):
+                raise ValueError(f"Unsupported EffectorExpr operator {operator!r}")
+            program.append(("op", operator))
+        else:
+            raise ValueError(f"Unsupported EffectorExpr instruction {statement.strip()!r}")
+    return program
+
+
+def evaluate_expr_program(program: list[tuple[str, Any]], slots: list[float]) -> float:
+    stack: list[float] = []
+    for mnemonic, operand in program:
+        if mnemonic == "var":
+            stack.append(slots[operand] if operand < len(slots) else 0.0)
+        elif mnemonic == "push":
+            stack.append(operand)
+        elif operand == "abs":
+            stack.append(abs(stack.pop()))
+        elif operand == "iif":
+            # Pushed in the order condition, then-value, else-value.
+            alternative = stack.pop()
+            consequent = stack.pop()
+            stack.append(consequent if stack.pop() else alternative)
+        else:
+            right = stack.pop()
+            stack.append(EXPR_BINARY_OPS[operand](stack.pop(), right))
+    return stack[-1] if stack else 0.0
+
+
 def target_value(config: dict[str, Any], value: float) -> float:
     if config["target_type"] == "TargetScale":
         scale = value * float(config.get("target_axis_sign", 1.0))
@@ -648,6 +709,8 @@ def blend_weights(weights: list[float]) -> tuple[list[float], float]:
 
 
 def source_value_count(config: dict[str, Any]) -> int:
+    if "effector_graph" in config:
+        return sum(source_value_count(source) for source in effector_graph_sources(config))
     count = len(config_source_bones(config))
     # Per source, plus the base-space bone's data once where the mode needs it.
     return {
@@ -734,9 +797,17 @@ def kdi_rotation(config_id: int, component: int, *values: float) -> float:
         cursor = 0
         for scalar_config in config["scalar_inputs"]:
             count = source_value_count(scalar_config)
-            source_value = scalar_source_value(scalar_config, values[cursor:cursor + count])
+            slice_ = values[cursor:cursor + count]
             cursor += count
-            channels[scalar_config["target_parameter"]] = apply_effector(scalar_config, source_value)
+            if "effector_graph" in scalar_config:
+                channels[scalar_config["target_parameter"]] = (
+                    evaluate_effector_graph(scalar_config, slice_)
+                    * float(scalar_config.get("output_coefficient", 1.0))
+                )
+            else:
+                channels[scalar_config["target_parameter"]] = apply_effector(
+                    scalar_config, scalar_source_value(scalar_config, slice_)
+                )
 
         rotation_type = config["rotation_type"]
         if rotation_type == "TargetBendSTRoll":
@@ -797,6 +868,9 @@ def kdi_scalar(config_id: int, *values: float) -> float:
     """Short driver-namespace entry point used by every generated FCurve."""
     try:
         config = RUNTIME[int(config_id)]
+        if "effector_graph" in config:
+            result = evaluate_effector_graph(config, values)
+            return target_value(config, result * float(config.get("output_coefficient", 1.0)))
         source_value = scalar_source_value(config, values)
         return target_value(config, apply_effector(config, source_value))
     except Exception:
@@ -982,6 +1056,202 @@ def build_config(link: dict[str, Any], node_by_index: dict[int, dict[str, Any]],
     return config
 
 
+def is_simple_link(link: dict[str, Any], node_by_index: dict[int, dict[str, Any]]) -> bool:
+    """True when the link is one effector sitting between a Source and a Target.
+
+    Anything else -- an EffectorExpr, or an effector fed by another effector --
+    needs the DAG evaluator instead. Keeping this predicate narrow means every
+    rig that already worked keeps taking the identical code path.
+    """
+    if link.get("effector_type") not in {"EffectorEZParamLink", "EffectorEZParamLinkLinear"}:
+        return False
+    source = node_by_index.get(int(link["source"]["operator_index"]))
+    return bool(source) and source["operator_type"] in {"SourceRotate", "SourceTranslate"}
+
+
+def build_graph_config(
+        target_node: dict[str, Any],
+        edge: dict[str, Any],
+        node_by_index: dict[int, dict[str, Any]],
+        incoming: dict[int, list[dict[str, Any]]],
+        armature: Any,
+        config_id: int,
+) -> dict[str, Any]:
+    """A scalar config whose value comes from an effector DAG rather than one effector."""
+    body = target_node["body"]
+    if target_node["operator_type"] == "TargetScale" and body.get("InputAsLogarithm"):
+        raise ValueError(
+            f"TargetScale {target_node['operator_index']} uses unsupported InputAsLogarithm"
+        )
+    effector_graph, root = build_effector_graph(
+        int(edge["source"]["operator_index"]), edge["source"].get("parameter"),
+        node_by_index, incoming, armature,
+    )
+    return {
+        "id": config_id,
+        "effector_graph": effector_graph,
+        "effector_graph_root": root,
+        # The wire from the graph's root operator into the target channel.
+        "output_coefficient": float(edge.get("coefficient", 1.0) or 1.0),
+        "target_type": target_node["operator_type"],
+        "target_bone": body["TargetObjectBoneName"],
+        "target_parameter": edge["target"]["parameter"],
+        "target_operator_index": target_node["operator_index"],
+        "clamp_zero": bool(body.get("ClampZero")),
+    }
+
+
+def channel_identifier(
+        audit: dict[str, Any],
+        node: dict[str, Any],
+        edge: dict[str, Any],
+        occupied: set[int],
+) -> int:
+    token = ":".join((
+        audit["graph"]["source"]["sha256"],
+        "CHANNEL",
+        str(node["operator_index"]),
+        str(edge["target"].get("parameter")),
+    ))
+    identifier = zlib.crc32(token.encode("utf-8")) & 0x7FFFFFFF
+    while identifier in occupied:
+        identifier = (identifier + 1) & 0x7FFFFFFF
+    occupied.add(identifier)
+    return identifier
+
+
+def build_effector_graph(
+        producer_index: int,
+        root_parameter: str | None,
+        node_by_index: dict[int, dict[str, Any]],
+        incoming: dict[int, list[dict[str, Any]]],
+        armature: Any,
+) -> tuple[list[dict[str, Any]], int]:
+    """Flatten the effector DAG feeding one channel into an evaluation order.
+
+    KineDriver effectors are not restricted to a single source -> effector ->
+    target hop. Effectors chain (148 such edges across 29 corpus files even
+    before EffectorExpr is considered), and an EffectorExpr takes several inputs
+    at once, most of which come from other effectors rather than from sources.
+    So a channel is fed by a small DAG, which this resolves into a topologically
+    ordered node list evaluated by ``evaluate_effector_graph``.
+
+    A node's result may fan out to several consumers, so each operator is
+    emitted once and referenced by index. The depth-1 case -- one effector
+    between a source and a target -- reduces to exactly the arithmetic the
+    single-effector path always performed, since the same ``scalar_source_value``
+    and ``apply_effector`` do the work.
+    """
+    graph: list[dict[str, Any]] = []
+    emitted: dict[Any, int] = {}
+
+    def resolve(operator_index: int, parameter: str | None, visiting: frozenset[int]) -> int:
+        node = node_by_index.get(operator_index)
+        if node is None:
+            raise ValueError(f"Effector graph references missing operator {operator_index}")
+        operator_type = node["operator_type"]
+        # A Source node exposes several ports and the consuming wire chooses one,
+        # so the same operator read as BendS and as BendT is two distinct leaves.
+        # Effectors have a single Output, so their index alone identifies them.
+        is_source = operator_type in {"SourceRotate", "SourceTranslate"}
+        key = (operator_index, parameter) if is_source else operator_index
+        if key in emitted:
+            return emitted[key]
+        if operator_index in visiting:
+            raise ValueError(f"Effector graph contains a cycle at operator {operator_index}")
+        visiting = visiting | {operator_index}
+
+        if is_source:
+            source_config = build_source_config(node, armature)
+            source_config["source_parameter"] = parameter
+            entry = {"kind": "source", "source": source_config}
+        elif operator_type in {"EffectorEZParamLink", "EffectorEZParamLinkLinear"}:
+            inputs = [
+                edge for edge in incoming.get(operator_index, [])
+                if edge["target"].get("parameter") == "Input"
+            ]
+            if len(inputs) != 1:
+                raise ValueError(
+                    f"Effector {operator_index} has {len(inputs)} inputs; expected exactly one"
+                )
+            edge = inputs[0]
+            entry = {
+                "kind": "effector",
+                "effector_type": operator_type,
+                "effector_body": node["body"],
+                "input": [
+                    resolve(int(edge["source"]["operator_index"]),
+                            edge["source"].get("parameter"), visiting),
+                    float(edge.get("coefficient", 1.0) or 1.0),
+                ],
+            }
+        elif operator_type == "EffectorExpr":
+            body = node["body"] or {}
+            slot_count = len(body.get("Inputs") or [])
+            edges = [
+                edge for edge in incoming.get(operator_index, [])
+                if edge["target"].get("parameter") == "Input"
+            ]
+            # MultiIndex selects the `var N` slot; across the corpus it is always
+            # exactly 0..n-1 and the wire count always equals the slot count.
+            slots: list[Any] = [None] * max(slot_count, len(edges))
+            for edge in edges:
+                slot = int(edge["target"].get("multi_index") or 0)
+                if not 0 <= slot < len(slots):
+                    raise ValueError(
+                        f"EffectorExpr {operator_index} has an input for slot {slot} "
+                        f"but only {len(slots)} slot(s)"
+                    )
+                slots[slot] = [
+                    resolve(int(edge["source"]["operator_index"]),
+                            edge["source"].get("parameter"), visiting),
+                    float(edge.get("coefficient", 1.0) or 1.0),
+                ]
+            missing = [index for index, slot in enumerate(slots) if slot is None]
+            if missing:
+                raise ValueError(
+                    f"EffectorExpr {operator_index} has no wire for input slot(s) {missing}"
+                )
+            entry = {
+                "kind": "expr",
+                "program": parse_expr_program(body.get("Code") or ""),
+                "inputs": [[slot[0], slot[1]] for slot in slots],
+            }
+        else:
+            raise ValueError(f"Unsupported effector {operator_type} feeding a driver")
+
+        graph.append(entry)
+        emitted[key] = len(graph) - 1
+        return emitted[key]
+
+    root = resolve(producer_index, root_parameter, frozenset())
+    return graph, root
+
+
+def evaluate_effector_graph(config: dict[str, Any], values: tuple[float, ...] | list[float]) -> float:
+    """Run a flattened effector graph; nodes are already in dependency order."""
+    results: list[float] = []
+    cursor = 0
+    for entry in config["effector_graph"]:
+        kind = entry["kind"]
+        if kind == "source":
+            source_config = entry["source"]
+            count = source_value_count(source_config)
+            results.append(scalar_source_value(source_config, values[cursor:cursor + count]))
+            cursor += count
+        elif kind == "effector":
+            producer, coefficient = entry["input"]
+            results.append(apply_effector(entry, results[producer] * coefficient))
+        else:
+            slots = [results[producer] * coefficient for producer, coefficient in entry["inputs"]]
+            results.append(evaluate_expr_program(entry["program"], slots))
+    return results[config["effector_graph_root"]]
+
+
+def effector_graph_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return [entry["source"] for entry in config["effector_graph"] if entry["kind"] == "source"]
+
+
 def config_identifier(audit: dict[str, Any], link: dict[str, Any], occupied: set[int]) -> int:
     token = ":".join((
         audit["graph"]["source"]["sha256"],
@@ -1053,6 +1323,7 @@ def build_rotation_config(
     node_by_index: dict[int, dict[str, Any]],
     armature: Any,
     config_id: int,
+    incoming_edges: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     body = node["body"]
     rotation_type = node["operator_type"]
@@ -1071,18 +1342,50 @@ def build_rotation_config(
         "TargetBendRoll": {"Roll"},
         "TargetRotate": set(),
     }[rotation_type]
+    # Most EffectorExpr output goes to rotation channels rather than scalar ones
+    # (703 of its corpus wires, against 301 to Translate/Scale), so these inputs
+    # need the same simple-vs-graph split the scalar path uses.
+    incoming_edges = incoming_edges or {}
+    simple_by_parameter = {
+        link["target"]["parameter"]: link
+        for link in incoming_links
+        if is_simple_link(link, node_by_index)
+    }
     scalar_inputs = []
     seen_parameters = set()
-    for link in sorted(incoming_links, key=lambda item: item["target"]["parameter"]):
-        parameter = link["target"]["parameter"]
-        if parameter not in allowed_parameters:
-            raise ValueError(
-                f"Rotation target {node['operator_index']} has unsupported scalar input {parameter}"
-            )
+    # Only effector-produced wires are scalar channel inputs. A rotation target
+    # is also wired directly from a Source for its quaternion (RotateQuat /
+    # BendingQuat), which is resolved via SourceQuat instead and must not be
+    # mistaken for an unsupported channel.
+    effector_edges = [
+        edge for edge in incoming_edges.get(int(node["operator_index"]), [])
+        if (node_by_index.get(int(edge["source"]["operator_index"])) or {})
+        .get("operator_type", "").startswith("Effector")
+    ]
+    channel_edges = [
+        edge for edge in effector_edges
+        if edge["target"].get("parameter") in allowed_parameters
+    ]
+    unsupported = {
+        edge["target"].get("parameter") for edge in effector_edges
+    } - allowed_parameters - {None}
+    if unsupported:
+        raise ValueError(
+            f"Rotation target {node['operator_index']} has unsupported scalar "
+            f"input {sorted(unsupported)[0]}"
+        )
+    for edge in sorted(channel_edges, key=lambda item: item["target"]["parameter"]):
+        parameter = edge["target"]["parameter"]
         if parameter in seen_parameters:
             raise ValueError(f"Rotation target {node['operator_index']} has duplicate input {parameter}")
         seen_parameters.add(parameter)
-        scalar_inputs.append(build_config(link, node_by_index, armature, -1))
+        link = simple_by_parameter.get(parameter)
+        if link is not None:
+            scalar_inputs.append(build_config(link, node_by_index, armature, -1))
+        else:
+            scalar_inputs.append(
+                build_graph_config(node, edge, node_by_index, incoming_edges, armature, -1)
+            )
 
     quaternion_source = resolve_quaternion_source(body, node_by_index)
     direct_source = (
@@ -1224,6 +1527,14 @@ def source_data_paths(config: dict[str, Any]) -> list[str]:
     matching ``source_value_count`` and the ``values`` indexing in
     ``source_rotation_delta``/``scalar_source_value``.
     """
+    if "effector_graph" in config:
+        # One contiguous block per source node, in graph order -- the same order
+        # evaluate_effector_graph consumes them.
+        return [
+            data_path
+            for source in effector_graph_sources(config)
+            for data_path in source_data_paths(source)
+        ]
     sources = config_source_bones(config)
     mode = config["source_mode"]
     if mode == "PARENT_ROTATION":
@@ -1480,10 +1791,35 @@ def build_scalar_drivers(
     coordinate_basis_to_reference(coordinate_profile)
     graph = audit["graph"]
     node_by_index = {int(node["operator_index"]): node for node in graph["nodes"]}
+    incoming_edges: dict[int, list[dict[str, Any]]] = {}
+    for connection in graph.get("live_connections") or []:
+        target_index = (connection.get("target") or {}).get("operator_index")
+        if target_index is not None:
+            incoming_edges.setdefault(int(target_index), []).append(connection)
+
+    def is_simple_scalar_link(link: dict[str, Any]) -> bool:
+        return is_simple_link(link, node_by_index)
+
     scalar_links = [
         link for link in graph["driver_links"]
         if node_by_index[int(link["target"]["operator_index"])]["operator_type"]
         in {"TargetTranslate", "TargetScale"}
+        and is_simple_scalar_link(link)
+    ]
+    simple_channels = {
+        (int(link["target"]["operator_index"]), link["target"]["parameter"])
+        for link in scalar_links
+    }
+    # Channels fed by something the single-effector path cannot express.
+    graph_channels = [
+        (node, edge)
+        for node in graph["nodes"]
+        if node["operator_type"] in {"TargetTranslate", "TargetScale"}
+        for edge in incoming_edges.get(int(node["operator_index"]), [])
+        if (int(node["operator_index"]), edge["target"].get("parameter")) not in simple_channels
+        and str(edge["target"].get("parameter") or "").startswith(
+            "Translate" if node["operator_type"] == "TargetTranslate" else "Scale"
+        )
     ]
     occupied: set[int] = set()
     previous_registry: dict[str, Any] = {}
@@ -1501,6 +1837,13 @@ def build_scalar_drivers(
         build_config(link, node_by_index, armature, config_identifier(audit, link, occupied))
         for link in scalar_links
     ]
+    configs.extend(
+        build_graph_config(
+            node, edge, node_by_index, incoming_edges, armature,
+            channel_identifier(audit, node, edge, occupied),
+        )
+        for node, edge in graph_channels
+    )
     for config in configs:
         config["target_axis_order"] = (
             translation_axis_order
@@ -1508,6 +1851,10 @@ def build_scalar_drivers(
             else scale_axis_order
         )
         config["coordinate_profile"] = coordinate_profile
+        # The graph's leaf source configs are what scalar_source_value actually
+        # receives, so the frame has to reach them too.
+        for source in effector_graph_sources(config) if "effector_graph" in config else ():
+            source["coordinate_profile"] = coordinate_profile
         # The +90-degree package-bone roll maps reference Z to negative package
         # X. Scale does not carry that sign, but translation does.
         config["target_axis_sign"] = (
@@ -1583,6 +1930,7 @@ def build_scalar_drivers(
             node_by_index,
             armature,
             rotation_identifier(audit, node, occupied),
+            incoming_edges,
         )
         for node in rotation_nodes
     ]
@@ -1590,6 +1938,11 @@ def build_scalar_drivers(
         config["coordinate_profile"] = coordinate_profile
         for scalar_input in config["scalar_inputs"]:
             scalar_input["coordinate_profile"] = coordinate_profile
+            for source in (
+                effector_graph_sources(scalar_input)
+                if "effector_graph" in scalar_input else ()
+            ):
+                source["coordinate_profile"] = coordinate_profile
         if config["direct_source"] is not None:
             config["direct_source"]["coordinate_profile"] = coordinate_profile
 
