@@ -512,6 +512,10 @@ def target_value(config: dict[str, Any], value: float) -> float:
     raise ValueError(f"Unsupported target type: {config['target_type']}")
 
 
+def matrix3_identity() -> list[list[float]]:
+    return [[1.0 if row == column else 0.0 for column in range(3)] for row in range(3)]
+
+
 def matrix4_identity() -> list[list[float]]:
     return [[1.0 if row == column else 0.0 for column in range(4)] for row in range(4)]
 
@@ -793,6 +797,7 @@ def kdi_rotation(config_id: int, component: int, *values: float) -> float:
     """Evaluate one quaternion component of a KineDriver rotation target."""
     try:
         config = RUNTIME[int(config_id)]
+        values = expand_values(config, values)
         channels = dict(config["defaults"])
         cursor = 0
         for scalar_config in config["scalar_inputs"]:
@@ -856,6 +861,23 @@ def kdi_rotation(config_id: int, component: int, *values: float) -> float:
             else:
                 raise ValueError(f"Unsupported rotation target: {rotation_type}")
         quaternion = reference_quaternion_in_target_frame(config, quaternion)
+        base_space = config.get("base_space")
+        if base_space:
+            # basis = A @ parent_now^-1 @ base_now @ C @ R
+            base_now = values_to_matrix3(values, cursor)
+            cursor += 9
+            if base_space.get("parent_bone"):
+                parent_now = values_to_matrix3(values, cursor)
+                cursor += 9
+            else:
+                parent_now = matrix3_identity()
+            rebase = multiply3(
+                multiply3(base_space["target_rest_to_parent"], transpose3(parent_now)),
+                multiply3(base_now, base_space["base_rest_to_target"]),
+            )
+            quaternion = matrix3_to_quaternion(
+                multiply3(rebase, quaternion_to_matrix3(quaternion))
+            )
         quaternion = normalize_quaternion(quaternion)
         if quaternion[0] < 0.0:
             quaternion = [-value for value in quaternion]
@@ -868,6 +890,7 @@ def kdi_scalar(config_id: int, *values: float) -> float:
     """Short driver-namespace entry point used by every generated FCurve."""
     try:
         config = RUNTIME[int(config_id)]
+        values = expand_values(config, values)
         if "effector_graph" in config:
             result = evaluate_effector_graph(config, values)
             return target_value(config, result * float(config.get("output_coefficient", 1.0)))
@@ -1317,6 +1340,65 @@ def resolve_quaternion_source(
     return source_node
 
 
+def build_rotation_base_space(
+        node: dict[str, Any],
+        base_info: dict[str, Any],
+        target_name: str,
+        armature: Any,
+) -> dict[str, Any]:
+    """Constants for a rotation target measured against a bone other than its parent.
+
+    KineDriver localises a target's result to its base space, which defaults to
+    the parent but can name any bone. Blender's ``rotation_quaternion`` is always
+    a delta in the *parent's* frame, so a NODE base space has to be rebased.
+
+    With R the computed local delta, and rest/pose rotations in armature space::
+
+        target_now = base_now @ (base_rest^-1 @ target_rest) @ R
+        basis      = (parent_rest^-1 @ target_rest)^-1 @ parent_now^-1 @ target_now
+                   = A @ parent_now^-1 @ base_now @ C @ R
+
+    so only ``A = target_rest^-1 @ parent_rest`` and ``C = base_rest^-1 @
+    target_rest`` need baking; the two pose matrices are read at runtime. The
+    form is self-checking: when the base *is* the parent, A @ C collapses to
+    identity and this reduces to the plain parent-space path, and at rest pose
+    (parent_now = parent_rest, base_now = base_rest) it is identity too, so the
+    bone does not move.
+
+    All 512 non-PARENT rotation targets in the corpus are NODE -- typically a
+    cloth or jacket helper measured against C_Hip_a or a spine bone -- so GLOBAL
+    stays unimplemented rather than guessed at.
+    """
+    base_name = base_info.get("BoneName")
+    if not base_name or base_name == "None":
+        raise ValueError(
+            f"Rotation target {node['operator_index']} has NODE base space without a base bone"
+        )
+    if base_name not in armature.data.bones:
+        raise ValueError(
+            f"Rotation target {node['operator_index']} names base bone "
+            f"'{base_name}', which is not in this armature"
+        )
+    target_bone = armature.data.bones[target_name]
+    target_rest = target_bone.matrix_local.to_3x3()
+    base_rest = armature.data.bones[base_name].matrix_local.to_3x3()
+    parent = target_bone.parent
+    # A root bone's rest-local transform is just its armature-space rest, so the
+    # parent term drops out rather than needing an identity matrix.
+    target_rest_to_parent = (
+        target_rest.inverted() @ parent.matrix_local.to_3x3() if parent
+        else target_rest.inverted()
+    )
+    return {
+        "base_bone": base_name,
+        "parent_bone": parent.name if parent else None,
+        # A: undoes the target's own rest offset within its parent.
+        "target_rest_to_parent": matrix3_from_matrix4(target_rest_to_parent),
+        # C: the target's rest offset within the base bone.
+        "base_rest_to_target": matrix3_from_matrix4(base_rest.inverted() @ target_rest),
+    }
+
+
 def build_rotation_config(
     node: dict[str, Any],
     incoming_links: list[dict[str, Any]],
@@ -1330,7 +1412,10 @@ def build_rotation_config(
     target_name = body["TargetObjectBoneName"]
     base_info = body.get("BaseSpaceInfo") or {}
     base_type = str(base_info.get("BaseSpaceType", "PARENT")).rsplit("_", 1)[-1]
-    if base_type != "PARENT":
+    base_space: dict[str, Any] | None = None
+    if base_type == "NODE":
+        base_space = build_rotation_base_space(node, base_info, target_name, armature)
+    elif base_type != "PARENT":
         raise ValueError(f"Rotation target {node['operator_index']} uses unsupported {base_type} base space")
     if body.get("MirrorParams", {}).get("EnableMirroring"):
         raise ValueError(f"Rotation target {node['operator_index']} uses unsupported mirroring")
@@ -1403,6 +1488,7 @@ def build_rotation_config(
         "target_bone": target_name,
         "target_body": body,
         "scalar_inputs": scalar_inputs,
+        "base_space": base_space,
         "direct_source": direct_source,
         "quaternion_weight": float(body.get("QuatWeight", 1.0)),
         "defaults": {
@@ -1475,6 +1561,49 @@ def target_path_and_index(config: dict[str, Any]) -> tuple[str, int]:
 
 
 VARIABLE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+EXPRESSION_LIMIT = 255
+
+
+def compact_arguments(names: list[str]) -> tuple[list[str], list[int] | None]:
+    """Collapse a repeated argument list to its distinct members plus a remap.
+
+    Driver variables are already deduplicated, so a name often appears several
+    times in the call -- a rotation target reads the same base-space and parent
+    matrices from each of its inputs. Passing each distinct variable once and
+    letting the evaluator expand the positions back out costs nothing at runtime
+    and buys a lot of room against the expression length limit, which
+    NODE base spaces (18 extra values per target) otherwise overrun.
+
+    Returns the arguments to emit and, when it differs from the identity, the
+    map from logical value position to argument index.
+    """
+    unique = list(dict.fromkeys(names))
+    position = {name: index for index, name in enumerate(unique)}
+    value_map = [position[name] for name in names]
+    if value_map == list(range(len(names))):
+        return names, None
+    return unique, value_map
+
+
+def expand_values(config: dict[str, Any], values: tuple[float, ...]) -> tuple[float, ...]:
+    value_map = config.get("value_map")
+    if not value_map:
+        return values
+    return tuple(values[index] for index in value_map)
+
+
+def check_expression_length(expression: str, description: str) -> None:
+    """Reject an over-long driver expression before Blender silently truncates it.
+
+    Assigning a longer string to ``driver.expression`` stores a cropped copy, so
+    a check made after assignment always sees exactly the limit and never fires
+    -- the driver just fails to parse at evaluation time instead.
+    """
+    if len(expression) > EXPRESSION_LIMIT:
+        raise ValueError(
+            f"The {description} needs a {len(expression)}-character driver "
+            f"expression; Blender's limit is {EXPRESSION_LIMIT}"
+        )
 
 
 def add_ordered_variables(driver: Any, armature: Any, data_paths: list[str]) -> list[str]:
@@ -1575,7 +1704,25 @@ def add_rotation_variables(driver: Any, config: dict[str, Any], armature: Any) -
         for source_config in source_configs
         for data_path in source_data_paths(source_config)
     ]
+    data_paths.extend(rotation_base_space_paths(config))
     return add_ordered_variables(driver, armature, data_paths)
+
+
+def rotation_base_space_paths(config: dict[str, Any]) -> list[str]:
+    """Pose matrices a NODE base space needs, appended after the source values."""
+    base_space = config.get("base_space")
+    if not base_space:
+        return []
+    paths = [
+        pose_matrix_component_path(base_space["base_bone"], row, column)
+        for row in range(3) for column in range(3)
+    ]
+    if base_space.get("parent_bone"):
+        paths.extend(
+            pose_matrix_component_path(base_space["parent_bone"], row, column)
+            for row in range(3) for column in range(3)
+        )
+    return paths
 
 
 def add_anchor_matrix_component(
@@ -1991,12 +2138,11 @@ def build_scalar_drivers(
             driver = fcurve.driver
             driver.type = "SCRIPTED"
             arguments = add_source_variables(driver, config, armature)
-            driver.expression = f"kdi_scalar({config['id']},{','.join(arguments)})"
-            if len(driver.expression) > 255:
-                raise ValueError(
-                    f"Scalar driver on bone {config['target_bone']} needs a "
-                    f"{len(driver.expression)}-character expression; Blender's limit is 255"
-                )
+            arguments, value_map = compact_arguments(arguments)
+            config["value_map"] = value_map
+            expression = f"kdi_scalar({config['id']},{','.join(arguments)})"
+            check_expression_length(expression, f"scalar driver on bone {config['target_bone']}")
+            driver.expression = expression
             generated.append({
                 "data_path": data_path,
                 "array_index": array_index,
@@ -2012,12 +2158,14 @@ def build_scalar_drivers(
                 driver = fcurve.driver
                 driver.type = "SCRIPTED"
                 arguments = add_rotation_variables(driver, config, armature)
-                driver.expression = f"kdi_rotation({config['id']},{array_index},{','.join(arguments)})"
-                if len(driver.expression) > 255:
-                    raise ValueError(
-                        f"Rotation driver expression exceeds Blender's limit on operator "
-                        f"{config['target_operator_index']}"
-                    )
+                arguments, value_map = compact_arguments(arguments)
+                config["value_map"] = value_map
+                expression = f"kdi_rotation({config['id']},{array_index},{','.join(arguments)})"
+                check_expression_length(
+                    expression,
+                    f"rotation target {config['target_operator_index']} on bone {config['target_bone']}",
+                )
+                driver.expression = expression
                 generated.append({
                     "data_path": data_path,
                     "array_index": array_index,
@@ -2031,7 +2179,12 @@ def build_scalar_drivers(
                 driver = fcurve.driver
                 driver.type = "SCRIPTED"
                 arguments = add_anchor_variables(driver, config, armature)
-                driver.expression = f"kdi_anchor({config['id']},{array_index},{','.join(arguments)})"
+                expression = f"kdi_anchor({config['id']},{array_index},{','.join(arguments)})"
+                check_expression_length(
+                    expression,
+                    f"constraint {config['target_operator_index']} on bone {config['target_bone']}",
+                )
+                driver.expression = expression
                 if len(driver.expression) > 255:
                     raise ValueError(
                         f"Anchor driver expression exceeds Blender's limit on operator {config['target_operator_index']}"
