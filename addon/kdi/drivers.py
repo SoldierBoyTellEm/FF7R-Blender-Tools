@@ -27,6 +27,7 @@ from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 from . import audit as kdi_audit
+from ..reporting import FF7R_LoggedOperator
 
 
 bl_info = {
@@ -2291,7 +2292,7 @@ def build_scalar_drivers(
     }
 
 
-class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
+class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
     """Audit a KineDriver JSON file and build its drivers on the active armature"""
 
     bl_idname = "import_scene.ff7r_kinedriver_json"
@@ -2414,7 +2415,7 @@ class KDI_OT_step2_scalar_drivers(bpy.types.Operator, ImportHelper):
             return {"CANCELLED"}
 
 
-class KDI_OT_remove_scalar_drivers(bpy.types.Operator):
+class KDI_OT_remove_scalar_drivers(FF7R_LoggedOperator):
     """Remove generated KDI drivers and restore inherited-scale settings"""
 
     bl_idname = "kdi.remove_scalar_drivers"

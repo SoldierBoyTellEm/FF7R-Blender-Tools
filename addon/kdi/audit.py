@@ -26,6 +26,7 @@ try:
     import bpy
     from bpy_extras.io_utils import ImportHelper
     from bpy.props import BoolProperty, StringProperty
+    from ..reporting import FF7R_LoggedOperator
 except ModuleNotFoundError:  # Allows parser testing with ordinary Python.
     bpy = None
     ImportHelper = object
@@ -639,7 +640,7 @@ def compose_report(graph: dict[str, Any], armature: dict[str, Any]) -> dict[str,
 
 if bpy is not None:
 
-    class KDI_OT_step1_audit(bpy.types.Operator, ImportHelper):
+    class KDI_OT_step1_audit(FF7R_LoggedOperator, ImportHelper):
         """Parse a KDI graph and audit it against the active armature"""
 
         bl_idname = "kdi.step1_audit"

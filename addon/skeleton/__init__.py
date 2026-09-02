@@ -1,1 +1,1 @@
-"""FF7R Skeleton (USkeleton/USkeletalMesh) JSON import implementation."""
+"""FF7R package Skeleton/USkeletalMesh armature construction."""

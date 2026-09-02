@@ -5,6 +5,7 @@ import json
 import bpy
 
 from .. import render_settings
+from ..reporting import FF7R_LoggedOperator
 from .parser import (
     BinReader,
     build_import_hash_table,
@@ -277,7 +278,7 @@ def import_umap_paths(
 #  Import operator
 # ============================================================
 
-class FF7R_REBIRTH_OT_import_mec_umap(bpy.types.Operator):
+class FF7R_REBIRTH_OT_import_mec_umap(FF7R_LoggedOperator):
     bl_idname = "import_scene.ff7r_rebirth_mec_umap"
     bl_label = "FF7R Massive Environment UMAP (.umap)"
     bl_description = (

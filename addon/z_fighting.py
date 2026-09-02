@@ -5,8 +5,10 @@ from collections import defaultdict
 import bmesh
 import bpy
 
+from .reporting import FF7R_LoggedOperator
 
-class MESH_OT_find_opposite_faces(bpy.types.Operator):
+
+class MESH_OT_find_opposite_faces(FF7R_LoggedOperator):
     """Find overlapping opposite-facing faces and add the established FF7R offset."""
 
     bl_idname = "mesh.find_opposite_faces"

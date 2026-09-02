@@ -1,34 +1,21 @@
-"""Build a Blender armature from a game Skeleton/SkeletalMesh bone hierarchy.
-
-Accepts two JSON shapes:
-
-- The compact shape produced by the FF7RGameAssetBridge "skeleton" action:
-  ``{"bones": [{"name", "parentIndex", "translation", "rotation", "scale"}, ...],
-  "sockets": [...], "sourceType": "USkeleton"|"USkeletalMesh"}``.
-- A raw FModel export of a ``Skeleton`` asset (a JSON array whose ``"Skeleton"``-typed
-  entry carries the native ``ReferenceSkeleton.FinalRefBoneInfo``/``FinalRefBonePose``
-  fields, with sibling ``SkeletalMeshSocket`` entries elsewhere in the same array) —
-  this lets any FModel-exported ``*_Skeleton.json`` file be imported directly.
+"""Build a Blender armature from package-decoded Skeleton/SkeletalMesh data.
 
 Bone translation/rotation values are UE-space (centimeters, left-handed quaternions),
 parent-relative, matching ``FTransform``. See ``ue_bone_transform_to_blender`` below
 for the coordinate conversion and why it differs from the one in
-``ff7r_json/map_import.py``.
+``json/map_import.py``.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 from typing import Any
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, StringProperty
-from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
-from ..ff7r_json.map_import import location_from_relative, rotation_from_relative
+from ..json.map_import import location_from_relative, rotation_from_relative
 
 MIN_BONE_LENGTH = 0.0005
 DEGENERATE_LENGTH = 1.0e-5
@@ -65,6 +52,46 @@ NEVER_CONNECT_SUFFIXES: tuple[str, ...] = ("Kdi", "Spo")
 # was verified against the game data.
 CONNECT_DISTANCE_THRESHOLD = 0.0001
 
+# Naive IK setup: a plain IK constraint (no target, no pole) on each limb's end
+# bone, plus a hinge lock on the elbow/knee so the solver can't bend it
+# sideways. This is deliberately bare-bones -- the user still has to add and
+# aim their own target objects; it just saves the constraint/limit busywork.
+IK_END_BONES: tuple[str, ...] = ("R_Foot_a", "L_Foot_a", "R_Hand_a", "L_Hand_a")
+IK_CHAIN_COUNT = 3
+IK_HINGE_BONES: tuple[str, ...] = ("L_Foreleg_a", "R_Foreleg_a", "L_Forearm_a", "R_Forearm_a")
+
+
+def apply_naive_ik(armature_obj: bpy.types.Object) -> tuple[int, int]:
+    """Add a chain-length-3 IK constraint to each present limb end bone, and
+    lock Y/Z rotation to 0 on each present elbow/knee. Missing bones are
+    skipped silently. Returns (end_bones_configured, hinge_bones_configured).
+    """
+    pose_bones = armature_obj.pose.bones
+
+    end_bones_configured = 0
+    for bone_name in IK_END_BONES:
+        pose_bone = pose_bones.get(bone_name)
+        if pose_bone is None:
+            continue
+        constraint = pose_bone.constraints.new(type="IK")
+        constraint.chain_count = IK_CHAIN_COUNT
+        end_bones_configured += 1
+
+    hinge_bones_configured = 0
+    for bone_name in IK_HINGE_BONES:
+        pose_bone = pose_bones.get(bone_name)
+        if pose_bone is None:
+            continue
+        pose_bone.use_ik_limit_y = True
+        pose_bone.ik_min_y = 0.0
+        pose_bone.ik_max_y = 0.0
+        pose_bone.use_ik_limit_z = True
+        pose_bone.ik_min_z = 0.0
+        pose_bone.ik_max_z = 0.0
+        hinge_bones_configured += 1
+
+    return end_bones_configured, hinge_bones_configured
+
 
 def max_length_for_bone(bone_name: str) -> float | None:
     """Return the display-length cap for this bone, or None if it is unclamped."""
@@ -93,7 +120,7 @@ def ue_bone_transform_to_blender(
     which negates Y on a translation, and takes a quaternion (X, Y, Z, W) to
     (W, -X, Y, -Z) -- note it is X and Z that flip, not Y and Z.
 
-    This deliberately differs from ``ff7r_json/map_import.py``'s
+    This deliberately differs from ``json/map_import.py``'s
     ``rotation_from_quaternion``, which negates Y and Z. The two forms agree
     exactly whenever X = Y = 0, i.e. for yaw-only rotations about Z -- which is
     what placed level actors overwhelmingly use, so the difference never
@@ -124,69 +151,6 @@ def _bones_from_bridge(data: dict[str, Any]) -> list[dict[str, Any]]:
     return bones
 
 
-def _bones_from_fmodel_skeleton(skeleton_entry: dict[str, Any]) -> list[dict[str, Any]]:
-    reference_skeleton = skeleton_entry.get("ReferenceSkeleton") or {}
-    bone_infos = reference_skeleton.get("FinalRefBoneInfo") or []
-    bone_poses = reference_skeleton.get("FinalRefBonePose") or []
-    bones = []
-    for index, info in enumerate(bone_infos):
-        pose = bone_poses[index] if index < len(bone_poses) else {}
-        translation = pose.get("Translation") or {}
-        rotation = pose.get("Rotation") or {}
-        bones.append({
-            "name": info.get("Name") or f"Bone_{index}",
-            "parent_index": int(info.get("ParentIndex", -1)),
-            "translation": (
-                float(translation.get("X", 0.0)),
-                float(translation.get("Y", 0.0)),
-                float(translation.get("Z", 0.0)),
-            ),
-            "rotation": (
-                float(rotation.get("X", 0.0)),
-                float(rotation.get("Y", 0.0)),
-                float(rotation.get("Z", 0.0)),
-                float(rotation.get("W", 1.0)),
-            ),
-        })
-    return bones
-
-
-def _sockets_from_fmodel_root(root: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    sockets = []
-    for entry in root:
-        if entry.get("Type") != "SkeletalMeshSocket":
-            continue
-        props = entry.get("Properties") or {}
-        sockets.append({
-            "name": props.get("SocketName", entry.get("Name")),
-            "boneName": props.get("BoneName"),
-            "relativeLocation": props.get("RelativeLocation"),
-            "relativeRotation": props.get("RelativeRotation"),
-            "relativeScale3D": props.get("RelativeScale3D"),
-        })
-    return sockets
-
-
-def read_skeleton_export(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
-    """Return (bones, sockets, source_label) for either JSON shape described above."""
-
-    data = json.loads(path.read_text(encoding="utf-8-sig"))
-
-    if isinstance(data, dict) and "bones" in data:
-        source_label = data.get("sourceType") or "bridge"
-        return _bones_from_bridge(data), list(data.get("sockets") or []), source_label
-
-    if isinstance(data, list):
-        skeleton_entry = next((entry for entry in data if entry.get("Type") == "Skeleton"), None)
-        if skeleton_entry is None:
-            raise ValueError('No "Skeleton" export was found in this FModel JSON file.')
-        bones = _bones_from_fmodel_skeleton(skeleton_entry)
-        sockets = _sockets_from_fmodel_root(data)
-        return bones, sockets, "FModel"
-
-    raise ValueError("Unrecognized skeleton JSON shape.")
-
-
 def build_armature_from_bones(
         context: Any,
         name: str,
@@ -195,6 +159,8 @@ def build_armature_from_bones(
         scale_factor: float = 0.01,
         connect_bones: bool = False,
         create_socket_empties: bool = True,
+        create_socket_bones: bool = False,
+        setup_naive_ik: bool = False,
 ) -> bpy.types.Object:
     """Create a new armature object with one edit-bone per entry in `bones`.
 
@@ -216,10 +182,14 @@ def build_armature_from_bones(
     ``allows_connect`` -- since KineDriver needs to translate them independently
     of their parent.
 
-    ``create_socket_empties`` additionally materializes each socket as a
-    bone-parented Empty, which is what ``ff7r_json/map_import``'s
-    ``find_attach_socket_empty`` looks for when resolving a UMAP actor's
-    AttachSocketName. The raw socket data is stored on the armature either way.
+    ``create_socket_empties`` materializes each socket as a bone-parented Empty.
+    ``create_socket_bones`` instead adds the sockets as non-deforming bones in a
+    hidden ``Sockets`` bone collection.  Socket bones are preferable for package
+    UMAP imports because their transform is part of the armature, not a separate
+    scene object.  The raw socket data is stored on the armature either way.
+
+    ``setup_naive_ik`` additionally calls ``apply_naive_ik`` -- see there for
+    what it does.
     """
 
     if not bones:
@@ -236,6 +206,13 @@ def build_armature_from_bones(
     bpy.ops.object.mode_set(mode="EDIT")
     try:
         armature_space = _build_edit_bones(armature_data, bones, scale_factor, connect_bones)
+        socket_bone_names = (
+            _build_socket_edit_bones(
+                armature_data, sockets, bones, armature_space, scale_factor
+            )
+            if sockets and create_socket_bones
+            else {}
+        )
     except Exception:
         # Never leave a half-built armature behind for the user to clean up.
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -246,11 +223,16 @@ def build_armature_from_bones(
 
     if sockets:
         armature_obj["ff7r_sockets"] = json.dumps(sockets, ensure_ascii=False)
-        _tag_socket_bones(armature_obj, sockets)
-        if create_socket_empties:
+        if socket_bone_names:
+            _finalize_socket_bones(armature_obj, socket_bone_names)
+        _tag_socket_bones(armature_obj, sockets, socket_bone_names)
+        if create_socket_empties and not socket_bone_names:
             _create_socket_empties(
                 armature_obj, sockets, bones, armature_space, scale_factor
             )
+
+    if setup_naive_ik:
+        apply_naive_ik(armature_obj)
 
     return armature_obj
 
@@ -262,7 +244,7 @@ def _socket_local_matrix(socket: dict[str, Any], scale_factor: float) -> Matrix:
     the rotation already converted to a quaternion by CUE4Parse's own
     ``FRotator.Quaternion()``, while a raw FModel export carries
     ``relativeLocation``/``relativeRotation`` as a Pitch/Yaw/Roll Rotator in
-    degrees. The Rotator path reuses ``ff7r_json/map_import``'s
+    degrees. The Rotator path reuses ``json/map_import``'s
     ``rotation_from_relative``, which was verified against the quaternion path by
     full rotation-matrix comparison rather than by decomposed Euler angles.
     """
@@ -337,18 +319,83 @@ def _create_socket_empties(
     return created
 
 
-def _tag_socket_bones(armature_obj: bpy.types.Object, sockets: list[dict[str, Any]]) -> None:
-    """Tag each socket's owning pose bone with a SocketName custom property.
+def _build_socket_edit_bones(
+        armature_data: bpy.types.Armature,
+        sockets: list[dict[str, Any]],
+        bones: list[dict[str, Any]],
+        armature_space: list[Matrix],
+        scale_factor: float,
+) -> dict[str, str]:
+    """Add one non-deforming edit bone at each socket transform.
 
-    ``ff7r_json/map_import.py``'s ``find_bone_by_socket_name`` already looks for
+    The rest transforms are composed in exactly the same pre-display coordinate
+    frame as the regular skeleton.  The bone is then aimed and rolled like an
+    imported UE bone, so using it as a Blender attachment target has the same
+    local axes as the socket's game transform.
+    """
+    bone_index_by_name = {bone["name"]: index for index, bone in enumerate(bones)}
+    edit_bones = armature_data.edit_bones
+    socket_bone_names: dict[str, str] = {}
+    for socket in sockets:
+        socket_name = socket.get("name")
+        parent_name = socket.get("boneName")
+        parent_index = bone_index_by_name.get(parent_name)
+        parent_bone = edit_bones.get(parent_name) if parent_name else None
+        if not socket_name or parent_index is None or parent_bone is None:
+            print(f"[FF7R Skeleton] Socket '{socket_name}': bone '{parent_name}' not found; skipped.")
+            continue
+
+        socket_matrix = armature_space[parent_index] @ _socket_local_matrix(socket, scale_factor)
+        socket_bone = edit_bones.new(socket_name)
+        socket_bone.parent = parent_bone
+        socket_bone.use_connect = False
+        basis = socket_matrix.to_3x3()
+        head = socket_matrix.translation
+        aim = (basis @ Vector((1.0, 0.0, 0.0))).normalized()
+        socket_bone.head = head
+        socket_bone.tail = head + aim * DEFAULT_BONE_LENGTH
+        socket_bone.align_roll(basis @ Vector((0.0, 0.0, 1.0)))
+        socket_bone.roll += math.pi * 0.5
+        socket_bone_names[socket_name] = socket_bone.name
+    return socket_bone_names
+
+
+def _finalize_socket_bones(
+        armature_obj: bpy.types.Object,
+        socket_bone_names: dict[str, str],
+) -> None:
+    """Move socket bones into a hidden collection and ensure they never deform."""
+    armature_data = armature_obj.data
+    socket_collection = armature_data.collections.get("Sockets")
+    if socket_collection is None:
+        socket_collection = armature_data.collections.new("Sockets")
+    for socket_bone_name in socket_bone_names.values():
+        bone = armature_data.bones.get(socket_bone_name)
+        if bone is None:
+            continue
+        bone.use_deform = False
+        for collection in list(bone.collections):
+            collection.unassign(bone)
+        socket_collection.assign(bone)
+    socket_collection.is_visible = False
+
+
+def _tag_socket_bones(
+        armature_obj: bpy.types.Object,
+        sockets: list[dict[str, Any]],
+        socket_bone_names: dict[str, str] | None = None,
+) -> None:
+    """Tag each socket target pose bone with a SocketName custom property.
+
+    ``json/map_import.py``'s ``find_bone_by_socket_name`` already looks for
     this property when resolving a UMAP actor's AttachSocketName against a
     skeletal actor -- it predates this importer and had nothing populating it
     until now, so package-sourced skeletons never resolved a socket attach.
     """
     pose_bones = armature_obj.pose.bones
     for socket in sockets:
-        bone_name = socket.get("boneName")
         socket_name = socket.get("name")
+        bone_name = (socket_bone_names or {}).get(socket_name) or socket.get("boneName")
         if not bone_name or not socket_name:
             continue
         pose_bone = pose_bones.get(bone_name)
@@ -453,59 +500,3 @@ def _build_edit_bones(
                 edit_bone.use_connect = True
 
     return armature_space
-
-
-class FF7R_OT_import_skeleton_json(bpy.types.Operator, ImportHelper):
-    """Build an armature from a Skeleton/SkeletalMesh JSON export"""
-
-    bl_idname = "import_scene.ff7r_rebirth_skeleton_json"
-    bl_label = "Import FF7R Skeleton JSON"
-    bl_description = (
-        "Build an armature matching a game Skeleton's bone hierarchy and bind pose, "
-        "from a bridge skeleton export or a raw FModel Skeleton JSON export"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    filename_ext = ".json"
-    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
-    armature_name: StringProperty(name="Armature Name", default="")
-    scale_factor: FloatProperty(name="Scale", default=0.01, min=0.0001, max=100.0)
-    connect_bones: BoolProperty(
-        name="Connect bones close to their parent's tail",
-        description=(
-            "Move the parent's tail to the imported child head, then enable Blender's "
-            "connected-bone display, preserving the child's original head position"
-        ),
-        default=False,
-    )
-    create_socket_empties: BoolProperty(
-        name="Create socket empties",
-        description=(
-            "Add a bone-parented Empty for each attachment socket, matching what "
-            "the UMAP importer looks for when resolving an actor's AttachSocketName"
-        ),
-        default=True,
-    )
-
-    def execute(self, context):
-        path = Path(self.filepath)
-        try:
-            bones, sockets, source_label = read_skeleton_export(path)
-            armature_obj = build_armature_from_bones(
-                context,
-                self.armature_name.strip() or path.stem,
-                bones,
-                sockets=sockets,
-                scale_factor=self.scale_factor,
-                connect_bones=self.connect_bones,
-                create_socket_empties=self.create_socket_empties,
-            )
-        except Exception as exc:
-            self.report({"ERROR"}, f"Skeleton import failed: {exc}")
-            return {"CANCELLED"}
-        message = f"Imported {len(bones)} bone(s) from {source_label} as '{armature_obj.name}'"
-        if sockets:
-            message += f"; {len(sockets)} socket(s) stored in custom property \"ff7r_sockets\""
-        self.report({"INFO"}, message)
-        print(message)
-        return {"FINISHED"}

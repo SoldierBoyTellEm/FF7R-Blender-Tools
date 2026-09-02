@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -12,16 +12,21 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import bpy
+import numpy as np
 
 from .mec.importer import import_umap_paths
 from .mec.material import image_loader_override
-from .ff7r_json import map_import
+from .mec.parser import offset_opposite_face_geometry, scaled_opposite_face_offset
+from .json import asset_linking, map_import
+from . import rmi_surface
+from .reporting import FF7R_LoggedOperator, report
 from .kdi.drivers import (
     AXIS_ORDER_ITEMS,
     COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
     SWAP_BEND_ST_DESCRIPTION,
     COORDINATE_PROFILE_REFERENCE,
 )
+from .skeleton.importer import _bones_from_bridge, build_armature_from_bones
 
 
 _VIRTUAL_UMAPS: list[str] = []
@@ -34,7 +39,14 @@ _SKELETON_CACHE_KEY: tuple[str, str, str] | None = None
 _VIRTUAL_STATIC_MESHES: list[str] = []
 _VIRTUAL_SKELETAL_MESHES: list[str] = []
 _MESH_CACHE_KEY: tuple[str, str, str] | None = None
+_MESH_CACHE_SOURCE = ""
+_MESH_CACHE_VERSION = 1
+_VIRTUAL_ANIMATIONS: list[str] = []
+_ANIMATION_CACHE_KEY: tuple[str, str, str, str] | None = None
+_NATURAL_PATH_TOKEN = re.compile(r"(\d+)")
+_LAST_UMAP_BROWSER_DIRECTORY = "End/Content/Level/Game/Field"
 KDI_COORDINATE_PROFILE_PROPERTY = "ff7r_kdi_coordinate_profile"
+SKELETON_ASSET_PATH_PROPERTY = "ff7r_skeleton_asset_path"
 DEFAULT_STATIC_MESH_PATH = (
     "End/Content/Environment/Machine/Model/Machine_MagicStore_01A.uasset"
 )
@@ -72,7 +84,6 @@ def _run_bridge(
         asset_path: str = "",
         raw_output: str = "",
         summary: bool = False,
-        needs_mappings: bool = True,
 ) -> dict:
     output_handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     output_path = output_handle.name
@@ -89,12 +100,6 @@ def _run_bridge(
         os.path.abspath(raw_output) if raw_output else "",
         "summary" if summary else "",
     ]
-    if not needs_mappings:
-        # Enumerating virtual paths only reads the mounted pak indices; the .usmap
-        # is used solely to deserialize package properties. Truncating the argument
-        # list here leaves the bridge's usmap argument absent so it skips that load
-        # entirely, and lets the browsers work before a .usmap has been configured.
-        command = command[:6]
     try:
         completed = subprocess.run(
             command,
@@ -150,6 +155,9 @@ def _run_bridge_asset_request(
         raise RuntimeError("The package bridge returned no response while indexing meshes.")
     response = json.loads(response_line)
     if not response.get("ok"):
+        details = response.get("errorDetails")
+        if details:
+            print("[FF7R bridge ERROR] Asset-server request failed:\n" + str(details))
         raise RuntimeError(response.get("error") or "Package mesh indexing failed")
     return response
 
@@ -170,132 +178,119 @@ def _package_config_key(game_root: str, oodle_dll: str, usmap_path: str) -> tupl
     )
 
 
-# Listing an index means mounting ~140 GiB of paks, which dominates the cost and
-# costs the same whether one asset type is being listed or all of them. The result
-# only changes when the game itself is patched, so it is cached on disk and keyed
-# by a fingerprint of the pak files -- making every later cold start a file read
-# rather than a mount. Bump the version to invalidate every cached index.
-# v2: the KDI index widened to include secondary *_KDI_<suffix> assets.
-_INDEX_CACHE_VERSION = 2
+def _mesh_package_signature(game_root: str) -> list[tuple[str, int, int]]:
+    """Small fingerprint of IoStore containers; changes invalidate disk cache."""
+    pak_root = Path(game_root) / "End" / "Content" / "Paks"
+    if not pak_root.is_dir():
+        pak_root = Path(game_root)
+    signature = []
+    for path in pak_root.rglob("*"):
+        if path.suffix.casefold() not in {".utoc", ".ucas"}:
+            continue
+        try:
+            stat = path.stat()
+            signature.append((
+                path.relative_to(pak_root).as_posix().casefold(),
+                stat.st_size,
+                stat.st_mtime_ns,
+            ))
+        except OSError:
+            continue
+    return sorted(signature)
 
 
-def _pak_signature(game_root: str) -> str | None:
-    """Fingerprint the mounted paks. Cheap (~3 ms for Rebirth's 153 files)."""
-    pak_directory = os.path.join(game_root, "End", "Content", "Paks")
-    if not os.path.isdir(pak_directory):
-        pak_directory = game_root
-    entries: list[str] = []
+def _mesh_disk_cache_path(cache_key: tuple[str, str, str]) -> Path | None:
     try:
-        for root, _directories, names in os.walk(pak_directory):
-            for name in names:
-                try:
-                    stat = os.stat(os.path.join(root, name))
-                except OSError:
-                    continue
-                entries.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
-    except OSError:
-        return None
-    if not entries:
-        return None
-    entries.sort()
-    return hashlib.sha1("\n".join(entries).encode("utf-8")).hexdigest()
-
-
-def _index_cache_file() -> Path | None:
-    try:
-        directory = bpy.utils.user_resource("DATAFILES", path="ff7r_rebirth_tools", create=True)
+        cache_root = bpy.utils.user_resource('CONFIG')
+        if not cache_root:
+            return None
+        cache_root = Path(cache_root) / "ff7r_rebirth_tools"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_id = hashlib.sha256("\0".join(cache_key).encode("utf-8")).hexdigest()[:20]
+        return cache_root / f"mesh_index_{cache_id}.json"
     except Exception:
         return None
-    return Path(directory) / "package_index_cache.json" if directory else None
 
 
-def _load_disk_index(kind: str, signature: str | None) -> list[str] | None:
-    """Return a previously cached index, or None if absent or stale."""
-    if not signature:
-        return None
-    path = _index_cache_file()
-    if path is None or not path.is_file():
+def _natural_path_key(path: str) -> tuple[tuple[int, int | str], ...]:
+    """Case-insensitive path key that orders numeric runs numerically.
+
+    Game mesh names commonly encode an outfit/variation as ``_00``, ``_04``,
+    and so on. Plain string ordering can be lost again in Blender's search
+    popup, so use this key both for the cached index and its returned matches.
+    """
+    return tuple(
+        (0, int(part)) if part.isdecimal() else (1, part.casefold())
+        for part in _NATURAL_PATH_TOKEN.split(path)
+        if part
+    )
+
+
+def _load_mesh_disk_cache(
+        cache_path: Path | None,
+        cache_key: tuple[str, str, str],
+        package_signature: list[tuple[str, int, int]],
+) -> tuple[list[str], list[str]] | None:
+    if cache_path is None or not cache_path.is_file():
         return None
     try:
-        with open(path, encoding="utf-8") as stream:
-            cache = json.load(stream)
-    except (OSError, ValueError):
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if (payload.get("version") != _MESH_CACHE_VERSION or
+                tuple(payload.get("config") or []) != cache_key or
+                payload.get("packageSignature") != [list(item) for item in package_signature]):
+            return None
+        static_meshes = payload.get("staticMeshes")
+        skeletal_meshes = payload.get("skeletalMeshes")
+        if not isinstance(static_meshes, list) or not isinstance(skeletal_meshes, list):
+            return None
+        return (
+            sorted((str(path) for path in static_meshes), key=_natural_path_key),
+            sorted((str(path) for path in skeletal_meshes), key=_natural_path_key),
+        )
+    except (OSError, ValueError, TypeError):
         return None
-    if cache.get("version") != _INDEX_CACHE_VERSION or cache.get("signature") != signature:
-        return None
-    cached = cache.get("indices", {}).get(kind)
-    return cached if isinstance(cached, list) else None
 
 
-def _store_disk_index(kind: str, signature: str | None, paths: list[str]) -> None:
-    """Cache one index. A stale signature drops every other kind with it."""
-    if not signature:
+def _save_mesh_disk_cache(
+        cache_path: Path | None,
+        cache_key: tuple[str, str, str],
+        package_signature: list[tuple[str, int, int]],
+        static_meshes: list[str],
+        skeletal_meshes: list[str],
+) -> None:
+    if cache_path is None:
         return
-    path = _index_cache_file()
-    if path is None:
-        return
-    cache = {"version": _INDEX_CACHE_VERSION, "signature": signature, "indices": {}}
-    if path.is_file():
-        try:
-            with open(path, encoding="utf-8") as stream:
-                existing = json.load(stream)
-            if (existing.get("version") == _INDEX_CACHE_VERSION
-                    and existing.get("signature") == signature
-                    and isinstance(existing.get("indices"), dict)):
-                cache["indices"] = existing["indices"]
-        except (OSError, ValueError):
-            pass
-    cache["indices"][kind] = paths
     try:
-        # Write via a sibling temp file so an interrupted write cannot leave a
-        # truncated cache that later reads would treat as authoritative.
-        temporary = path.with_suffix(".json.tmp")
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump(cache, stream)
-        os.replace(temporary, path)
-    except OSError:
-        pass
+        payload = {
+            "version": _MESH_CACHE_VERSION,
+            "config": list(cache_key),
+            "packageSignature": [list(item) for item in package_signature],
+            "staticMeshes": static_meshes,
+            "skeletalMeshes": skeletal_meshes,
+        }
+        temporary_path = cache_path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary_path, cache_path)
+    except OSError as exc:
+        print(f"Package mesh index could not be saved to disk: {exc}")
 
 
-def _search_virtual_paths(paths: list[str], edit_text: str, empty_limit=256, result_limit=512):
+def _search_virtual_paths(
+        paths: list[str],
+        edit_text: str,
+        empty_limit=256,
+        result_limit=512,
+        *,
+        sort_key=str.casefold,
+):
     query = edit_text.casefold().replace("\\", "/").strip()
     if not query:
-        return paths[:empty_limit]
+        return sorted(paths, key=sort_key)[:empty_limit]
     terms = query.split()
-    return [path for path in paths if all(term in path.casefold() for term in terms)][:result_limit]
-
-
-def _build_index(
-        kind: str,
-        game_root: str,
-        oodle_dll: str,
-        usmap_path: str,
-        path_filter: str,
-        keep,
-        force: bool,
-) -> list[str]:
-    """Return the virtual paths for one asset kind, cheapest source first.
-
-    Falls back through the on-disk cache before paying for a pak mount, and
-    stores whatever it had to build. Listing never needs type mappings, so the
-    bridge is told to skip loading the .usmap.
-    """
-    signature = _pak_signature(game_root)
-    if not force:
-        cached = _load_disk_index(kind, signature)
-        if cached is not None:
-            return cached
-    result = _run_bridge(
-        game_root, oodle_dll, usmap_path,
-        path_filter=path_filter,
-        needs_mappings=False,
-    )
-    paths = [
-        path for path in result.get("files", [])
-        if keep(path) and "/autogencollision/" not in path.replace("\\", "/").casefold()
-    ]
-    _store_disk_index(kind, signature, paths)
-    return paths
+    return sorted(
+        (path for path in paths if all(term in path.casefold() for term in terms)),
+        key=sort_key,
+    )[:result_limit]
 
 
 def refresh_umap_index(game_root: str, oodle_dll: str, usmap_path: str, *, force=False) -> list[str]:
@@ -303,13 +298,30 @@ def refresh_umap_index(game_root: str, oodle_dll: str, usmap_path: str, *, force
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _CACHE_KEY:
-        _VIRTUAL_UMAPS = _build_index(
-            "umap", game_root, oodle_dll, usmap_path, ".umap",
-            lambda path: path.lower().endswith(".umap"),
-            force,
+        result = _run_bridge(
+            game_root,
+            oodle_dll,
+            usmap_path,
+            path_filter=".umap",
         )
+        _VIRTUAL_UMAPS = sorted((
+            path for path in result.get("files", [])
+            if path.lower().endswith(".umap")
+            and "/autogencollision/" not in path.replace("\\", "/").casefold()
+        ), key=str.casefold)
         _CACHE_KEY = cache_key
     return _VIRTUAL_UMAPS
+
+
+# A character's KineDriver rig can span several assets: the main pre-physics
+# ``<stem>_KDI.uasset`` plus optional secondary passes named ``<stem>_KDI_<suffix>``
+# -- Extra1, Head, Hood, StBody, StHair, Extra_Hand are the suffixes Rebirth ships.
+# Per a third-party UE4SS capture of the KBD asset user data, the ``_Extra1`` pass is
+# the game's *post-physics* KineDriver list (it runs after Bonamik, which this add-on
+# does not simulate), so treat these as a best-effort extra layer rather than an
+# exact reproduction of the in-game result.
+# The suffix may itself contain underscores (Rebirth ships _KDI_Extra_Hand).
+_KDI_ASSET_PATTERN = re.compile(r"_KDI(_[A-Za-z0-9_]+)?\.uasset$", re.IGNORECASE)
 
 
 def refresh_kdi_index(game_root: str, oodle_dll: str, usmap_path: str, *, force=False) -> list[str]:
@@ -317,11 +329,16 @@ def refresh_kdi_index(game_root: str, oodle_dll: str, usmap_path: str, *, force=
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _KDI_CACHE_KEY:
-        _VIRTUAL_KDIS = _build_index(
-            "kdi", game_root, oodle_dll, usmap_path, "_KDI",
-            lambda path: _KDI_ASSET_PATTERN.search(os.path.basename(path)) is not None,
-            force,
+        result = _run_bridge(
+            game_root, oodle_dll, usmap_path,
+            path_filter="_KDI",
         )
+        _VIRTUAL_KDIS = sorted((
+            path for path in result.get("files", [])
+            if path.lower().endswith(".uasset")
+            and _KDI_ASSET_PATTERN.search(os.path.basename(path)) is not None
+            and "/autogencollision/" not in path.replace("\\", "/").casefold()
+        ), key=str.casefold)
         _KDI_CACHE_KEY = cache_key
     return _VIRTUAL_KDIS
 
@@ -335,11 +352,16 @@ def refresh_skeleton_index(game_root: str, oodle_dll: str, usmap_path: str, *, f
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _SKELETON_CACHE_KEY:
-        _VIRTUAL_SKELETONS = _build_index(
-            "skeleton", game_root, oodle_dll, usmap_path, "_Skeleton",
-            lambda path: os.path.basename(path).lower().endswith("_skeleton.uasset"),
-            force,
+        result = _run_bridge(
+            game_root, oodle_dll, usmap_path,
+            path_filter="_Skeleton",
         )
+        _VIRTUAL_SKELETONS = sorted((
+            path for path in result.get("files", [])
+            if path.lower().endswith(".uasset")
+            and os.path.basename(path).lower().endswith("_skeleton.uasset")
+            and "/autogencollision/" not in path.replace("\\", "/").casefold()
+        ), key=str.casefold)
         _SKELETON_CACHE_KEY = cache_key
     return _VIRTUAL_SKELETONS
 
@@ -352,33 +374,104 @@ def refresh_mesh_indices(
         game_root: str, oodle_dll: str, usmap_path: str, *, force=False
 ) -> tuple[list[str], list[str]]:
     """Index actual Unreal StaticMesh/SkeletalMesh export classes for the pickers."""
-    global _VIRTUAL_STATIC_MESHES, _VIRTUAL_SKELETAL_MESHES, _MESH_CACHE_KEY
+    global _VIRTUAL_STATIC_MESHES, _VIRTUAL_SKELETAL_MESHES, _MESH_CACHE_KEY, _MESH_CACHE_SOURCE
     _validate_paths(game_root, oodle_dll, usmap_path)
     cache_key = _package_config_key(game_root, oodle_dll, usmap_path)
     if force or cache_key != _MESH_CACHE_KEY:
-        # Models hold the game mesh assets and keep the one-time initial index practical.
-        result = _run_bridge_asset_request(
-            game_root,
-            oodle_dll,
-            usmap_path,
-            {"action": "mesh_index", "pathFilter": "/Model/"},
+        package_signature = _mesh_package_signature(game_root)
+        cache_path = _mesh_disk_cache_path(cache_key)
+        disk_cache = None if force else _load_mesh_disk_cache(
+            cache_path, cache_key, package_signature
         )
-        mesh_index = result.get("meshIndex") or {}
-        _VIRTUAL_STATIC_MESHES = sorted(mesh_index.get("staticMeshes") or [])
-        _VIRTUAL_SKELETAL_MESHES = sorted(mesh_index.get("skeletalMeshes") or [])
-        failures = mesh_index.get("failures") or []
-        if failures:
-            print(f"Package mesh index skipped {len(failures):,} unreadable package(s).")
+        if disk_cache is not None:
+            _VIRTUAL_STATIC_MESHES, _VIRTUAL_SKELETAL_MESHES = disk_cache
+            _MESH_CACHE_SOURCE = "disk cache"
+        else:
+            # Models hold the game mesh assets and keep the one-time initial index practical.
+            result = _run_bridge_asset_request(
+                game_root,
+                oodle_dll,
+                usmap_path,
+                {"action": "mesh_index", "pathFilter": "/Model/"},
+            )
+            mesh_index = result.get("meshIndex") or {}
+            _VIRTUAL_STATIC_MESHES = sorted(
+                mesh_index.get("staticMeshes") or [], key=_natural_path_key
+            )
+            _VIRTUAL_SKELETAL_MESHES = sorted(
+                mesh_index.get("skeletalMeshes") or [], key=_natural_path_key
+            )
+            failures = mesh_index.get("failures") or []
+            if failures:
+                print(f"Package mesh index skipped {len(failures):,} unreadable package(s).")
+            _save_mesh_disk_cache(
+                cache_path, cache_key, package_signature,
+                _VIRTUAL_STATIC_MESHES, _VIRTUAL_SKELETAL_MESHES,
+            )
+            _MESH_CACHE_SOURCE = "fresh package scan"
         _MESH_CACHE_KEY = cache_key
     return _VIRTUAL_STATIC_MESHES, _VIRTUAL_SKELETAL_MESHES
 
 
 def _search_virtual_static_meshes(_self, _context, edit_text):
-    return _search_virtual_paths(_VIRTUAL_STATIC_MESHES, edit_text)
+    return _search_virtual_paths(
+        _VIRTUAL_STATIC_MESHES, edit_text, sort_key=_natural_path_key
+    )
 
 
 def _search_virtual_skeletal_meshes(_self, _context, edit_text):
-    return _search_virtual_paths(_VIRTUAL_SKELETAL_MESHES, edit_text)
+    return _search_virtual_paths(
+        _VIRTUAL_SKELETAL_MESHES, edit_text, sort_key=_natural_path_key
+    )
+
+
+def refresh_animation_index(
+        game_root: str,
+        oodle_dll: str,
+        usmap_path: str,
+        skeleton_asset_path: str,
+        *,
+        force=False,
+) -> list[str]:
+    """Find AnimSequence assets explicitly linked to one game Skeleton."""
+    global _VIRTUAL_ANIMATIONS, _ANIMATION_CACHE_KEY
+    _validate_paths(game_root, oodle_dll, usmap_path)
+    skeleton_asset_path = skeleton_asset_path.replace("\\", "/").lstrip("/")
+    cache_key = (*_package_config_key(game_root, oodle_dll, usmap_path), skeleton_asset_path.casefold())
+    if force or cache_key != _ANIMATION_CACHE_KEY:
+        # Animation packages are distributed through field, battle, and cutscene
+        # folders, but character clips consistently carry the Skeleton's family
+        # token (for example PC0000_00) in their virtual path.  This is much
+        # faster than deserializing the complete game on every armature click.
+        skeleton_stem = Path(skeleton_asset_path).stem
+        search_token = re.sub(r"_Skeleton$", "", skeleton_stem, flags=re.IGNORECASE)
+        response = _run_bridge_asset_request(
+            game_root,
+            oodle_dll,
+            usmap_path,
+            {
+                "action": "animation_index",
+                "skeletonAssetPath": skeleton_asset_path,
+                "searchToken": search_token,
+            },
+        )
+        index = response.get("animationIndex") or {}
+        _VIRTUAL_ANIMATIONS = sorted({
+            str(item.get("assetPath"))
+            for item in (index.get("animations") or [])
+            if isinstance(item, dict) and item.get("assetPath")
+        }, key=_natural_path_key)
+        failures = int(index.get("failures") or 0)
+        if failures:
+            print(f"Package animation index skipped {failures:,} unreadable package(s).")
+        _ANIMATION_CACHE_KEY = cache_key
+    return _VIRTUAL_ANIMATIONS
+
+
+def _search_virtual_animations(_self, _context, edit_text):
+    return _search_virtual_paths(
+        _VIRTUAL_ANIMATIONS, edit_text, sort_key=_natural_path_key
+    )
 
 
 def _entry_selection_changed(entry, _context):
@@ -414,24 +507,6 @@ class FF7R_PG_package_browser_state(bpy.types.PropertyGroup):
 
 def _browser_state(context):
     return context.window_manager.ff7r_package_browser
-
-
-def _highlighted_umap(context) -> str | None:
-    """The UMAP row the browser list is currently sitting on, if it is a file.
-
-    Used as a fallback when nothing has been ticked, so that pointing at a single
-    map and hitting OK does the obvious thing instead of erroring out.
-    """
-    try:
-        state = _browser_state(context)
-    except AttributeError:
-        return None
-    if not 0 <= state.active_index < len(state.entries):
-        return None
-    entry = state.entries[state.active_index]
-    if entry.is_directory or not entry.virtual_path:
-        return None
-    return entry.virtual_path
 
 
 def _populate_browser(context) -> None:
@@ -489,37 +564,41 @@ class FF7R_UL_package_umaps(bpy.types.UIList):
             row.label(text=item.display_name, icon='FILE')
 
 
-class FF7R_REBIRTH_OT_package_browser_folder(bpy.types.Operator):
+class FF7R_REBIRTH_OT_package_browser_folder(FF7R_LoggedOperator):
     bl_idname = "wm.ff7r_rebirth_package_folder"
     bl_label = "Open Package Folder"
     bl_options = {'INTERNAL'}
     virtual_path: bpy.props.StringProperty()
 
     def execute(self, context):
+        global _LAST_UMAP_BROWSER_DIRECTORY
         state = _browser_state(context)
         state.current_directory = self.virtual_path.strip("/") or "End/Content"
+        _LAST_UMAP_BROWSER_DIRECTORY = state.current_directory
         state.filter_text = ""
         _populate_browser(context)
         return {'FINISHED'}
 
 
-class FF7R_REBIRTH_OT_package_browser_up(bpy.types.Operator):
+class FF7R_REBIRTH_OT_package_browser_up(FF7R_LoggedOperator):
     bl_idname = "wm.ff7r_rebirth_package_up"
     bl_label = "Parent Folder"
     bl_options = {'INTERNAL'}
 
     def execute(self, context):
+        global _LAST_UMAP_BROWSER_DIRECTORY
         state = _browser_state(context)
         parent = state.current_directory.rstrip("/").rsplit("/", 1)[0]
         state.current_directory = (
             parent if parent.casefold().startswith("end/content") else "End/Content"
         )
+        _LAST_UMAP_BROWSER_DIRECTORY = state.current_directory
         state.filter_text = ""
         _populate_browser(context)
         return {'FINISHED'}
 
 
-class FF7R_REBIRTH_OT_package_browser_select(bpy.types.Operator):
+class FF7R_REBIRTH_OT_package_browser_select(FF7R_LoggedOperator):
     bl_idname = "wm.ff7r_rebirth_package_select"
     bl_label = "Change Package Selection"
     bl_options = {'INTERNAL'}
@@ -575,6 +654,24 @@ def _game_asset_path_to_virtual_umap(asset_path: str) -> str | None:
     return "End/Content/" + package_path[6:] + ".umap"
 
 
+def _game_asset_path_to_virtual_uasset(asset_path: str) -> str | None:
+    """Convert a UE ObjectName such as StaticMesh'/Game/A/B.B' to a package path."""
+    if not isinstance(asset_path, str):
+        return None
+    path = asset_path.strip().strip("'")
+    if "'" in path:
+        parts = path.split("'", 2)
+        if len(parts) >= 2:
+            path = parts[1]
+    path = path.split(":", 1)[0].strip()
+    package_path = path.split(".", 1)[0]
+    if package_path.casefold().startswith("/game/"):
+        return "End/Content/" + package_path[6:] + ".uasset"
+    if package_path.casefold().startswith("/engine/"):
+        return "Engine/Content/" + package_path[8:] + ".uasset"
+    return None
+
+
 class PackageAssetSession:
     """Keep CUE4Parse mounted for a complete multi-asset import batch."""
 
@@ -586,6 +683,7 @@ class PackageAssetSession:
         self.usmap_path = usmap_path
         self.process = None
         self.cache: dict[str, bpy.types.Image | None] = {}
+        self.material_cache: dict[str, dict] = {}
         self.loaded = 0
         self.failed = 0
 
@@ -678,8 +776,19 @@ class PackageAssetSession:
     def skeleton_asset(self, asset_path: str) -> dict:
         return self.request({"action": "skeleton", "assetPath": asset_path}).get("skeleton") or {}
 
+    def animation_asset(self, asset_path: str) -> dict:
+        return self.request({"action": "animation", "assetPath": asset_path}).get("animation") or {}
+
     def static_mesh(self, asset_path: str) -> dict:
         return self.request({"action": "static_mesh", "assetPath": asset_path}).get("staticMesh") or {}
+
+    def material_instance(self, asset_path: str) -> dict:
+        cache_key = asset_path.casefold()
+        if cache_key not in self.material_cache:
+            self.material_cache[cache_key] = self.request(
+                {"action": "material", "assetPath": asset_path}
+            ).get("material") or {}
+        return self.material_cache[cache_key]
 
     def skeletal_mesh(self, asset_path: str) -> dict:
         return self.request({"action": "skeletal_mesh", "assetPath": asset_path}).get("skeletalMesh") or {}
@@ -769,6 +878,8 @@ def import_static_mesh_asset(
         virtual_path: str,
         *,
         scale_factor: float = 0.01,
+        offset_opposite_faces: bool = False,
+        material_session: PackageAssetSession | None = None,
 ):
     """Build one Blender mesh from the bridge's selected Rebirth static-mesh LOD."""
     positions = static_mesh.get("positions") or []
@@ -788,27 +899,41 @@ def import_static_mesh_asset(
         raise ValueError("The package bridge returned an out-of-range mesh index.")
 
     mesh_name = static_mesh.get("name") or Path(virtual_path).stem
-    vertices = [
+    vertices = np.asarray([
         (float(value[0]) * scale_factor,
          -float(value[1]) * scale_factor,
          float(value[2]) * scale_factor)
         for value in positions
-    ]
-    faces = [tuple(indices[offset:offset + 3]) for offset in range(0, len(indices), 3)]
+    ], dtype=np.float32)
+    faces = np.asarray(indices, dtype=np.int32).reshape(-1, 3)
+    converted_normals = np.asarray([
+        (float(value[0]), -float(value[1]), float(value[2]))
+        for value in normals
+    ], dtype=np.float32)
+    offset_count = 0
+    if offset_opposite_faces:
+        offset_count = offset_opposite_face_geometry(
+            vertices,
+            converted_normals,
+            faces,
+            offset=scaled_opposite_face_offset(scale_factor),
+        )
+        if offset_count:
+            print(f"  {mesh_name}: offset {offset_count} opposite-face vertices")
     mesh = bpy.data.meshes.new(mesh_name)
     obj = None
     try:
-        mesh.from_pydata(vertices, [], faces)
+        mesh.from_pydata(vertices.tolist(), [], faces.tolist())
         mesh.update()
+        if offset_opposite_faces:
+            # Store this on the datablock because UMAP actors reuse it after the
+            # temporary source object has been removed.
+            mesh["ff7r_opposite_face_offset_vertices"] = offset_count
         for polygon in mesh.polygons:
             polygon.use_smooth = True
 
-        converted_normals = [
-            (float(value[0]), -float(value[1]), float(value[2]))
-            for value in normals
-        ]
         if hasattr(mesh, "normals_split_custom_set_from_vertices"):
-            mesh.normals_split_custom_set_from_vertices(converted_normals)
+            mesh.normals_split_custom_set_from_vertices(converted_normals.tolist())
 
         for channel_index, channel in enumerate(uv_channels):
             # Preserve the names used by Rebirth material parameters, e.g.
@@ -883,6 +1008,26 @@ def import_static_mesh_asset(
             selected.select_set(False)
         obj.select_set(True)
         context.view_layer.objects.active = obj
+        if material_session is not None:
+            for material_index, section in enumerate(material_specs):
+                section = section or {}
+                material_path = section.get("materialPath") or ""
+                material_asset = _game_asset_path_to_virtual_uasset(material_path)
+                if not material_asset:
+                    continue
+                try:
+                    material_data = material_session.material_instance(material_asset)
+                    material = rmi_surface.build_material(
+                        section.get("materialName") or f"Material_{material_index}",
+                        material_path,
+                        material_data,
+                        material_session,
+                    )
+                    if material is not None:
+                        mesh.materials[material_index] = material
+                except Exception as exc:
+                    # Surface material failures must never discard imported mesh data.
+                    print(f"  Warning: RMI material '{material_path}' could not be built: {exc}")
         return obj
     except Exception:
         if obj is not None:
@@ -892,6 +1037,49 @@ def import_static_mesh_asset(
         raise
 
 
+class PackageStaticMeshResolver:
+    """Build each game StaticMesh once, then hand its shared mesh datablock to UMAP actors."""
+
+    def __init__(
+            self,
+            context,
+            session: PackageAssetSession,
+            scale_factor: float,
+            *,
+            offset_opposite_faces: bool = False,
+    ):
+        self.context = context
+        self.session = session
+        self.scale_factor = scale_factor
+        self.offset_opposite_faces = offset_opposite_faces
+        self._mesh_cache: dict[str, bpy.types.Mesh] = {}
+
+    def __call__(self, asset_path: str):
+        virtual_path = _game_asset_path_to_virtual_uasset(asset_path)
+        if virtual_path is None:
+            raise ValueError(f"Unsupported StaticMesh game path: {asset_path!r}")
+
+        cache_key = virtual_path.casefold()
+        mesh = self._mesh_cache.get(cache_key)
+        if mesh is not None:
+            return mesh
+
+        static_mesh = self.session.static_mesh(virtual_path)
+        source_obj = import_static_mesh_asset(
+            self.context,
+            static_mesh,
+            virtual_path,
+            scale_factor=self.scale_factor,
+            offset_opposite_faces=self.offset_opposite_faces,
+            material_session=self.session,
+        )
+        mesh = source_obj.data
+        bpy.data.objects.remove(source_obj, do_unlink=True)
+        mesh["ff7r_virtual_path"] = virtual_path
+        self._mesh_cache[cache_key] = mesh
+        return mesh
+
+
 def import_skeletal_mesh_asset(
         context,
         skeletal_mesh: dict,
@@ -899,13 +1087,24 @@ def import_skeletal_mesh_asset(
         *,
         armature_obj=None,
         scale_factor: float = 0.01,
+        offset_opposite_faces: bool = False,
+        material_session: PackageAssetSession | None = None,
 ):
-    """Build a Rebirth SkeletalMesh and transfer its section-local bone weights."""
+    """Build a Rebirth SkeletalMesh and transfer its section-local bone weights.
+
+    `material_session` is forwarded untouched to the StaticMesh importer, which
+    is where RMI_Surface materials are actually built.  The bridge fills in each
+    section's `materialName`/`materialPath` for a SkeletalMesh exactly as it
+    does for a StaticMesh (SkeletalMaterials vs StaticMaterials), so the two
+    paths need no separate material handling -- passing the session is the whole
+    difference between textured and placeholder characters."""
     obj = import_static_mesh_asset(
         context,
         skeletal_mesh,
         virtual_path,
         scale_factor=scale_factor,
+        offset_opposite_faces=offset_opposite_faces,
+        material_session=material_session,
     )
     bone_names = skeletal_mesh.get("boneNames") or []
     weights = skeletal_mesh.get("weights") or []
@@ -963,7 +1162,89 @@ def import_skeletal_mesh_asset(
         raise
 
 
-class FF7R_REBIRTH_OT_import_static_mesh_game_packages(bpy.types.Operator):
+class PackageSkeletalMeshResolver:
+    """Build each game Skeleton+SkeletalMesh once, wrapped as a collection UMAP actors can instance.
+
+    Mirrors ``PackageStaticMeshResolver``, but a skeletal mesh needs its own
+    armature object per placement (vertex groups and the Armature modifier
+    live on the object, not the mesh datablock) rather than a single shared
+    mesh. The built mesh+armature pair is parked in a private, unlinked
+    collection and handed back as a ``LinkedAsset`` of kind "COLLECTION" --
+    the same shape ``find_or_load_asset_cached`` returns for a .blend rig --
+    so the package map actor builder can instance it with its existing collection-
+    instancing path unchanged. Instances stay in the mesh's bind pose; no
+    per-placement animation/pose data is available from the package.
+    """
+
+    def __init__(
+            self,
+            context,
+            session: PackageAssetSession,
+            scale_factor: float,
+            *,
+            offset_opposite_faces: bool = False,
+    ):
+        self.context = context
+        self.session = session
+        self.scale_factor = scale_factor
+        self.offset_opposite_faces = offset_opposite_faces
+        self._asset_cache: dict[str, asset_linking.LinkedAsset] = {}
+
+    def __call__(self, asset_path: str) -> asset_linking.LinkedAsset:
+        virtual_path = _game_asset_path_to_virtual_uasset(asset_path)
+        if virtual_path is None:
+            raise ValueError(f"Unsupported SkeletalMesh game path: {asset_path!r}")
+
+        cache_key = virtual_path.casefold()
+        asset = self._asset_cache.get(cache_key)
+        if asset is not None:
+            return asset
+
+        skeletal_mesh = self.session.skeletal_mesh(virtual_path)
+        skeleton_path = skeletal_mesh.get("skeletonPath")
+        armature_obj = None
+        if skeleton_path:
+            try:
+                skeleton = self.session.skeleton_asset(skeleton_path)
+                if skeleton.get("bones"):
+                    armature_obj = build_armature_from_bones(
+                        self.context,
+                        skeleton.get("name") or Path(skeleton_path).stem,
+                        _bones_from_bridge(skeleton),
+                        skeleton.get("sockets") or [],
+                        scale_factor=self.scale_factor,
+                        create_socket_empties=False,
+                        create_socket_bones=True,
+                    )
+                    armature_obj[SKELETON_ASSET_PATH_PROPERTY] = skeleton_path
+            except Exception as exc:
+                print(f"  Warning: Skeleton for '{virtual_path}' could not be built: {exc}")
+                armature_obj = None
+
+        mesh_obj, _weighted_vertices, _influence_count = import_skeletal_mesh_asset(
+            self.context,
+            skeletal_mesh,
+            virtual_path,
+            armature_obj=armature_obj,
+            scale_factor=self.scale_factor,
+            offset_opposite_faces=self.offset_opposite_faces,
+            material_session=self.session,
+        )
+
+        collection = bpy.data.collections.new(f"{mesh_obj.name}_PkgSource")
+        for obj in (armature_obj, mesh_obj):
+            if obj is None:
+                continue
+            for existing_collection in list(obj.users_collection):
+                existing_collection.objects.unlink(obj)
+            collection.objects.link(obj)
+
+        asset = asset_linking.LinkedAsset(kind="COLLECTION", datablock=collection)
+        self._asset_cache[cache_key] = asset
+        return asset
+
+
+class FF7R_REBIRTH_OT_import_static_mesh_game_packages(FF7R_LoggedOperator):
     bl_idname = "import_scene.ff7r_rebirth_static_mesh_game_packages"
     bl_label = "Static Mesh from Rebirth Packages"
     bl_description = "Import a Rebirth StaticMesh directly from its mounted virtual package path"
@@ -974,7 +1255,7 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(bpy.types.Operator):
         description="Mounted Unreal virtual path to an indexed StaticMesh .uasset",
         default=DEFAULT_STATIC_MESH_PATH,
         search=_search_virtual_static_meshes,
-        search_options={'SORT'},
+        search_options={'SUGGESTION'},
     )
     scale_factor: bpy.props.FloatProperty(
         name="Scale",
@@ -983,12 +1264,21 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(bpy.types.Operator):
         min=0.0001,
         max=100.0,
     )
+    offset_opposite_faces: bpy.props.BoolProperty(
+        name="Offset opposite overlapping faces",
+        description=(
+            "Directly offset vertices on coincident opposite-facing faces to reduce "
+            "z-fighting; no modifiers or material changes"
+        ),
+        default=False,
+    )
 
     def invoke(self, context, _event):
         prefs = _preferences(context)
         if prefs is None:
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
+        self.offset_opposite_faces = prefs.offset_mec_opposite_faces
         try:
             refresh_mesh_indices(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1004,7 +1294,11 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, "virtual_path", icon='PACKAGE')
         layout.prop(self, "scale_factor")
-        layout.label(text=f"{len(_VIRTUAL_STATIC_MESHES):,} StaticMesh assets indexed", icon='PACKAGE')
+        layout.prop(self, "offset_opposite_faces")
+        layout.label(
+            text=f"{len(_VIRTUAL_STATIC_MESHES):,} StaticMesh assets indexed ({_MESH_CACHE_SOURCE or 'memory'})",
+            icon='PACKAGE',
+        )
         layout.label(text="Supports updated flattened meshes and earlier conventional layouts.")
 
     def execute(self, context):
@@ -1022,12 +1316,14 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(bpy.types.Operator):
                 raise ValueError("Choose a StaticMesh from the package search results.")
             with PackageAssetSession(game_root, oodle_dll, usmap_path) as session:
                 static_mesh = session.static_mesh(virtual_path)
-            obj = import_static_mesh_asset(
-                context,
-                static_mesh,
-                virtual_path,
-                scale_factor=self.scale_factor,
-            )
+                obj = import_static_mesh_asset(
+                    context,
+                    static_mesh,
+                    virtual_path,
+                    scale_factor=self.scale_factor,
+                    offset_opposite_faces=self.offset_opposite_faces,
+                    material_session=session,
+                )
         except Exception as exc:
             self.report({'ERROR'}, f"Package StaticMesh import failed: {exc}")
             return {'CANCELLED'}
@@ -1039,7 +1335,7 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
+class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
     bl_idname = "import_scene.ff7r_rebirth_skeletal_mesh_game_packages"
     bl_label = "Skeletal Mesh from Rebirth Packages"
     bl_description = "Import a Rebirth SkeletalMesh and bind it to the selected armature"
@@ -1048,9 +1344,9 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
     virtual_path: bpy.props.StringProperty(
         name="Skeletal Mesh Path",
         description="Mounted Unreal virtual path to an indexed SkeletalMesh .uasset",
-        default="End/Content/Character/Player/PC0004_00_RedXIII_Standard/Model/PC0004_00.uasset",
+        default="",
         search=_search_virtual_skeletal_meshes,
-        search_options={'SORT'},
+        search_options={'SUGGESTION'},
     )
     scale_factor: bpy.props.FloatProperty(
         name="Scale",
@@ -1059,9 +1355,39 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
         min=0.0001,
         max=100.0,
     )
+    offset_opposite_faces: bpy.props.BoolProperty(
+        name="Offset opposite overlapping faces",
+        description=(
+            "Directly offset vertices on coincident opposite-facing faces to reduce "
+            "z-fighting; no modifiers or material changes"
+        ),
+        default=False,
+    )
     bind_active_armature: bpy.props.BoolProperty(
         name="Bind Active Armature",
         description="Add matching vertex groups and an Armature modifier for the active armature",
+        default=True,
+    )
+    build_skeleton: bpy.props.BoolProperty(
+        name="Build Skeleton from Package",
+        description=(
+            "Ignore Bind Active Armature and build a new armature from this mesh's "
+            "associated Skeleton asset before importing, exactly as the Skeleton "
+            "importer would"
+        ),
+        default=True,
+    )
+    import_socket_bones: bpy.props.BoolProperty(
+        name="Import attachment sockets as hidden non-deform bones",
+        description=(
+            "When building the associated Skeleton, use a hidden Sockets bone collection "
+            "instead of creating socket Empty objects"
+        ),
+        default=False,
+    )
+    import_kdi: bpy.props.BoolProperty(
+        name="Also import KDI",
+        description="After building the skeleton, also import its KineDriver rig (and any secondary passes)",
         default=True,
     )
 
@@ -1070,6 +1396,7 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
         if prefs is None:
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
+        self.offset_opposite_faces = prefs.offset_mec_opposite_faces
         try:
             refresh_mesh_indices(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1085,9 +1412,23 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, "virtual_path", icon='PACKAGE')
         layout.prop(self, "scale_factor")
-        layout.prop(self, "bind_active_armature")
-        layout.label(text=f"{len(_VIRTUAL_SKELETAL_MESHES):,} SkeletalMesh assets indexed", icon='PACKAGE')
-        layout.label(text="Imports Coordinate0–Coordinate3 and per-vertex bone weights.")
+        layout.prop(self, "offset_opposite_faces")
+        bind_row = layout.row()
+        bind_row.enabled = not self.build_skeleton
+        bind_row.prop(self, "bind_active_armature")
+        layout.prop(self, "build_skeleton")
+        socket_row = layout.row()
+        socket_row.enabled = self.build_skeleton
+        socket_row.prop(self, "import_socket_bones")
+        kdi_row = layout.row()
+        kdi_row.enabled = self.build_skeleton
+        kdi_row.prop(self, "import_kdi")
+        layout.label(
+            text=f"{len(_VIRTUAL_SKELETAL_MESHES):,} SkeletalMesh assets indexed ({_MESH_CACHE_SOURCE or 'memory'})",
+            icon='PACKAGE',
+        )
+        layout.label(text="Imports Coordinate0–Coordinate3, per-vertex bone weights, "
+                          "and RMI_Surface materials.")
 
     def execute(self, context):
         prefs = _preferences(context)
@@ -1095,8 +1436,8 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
         virtual_path = self.virtual_path.strip().replace("\\", "/").lstrip("/")
-        armature_obj = context.active_object if self.bind_active_armature else None
-        if self.bind_active_armature and (armature_obj is None or armature_obj.type != 'ARMATURE'):
+        armature_obj = context.active_object if (self.bind_active_armature and not self.build_skeleton) else None
+        if self.bind_active_armature and not self.build_skeleton and (armature_obj is None or armature_obj.type != 'ARMATURE'):
             self.report({'ERROR'}, "Select the matching armature before importing, or disable Bind Active Armature.")
             return {'CANCELLED'}
         try:
@@ -1106,15 +1447,43 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
             _static_meshes, skeletal_meshes = refresh_mesh_indices(game_root, oodle_dll, usmap_path)
             if virtual_path not in skeletal_meshes:
                 raise ValueError("Choose a SkeletalMesh from the package search results.")
+            # The import has to happen INSIDE the session: building RMI
+            # materials reads the material instance and streams its textures
+            # back over the same bridge process, so closing the session first
+            # (as this operator used to) leaves nothing to load them with.
             with PackageAssetSession(game_root, oodle_dll, usmap_path) as session:
                 skeletal_mesh = session.skeletal_mesh(virtual_path)
-            obj, weighted_vertices, influence_count = import_skeletal_mesh_asset(
-                context,
-                skeletal_mesh,
-                virtual_path,
-                armature_obj=armature_obj,
-                scale_factor=self.scale_factor,
-            )
+                if self.build_skeleton:
+                    skeleton_path = skeletal_mesh.get("skeletonPath")
+                    if not skeleton_path:
+                        raise ValueError("This SkeletalMesh has no associated Skeleton asset.")
+                    # Delegate to the Skeleton importer so armature building,
+                    # sockets, variant collections, and secondary KDI passes
+                    # stay in one place instead of being duplicated here. This
+                    # opens its own bridge process; the mesh's own session
+                    # above is idle for the moment but stays open for the
+                    # material/texture fetches below.
+                    result = bpy.ops.import_scene.ff7r_rebirth_skeleton_game_packages(
+                        virtual_path=skeleton_path,
+                        scale_factor=self.scale_factor,
+                        import_kdi=self.import_kdi,
+                        create_socket_empties=not self.import_socket_bones,
+                        create_socket_bones=self.import_socket_bones,
+                    )
+                    if result != {'FINISHED'}:
+                        raise RuntimeError("Building the associated Skeleton failed.")
+                    armature_obj = context.view_layer.objects.active
+                    if armature_obj is None or armature_obj.type != 'ARMATURE':
+                        raise RuntimeError("Could not identify the built armature.")
+                obj, weighted_vertices, influence_count = import_skeletal_mesh_asset(
+                    context,
+                    skeletal_mesh,
+                    virtual_path,
+                    armature_obj=armature_obj,
+                    scale_factor=self.scale_factor,
+                    offset_opposite_faces=self.offset_opposite_faces,
+                    material_session=session,
+                )
         except Exception as exc:
             self.report({'ERROR'}, f"Package SkeletalMesh import failed: {exc}")
             return {'CANCELLED'}
@@ -1123,12 +1492,13 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(bpy.types.Operator):
             {'INFO'},
             f"Imported '{obj.name}': {len(obj.data.vertices):,} vertices, "
             f"{len(obj.data.polygons):,} triangles, {weighted_vertices:,} weighted vertices, "
-            f"{influence_count:,} influences{binding_note}",
+            f"{influence_count:,} influences, {len(obj.data.materials)} material slots"
+            f"{binding_note}",
         )
         return {'FINISHED'}
 
 
-class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
+class FF7R_REBIRTH_OT_import_mec_game_packages(FF7R_LoggedOperator):
     bl_idname = "import_scene.ff7r_rebirth_mec_game_packages"
     bl_label = "UMAP from Rebirth Packages"
     bl_description = "Browse UMAPs inside Rebirth's mounted package files and import geometry, actors, lights, and linked assets"
@@ -1150,8 +1520,12 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
     import_actors: bpy.props.BoolProperty(
         name="Import actors, lights, and linked assets",
         description=(
-            "Create non-MEC UMAP actors using the JSON importer's existing Blender "
-            "asset-library links. Game-package meshes are not loaded"
+            "Create non-MEC UMAP actors. StaticMesh and SkeletalMesh actors are "
+            "built directly from the mounted game packages -- repeated actors "
+            "share one Blender datablock, missing game assets are reported, and "
+            "the Blender asset library is not used for either mesh type. "
+            "Skeletal actors import in bind pose; no in-level animation/pose "
+            "data is available from the package."
         ),
         default=True,
     )
@@ -1179,7 +1553,7 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
         self.offset_opposite_faces = prefs.offset_mec_opposite_faces
-        self.scale_factor = prefs.json_scale_factor
+        self.scale_factor = prefs.map_scale_factor
         try:
             paths = refresh_umap_index(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1194,7 +1568,7 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
             return {'CANCELLED'}
         _SELECTED_UMAPS.clear()
         state = _browser_state(context)
-        state.current_directory = "End/Content/Level/Game/Field"
+        state.current_directory = _LAST_UMAP_BROWSER_DIRECTORY
         state.filter_text = ""
         _populate_browser(context)
         return context.window_manager.invoke_props_dialog(self, width=1000)
@@ -1203,11 +1577,10 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
         layout = self.layout
         state = _browser_state(context)
         header = layout.row(align=True)
-        if _SELECTED_UMAPS:
-            header_text = f"{len(_VIRTUAL_UMAPS):,} UMAPs available — {len(_SELECTED_UMAPS):,} selected"
-        else:
-            header_text = f"{len(_VIRTUAL_UMAPS):,} UMAPs available — none ticked, will import the highlighted row"
-        header.label(text=header_text, icon='PACKAGE')
+        header.label(
+            text=f"{len(_VIRTUAL_UMAPS):,} UMAPs available — {len(_SELECTED_UMAPS):,} selected",
+            icon='PACKAGE',
+        )
         header.operator(FF7R_REBIRTH_OT_package_browser_up.bl_idname, text="", icon='FILE_PARENT')
         header.label(text=state.current_directory)
         layout.prop(state, "filter_text", text="", icon='VIEWZOOM')
@@ -1260,18 +1633,18 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
         scripted_path = self.virtual_path.strip().replace("\\", "/")
         if not virtual_paths and scripted_path:
             virtual_paths = [scripted_path]
-        if not virtual_paths:
-            # Nothing ticked: fall back to whichever row the browser is on, so
-            # single-map imports do not require ticking a box first.
-            highlighted = _highlighted_umap(context)
-            if highlighted:
-                virtual_paths = [highlighted]
+        if not virtual_paths and not scripted_path:
+            state = _browser_state(context)
+            if 0 <= state.active_index < len(state.entries):
+                highlighted = state.entries[state.active_index]
+                if not highlighted.is_directory:
+                    virtual_paths = [highlighted.virtual_path]
         invalid_paths = [path for path in virtual_paths if path not in _VIRTUAL_UMAPS]
         if invalid_paths:
             self.report({'ERROR'}, f"Package UMAP was not found: {invalid_paths[0]}")
             return {'CANCELLED'}
         if not virtual_paths:
-            self.report({'ERROR'}, "Highlight or tick at least one UMAP in the package browser.")
+            self.report({'ERROR'}, "Highlight or select at least one UMAP from the package browser.")
             return {'CANCELLED'}
         queued_paths = set(virtual_paths)
 
@@ -1289,6 +1662,26 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
             with tempfile.TemporaryDirectory(prefix="ff7r_mec_") as temp_dir:
                 package_session = PackageAssetSession(game_root, oodle_dll, usmap_path)
                 with package_session:
+                    static_mesh_resolver = (
+                        PackageStaticMeshResolver(
+                            context,
+                            package_session,
+                            self.scale_factor,
+                            offset_opposite_faces=self.offset_opposite_faces,
+                        )
+                        if self.import_actors
+                        else None
+                    )
+                    skeletal_mesh_resolver = (
+                        PackageSkeletalMeshResolver(
+                            context,
+                            package_session,
+                            self.scale_factor,
+                            offset_opposite_faces=self.offset_opposite_faces,
+                        )
+                        if self.import_actors
+                        else None
+                    )
                     loader_context = (
                         image_loader_override(package_session)
                         if self.import_textures
@@ -1358,22 +1751,15 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
 
                                 actor_data = (actor_payload or {}).get("actors") or []
                                 if self.import_actors and actor_data:
-                                    actor_json = os.path.join(
-                                        map_temp_dir,
-                                        os.path.splitext(os.path.basename(virtual_path))[0] + ".json",
-                                    )
                                     try:
-                                        with open(actor_json, "w", encoding="utf-8") as stream:
-                                            json.dump(actor_data, stream, ensure_ascii=False)
-                                        actor_created, actor_missing = map_import.import_json_file(
-                                            actor_json,
+                                        actor_created, actor_missing = map_import.import_map_entries(
+                                            actor_data,
+                                            virtual_path,
                                             exposure_mult=1.0,
                                             attenuation_radius_mult=1.0,
-                                            game_root="",
-                                            visited_paths=set(),
-                                            recursive_import=False,
-                                            import_massive_environment_umaps=False,
                                             location_scale=self.scale_factor,
+                                            static_mesh_resolver=static_mesh_resolver,
+                                            skeletal_mesh_resolver=skeletal_mesh_resolver,
                                         )
                                         actor_created_total += actor_created
                                         actor_missing_total |= actor_missing
@@ -1421,12 +1807,20 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(bpy.types.Operator):
         if actor_created_total:
             message += f"; {actor_created_total} actor/light object(s)"
         if actor_missing_total:
-            message += f"; {len(actor_missing_total)} linked asset(s) missing"
+            message += f"; {len(actor_missing_total)} actor asset(s) unavailable"
+            missing_preview = sorted(actor_missing_total, key=str.casefold)
+            if len(missing_preview) > 20:
+                missing_preview = missing_preview[:20] + ["..."]
+            print(
+                "[FF7R Package UMAP] ERROR: "
+                f"{len(actor_missing_total)} actor asset(s) could not be loaded: "
+                + ", ".join(missing_preview)
+            )
         self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
-class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
+class FF7R_REBIRTH_OT_import_kdi_game_packages(FF7R_LoggedOperator):
     bl_idname = "import_scene.ff7r_rebirth_kdi_game_packages"
     bl_label = "KineDriver JSON from Rebirth Packages"
     bl_description = "Search the mounted game packages for a _KDI asset and build its drivers on the active armature"
@@ -1454,11 +1848,6 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
         name="Scale axis mapping",
         items=AXIS_ORDER_ITEMS,
         default="YZX",
-    )
-    swap_bend_st: bpy.props.BoolProperty(
-        name="Swap BendS/BendT interpretation",
-        description=SWAP_BEND_ST_DESCRIPTION,
-        default=False,
     )
 
     def invoke(self, context, _event):
@@ -1498,9 +1887,6 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
         layout.label(text="Experimental target-axis mapping")
         layout.prop(self, "translation_axis_order")
         layout.prop(self, "scale_axis_order")
-        layout.separator()
-        layout.label(text="Debug")
-        layout.prop(self, "swap_bend_st")
 
     def execute(self, context):
         prefs = _preferences(context)
@@ -1540,7 +1926,6 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
                         if context.active_object and context.active_object.type == "ARMATURE"
                         else COORDINATE_PROFILE_REFERENCE
                     ),
-                    swap_bend_st=self.swap_bend_st,
                 )
         except Exception as exc:
             self.report({'ERROR'}, f"Package KDI import failed: {exc}")
@@ -1552,15 +1937,32 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# A character's KineDriver rig can span several assets: the main pre-physics
-# ``<stem>_KDI.uasset`` plus optional secondary passes named ``<stem>_KDI_<suffix>``
-# -- Extra1, Head, Hood, StBody, StHair, Extra_Hand are the suffixes Rebirth ships.
-# Per a third-party UE4SS capture of the KBD asset user data, the ``_Extra1`` pass is
-# the game's *post-physics* KineDriver list (it runs after Bonamik, which this add-on
-# does not simulate), so treat these as a best-effort extra layer rather than an
-# exact reproduction of the in-game result.
-# The suffix may itself contain underscores (Rebirth ships _KDI_Extra_Hand).
-_KDI_ASSET_PATTERN = re.compile(r"_KDI(_[A-Za-z0-9_]+)?\.uasset$", re.IGNORECASE)
+def _kdi_path_for_skeleton(virtual_path: str) -> str | None:
+    """Derive the associated KDI asset's virtual path from a Skeleton's, if any.
+
+    Character asset folders name these as siblings, e.g. ``PC0000_00_Skeleton.uasset``
+    next to ``PC0000_00_KDI.uasset`` -- same directory, ``_Skeleton`` swapped for
+    ``_KDI``. Confirmed for Cloud; callers must still check the mounted _KDI index,
+    since plenty of Skeletons (most enemies/props) have no KineDriver rig at all.
+    """
+    suffix = "_skeleton.uasset"
+    if not virtual_path.casefold().endswith(suffix):
+        return None
+    return virtual_path[: -len(suffix)] + "_KDI.uasset"
+
+
+def _secondary_kdi_paths_for_skeleton(virtual_path: str, available: list[str]) -> list[str]:
+    """Sibling ``<stem>_KDI_<suffix>.uasset`` passes for a Skeleton, if any."""
+    main = _kdi_path_for_skeleton(virtual_path)
+    if main is None:
+        return []
+    prefix = main[: -len(".uasset")] + "_"
+    lowered = prefix.casefold()
+    return sorted(
+        (path for path in available
+         if path.casefold().startswith(lowered) and path.casefold().endswith(".uasset")),
+        key=str.casefold,
+    )
 
 
 def _import_secondary_kdi_passes(
@@ -1609,33 +2011,6 @@ def _import_secondary_kdi_passes(
     if skipped:
         note += f"; {len(skipped)} secondary pass(es) skipped: {', '.join(skipped)}"
     return note
-
-
-def _secondary_kdi_paths_for_skeleton(virtual_path: str, available: list[str]) -> list[str]:
-    """Sibling ``<stem>_KDI_<suffix>.uasset`` passes for a Skeleton, if any."""
-    main = _kdi_path_for_skeleton(virtual_path)
-    if main is None:
-        return []
-    prefix = main[: -len(".uasset")] + "_"
-    lowered = prefix.casefold()
-    return sorted(
-        path for path in available
-        if path.casefold().startswith(lowered) and path.casefold().endswith(".uasset")
-    )
-
-
-def _kdi_path_for_skeleton(virtual_path: str) -> str | None:
-    """Derive the associated KDI asset's virtual path from a Skeleton's, if any.
-
-    Character asset folders name these as siblings, e.g. ``PC0000_00_Skeleton.uasset``
-    next to ``PC0000_00_KDI.uasset`` -- same directory, ``_Skeleton`` swapped for
-    ``_KDI``. Confirmed for Cloud; callers must still check the mounted _KDI index,
-    since plenty of Skeletons (most enemies/props) have no KineDriver rig at all.
-    """
-    suffix = "_skeleton.uasset"
-    if not virtual_path.casefold().endswith(suffix):
-        return None
-    return virtual_path[: -len(suffix)] + "_KDI.uasset"
 
 
 def _character_family_search_path(virtual_path: str) -> str | None:
@@ -1734,7 +2109,7 @@ def _restrict_skeleton_to_folder_mesh_bones(
     return reduced_asset, len(referenced_bones), len(reduced_bones)
 
 
-class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
+class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
     bl_idname = "import_scene.ff7r_rebirth_skeleton_game_packages"
     bl_label = "Skeleton from Rebirth Packages"
     bl_description = "Search the mounted game packages for a _Skeleton asset and build its armature"
@@ -1760,6 +2135,32 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         ),
         default=False,
     )
+    create_socket_empties: bpy.props.BoolProperty(
+        name="Create socket empties",
+        description=(
+            "Add a bone-parented Empty for each attachment socket, matching what "
+            "the UMAP importer looks for when resolving an actor's AttachSocketName"
+        ),
+        default=True,
+    )
+    create_socket_bones: bpy.props.BoolProperty(
+        name="Import attachment sockets as hidden non-deform bones",
+        description=(
+            "Use a hidden Sockets bone collection instead of separate Empty objects; "
+            "takes precedence over Create socket empties"
+        ),
+        default=False,
+    )
+    setup_naive_ik: bpy.props.BoolProperty(
+        name="Setup IK (naive)",
+        description=(
+            "Add a chain-length-3 IK constraint (no target) to R_Foot_a/L_Foot_a/"
+            "R_Hand_a/L_Hand_a, and lock Y/Z rotation to 0 on R_Foreleg_a/L_Foreleg_a/"
+            "R_Forearm_a/L_Forearm_a so they only bend as a hinge. Bones not present "
+            "on this skeleton are skipped"
+        ),
+        default=False,
+    )
     import_secondary_kdi: bpy.props.BoolProperty(
         name="Also import secondary KDI passes",
         description=(
@@ -1774,14 +2175,6 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         name="Swap BendS/BendT interpretation",
         description=SWAP_BEND_ST_DESCRIPTION,
         default=False,
-    )
-    create_socket_empties: bpy.props.BoolProperty(
-        name="Create socket empties",
-        description=(
-            "Add a bone-parented Empty for each attachment socket, matching what "
-            "the UMAP importer looks for when resolving an actor's AttachSocketName"
-        ),
-        default=True,
     )
     import_kdi: bpy.props.BoolProperty(
         name="Import associated KDI",
@@ -1838,6 +2231,8 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
         layout.prop(self, "scale_factor")
         layout.prop(self, "connect_bones")
         layout.prop(self, "create_socket_empties")
+        layout.prop(self, "create_socket_bones")
+        layout.prop(self, "setup_naive_ik")
         layout.prop(self, "import_kdi")
         secondary = layout.row()
         secondary.enabled = self.import_kdi
@@ -1937,24 +2332,23 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(bpy.types.Operator):
                         f"; retained {retained_count} hierarchy bone(s) from "
                         f"{referenced_count} mesh ReferenceSkeleton bone(s)"
                     )
-                skeleton_path = os.path.join(temp_dir, os.path.basename(virtual_path) + ".json")
-                with open(skeleton_path, "w", encoding="utf-8") as stream:
-                    json.dump(skeleton_asset, stream, ensure_ascii=False)
-                result = bpy.ops.import_scene.ff7r_rebirth_skeleton_json(
-                    filepath=skeleton_path,
-                    armature_name=self.armature_name,
+                skeleton_stem = os.path.basename(virtual_path)
+                if skeleton_stem.lower().endswith(".uasset"):
+                    skeleton_stem = skeleton_stem[: -len(".uasset")]
+                armature_obj = build_armature_from_bones(
+                    context,
+                    self.armature_name.strip()
+                    or skeleton_asset.get("name")
+                    or skeleton_stem,
+                    _bones_from_bridge(skeleton_asset),
+                    skeleton_asset.get("sockets") or [],
                     scale_factor=self.scale_factor,
                     connect_bones=self.connect_bones,
                     create_socket_empties=self.create_socket_empties,
+                    create_socket_bones=self.create_socket_bones,
+                    setup_naive_ik=self.setup_naive_ik,
                 )
-                if result != {'FINISHED'}:
-                    raise RuntimeError("The skeleton importer could not complete.")
-                # build_armature_from_bones left the new armature active; look it up
-                # this way rather than by name, since Blender silently renames on a
-                # collision (re-importing a character already in the scene).
-                armature_obj = context.view_layer.objects.active
-                if armature_obj is None or armature_obj.type != 'ARMATURE':
-                    raise RuntimeError("Could not identify the imported armature.")
+                armature_obj[SKELETON_ASSET_PATH_PROPERTY] = virtual_path
                 armature_obj[KDI_COORDINATE_PROFILE_PROPERTY] = COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90
 
                 collection_note = ""

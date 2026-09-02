@@ -1,5 +1,4 @@
 import bpy
-import json
 import os
 import math
 import re
@@ -33,8 +32,16 @@ def extract_static_mesh_name(object_name_str: str) -> str | None:
     return object_name_str
 
 
-def ensure_parent_collection_for_file(filepath: str) -> bpy.types.Collection:
-    base_name = os.path.splitext(os.path.basename(filepath))[0]
+def extract_static_mesh_game_path(static_mesh: dict) -> str | None:
+    """Return the full UE object path emitted by the package bridge, when present."""
+    if not isinstance(static_mesh, dict):
+        return None
+    object_path = static_mesh.get("ObjectPath")
+    return extract_static_mesh_name(object_path) if isinstance(object_path, str) else None
+
+
+def ensure_parent_collection_for_source(source_name: str) -> bpy.types.Collection:
+    base_name = os.path.splitext(os.path.basename(source_name))[0]
     col = bpy.data.collections.get(base_name)
     if col is None:
         col = bpy.data.collections.new(base_name)
@@ -108,7 +115,7 @@ def unlink_collection_from_scene(collection: bpy.types.Collection) -> int:
             unlinked_count += 1
         except RuntimeError as exc:
             print(
-                f"[End JSON Import]   Could not unlink collection "
+                f"[Rebirth Map Import]   Could not unlink collection "
                 f"'{collection.name}' from '{parent.name}': {exc}"
             )
 
@@ -130,7 +137,7 @@ def file_collection_under_import_type(
     if collection.library is not None:
         if unlink_collection_from_scene(collection):
             print(
-                f"[End JSON Import]   Unlinked source collection "
+                f"[Rebirth Map Import]   Unlinked source collection "
                 f"'{collection.name}' from the scene hierarchy."
         )
         return
@@ -140,7 +147,7 @@ def file_collection_under_import_type(
             target_collection.children.link(collection)
         except RuntimeError as exc:
             print(
-                f"[End JSON Import]   Could not file collection "
+                f"[Rebirth Map Import]   Could not file collection "
                 f"'{collection.name}' under '{target_collection.name}': {exc}"
             )
             return
@@ -154,13 +161,13 @@ def file_collection_under_import_type(
             unlinked_count += 1
         except RuntimeError as exc:
             print(
-                f"[End JSON Import]   Could not remove collection "
+                f"[Rebirth Map Import]   Could not remove collection "
                 f"'{collection.name}' from '{parent.name}': {exc}"
             )
 
     if unlinked_count:
         print(
-            f"[End JSON Import]   Filed override collection '{collection.name}' "
+            f"[Rebirth Map Import]   Filed override collection '{collection.name}' "
             f"under '{target_collection.name}'."
         )
 
@@ -206,7 +213,7 @@ def collapse_outliner_collections() -> None:
                     if result == {"CANCELLED"}:
                         break
         except Exception as exc:
-            print(f"[End JSON Import]   Could not collapse Outliner collections: {exc}")
+            print(f"[Rebirth Map Import]   Could not collapse Outliner collections: {exc}")
 
 
 def find_or_load_collection_cached(asset_name: str) -> bpy.types.Collection | None:
@@ -537,7 +544,27 @@ def create_spot_light_from_entry(
 
 
 def extract_skeletal_mesh_name(entry: dict) -> tuple[str | None, str | None]:
-    """Return (asset_name, template_object_path) from an EndSkeletalMeshComponent entry."""
+    """Return (asset_name, object_path) from an EndSkeletalMeshComponent entry.
+
+    Package UMAP imports expose the resolved SkeletalMesh reference in the
+    component properties. Legacy exported JSON instead stores a compatible
+    object path on the component template, so retain that fallback.
+    """
+    props = entry.get("Properties", {})
+    if isinstance(props, dict):
+        for property_name in ("SkeletalMesh", "SkinnedAsset"):
+            mesh_ref = props.get(property_name)
+            if not isinstance(mesh_ref, dict):
+                continue
+            obj_path = mesh_ref.get("ObjectPath", "")
+            if not isinstance(obj_path, str) or not obj_path:
+                continue
+            object_path = extract_static_mesh_name(obj_path)
+            last_segment = object_path.rstrip("/").rsplit("/", 1)[-1]
+            asset_name = last_segment.split(".")[0] or None
+            if asset_name:
+                return asset_name, object_path
+
     template = entry.get("Template", {})
     if not isinstance(template, dict):
         return None, None
@@ -957,7 +984,7 @@ def resolve_attach_parent_object(
     if report_missing:
         object_name = attach_parent.get("ObjectName", "<missing ObjectName>")
         print(
-            f"[End JSON Import]   AttachParent for '{child_name}' could not be resolved: "
+            f"[Rebirth Map Import]   AttachParent for '{child_name}' could not be resolved: "
             f"{object_name!r} (tried {len(lookup_keys)} key(s))."
         )
     return None
@@ -1039,23 +1066,6 @@ def resolve_game_asset_file_path(asset_path_name: str, game_root: str, extension
     return os.path.join(game_root, *rel_path_parts)
 
 
-def resolve_streaming_level_json_path(asset_path_name: str, game_root: str) -> str | None:
-    return resolve_game_asset_file_path(asset_path_name, game_root, ".json")
-
-
-def is_path_in_or_beneath(path: str, root_dir: str) -> bool:
-    """Return True when *path* is inside *root_dir* or is *root_dir* itself."""
-    if not path or not root_dir:
-        return True
-
-    try:
-        resolved_path = os.path.normcase(os.path.realpath(path))
-        resolved_root = os.path.normcase(os.path.realpath(root_dir))
-        return os.path.commonpath([resolved_path, resolved_root]) == resolved_root
-    except (OSError, ValueError):
-        return False
-
-
 def collect_level_streaming_asset_paths(data: list) -> list[str]:
     """Return asset paths from LevelStreamingAlwaysLoaded/Dynamic entries (preferred over EndStreamingVolume)."""
     asset_paths: list[str] = []
@@ -1110,70 +1120,6 @@ def collect_volume_streaming_asset_paths(data: list) -> list[str]:
     return asset_paths
 
 
-def import_streaming_asset_paths(
-    asset_paths: list[str],
-    source_label: str,
-    game_root: str,
-    exposure_mult: float,
-    attenuation_radius_mult: float,
-    location_scale: float,
-    visited_paths: set[str],
-    recursive_import: bool,
-    allow_external_recursive_json: bool,
-    recursive_root_dir: str,
-    import_massive_environment_umaps: bool,
-    imported_umap_paths: set[str],
-    imported_world_sky_paths: set[str],
-    texture_index_cache: TextureIndexCache | None = None,
-    offset_mec_opposite_faces: bool = False,
-) -> tuple[int, set[str]]:
-    """Resolve streaming asset paths to JSON files and import them."""
-    created_count = 0
-    missing_assets: set[str] = set()
-
-    print(f"[End JSON Import]   {source_label} - {len(asset_paths)} streaming level(s) referenced.")
-    for asset_path_name in asset_paths:
-        json_path = resolve_streaming_level_json_path(asset_path_name, game_root)
-        if not json_path:
-            print(f"[End JSON Import]     Could not resolve path for: {asset_path_name!r}")
-            continue
-        if (
-            not allow_external_recursive_json
-            and not is_path_in_or_beneath(json_path, recursive_root_dir)
-        ):
-            print(
-                f"[End JSON Import]     Skipping external streaming JSON outside "
-                f"'{recursive_root_dir}': {json_path}"
-            )
-            continue
-        if not os.path.exists(json_path):
-            print(f"[End JSON Import]     Streaming JSON not found: {json_path}")
-            continue
-
-        print(f"[End JSON Import]     Recursing into streaming level: {json_path}")
-        child_created, child_missing = import_json_file(
-            filepath=json_path,
-            exposure_mult=exposure_mult,
-            attenuation_radius_mult=attenuation_radius_mult,
-            game_root=game_root,
-            location_scale=location_scale,
-            visited_paths=visited_paths,
-            recursive_import=recursive_import,
-            allow_external_recursive_json=allow_external_recursive_json,
-            recursive_root_dir=recursive_root_dir,
-            import_massive_environment_umaps=import_massive_environment_umaps,
-            imported_umap_paths=imported_umap_paths,
-            imported_world_sky_paths=imported_world_sky_paths,
-            texture_index_cache=texture_index_cache,
-            offset_mec_opposite_faces=offset_mec_opposite_faces,
-        )
-        print(f"[End JSON Import]     Streaming level done - {child_created} item(s) created, {len(child_missing)} missing.")
-        created_count += child_created
-        missing_assets |= child_missing
-
-    return created_count, missing_assets
-
-
 def resolve_massive_environment_umap_path(entry: dict, game_root: str) -> str | None:
     """Resolve a MassiveEnvironmentComponent StreamingProxy ObjectPath to a local .umap path."""
     props = entry.get("Properties", {})
@@ -1192,7 +1138,7 @@ def get_umap_import_function():
     try:
         importer_module = importlib.import_module(f"{__package__.rsplit('.', 1)[0]}.mec.importer")
     except Exception as exc:
-        print(f"[End JSON Import]   Bundled FF7R .umap importer is not available: {exc}")
+        print(f"[Rebirth Map Import]   Bundled FF7R .umap importer is not available: {exc}")
         return None
     return getattr(importer_module, "import_umap_paths", None)
 
@@ -1215,21 +1161,21 @@ def import_massive_environment_umap(
     scale_factor: float = 0.01,
 ) -> tuple[int, int, set[str]]:
     if not game_root:
-        print("[End JSON Import]   MassiveEnvironmentComponent found but Game Root is not set - skipping .umap import.")
+        print("[Rebirth Map Import]   MassiveEnvironmentComponent found but Game Root is not set - skipping .umap import.")
         return 0, 1, set()
 
     umap_path = resolve_massive_environment_umap_path(entry, game_root)
     if not umap_path:
-        print("[End JSON Import]   MassiveEnvironmentComponent path could not be resolved - skipping .umap import.")
+        print("[Rebirth Map Import]   MassiveEnvironmentComponent path could not be resolved - skipping .umap import.")
         return 0, 1, set()
 
     umap_path = os.path.realpath(umap_path)
     if umap_path in imported_umap_paths:
-        print(f"[End JSON Import]   MassiveEnvironment .umap already imported: {umap_path}")
+        print(f"[Rebirth Map Import]   MassiveEnvironment .umap already imported: {umap_path}")
         return 0, 0, set()
 
     if not os.path.exists(umap_path):
-        print(f"[End JSON Import]   MassiveEnvironment .umap not found: {umap_path}")
+        print(f"[Rebirth Map Import]   MassiveEnvironment .umap not found: {umap_path}")
         imported_umap_paths.add(umap_path)
         return 0, 1, set()
 
@@ -1238,7 +1184,7 @@ def import_massive_environment_umap(
         imported_umap_paths.add(umap_path)
         return 0, 1, set()
 
-    print(f"[End JSON Import]   Importing MassiveEnvironment .umap: {umap_path}")
+    print(f"[Rebirth Map Import]   Importing MassiveEnvironment .umap: {umap_path}")
     imported_umap_paths.add(umap_path)
     try:
         processed, skipped, _unresolved_count = import_umap_paths(
@@ -1252,7 +1198,7 @@ def import_massive_environment_umap(
         )
         return processed, skipped, set()
     except Exception as exc:
-        print(f"[End JSON Import]   MassiveEnvironment .umap import failed for {umap_path}: {exc}")
+        print(f"[Rebirth Map Import]   MassiveEnvironment .umap import failed for {umap_path}: {exc}")
         return 0, 1, set()
 
 
@@ -1279,14 +1225,14 @@ def make_library_override_for_instance(instance_obj: bpy.types.Object) -> bpy.ty
         if override_col is not None:
             instance_obj.instance_collection = override_col
             view_layer.update()
-            print(f"[End JSON Import]   Library override created for '{instance_obj.name}' -> '{override_col.name}'.")
+            print(f"[Rebirth Map Import]   Library override created for '{instance_obj.name}' -> '{override_col.name}'.")
         else:
-            print(f"[End JSON Import]   override_hierarchy_create returned None for '{instance_obj.name}'.")
+            print(f"[Rebirth Map Import]   override_hierarchy_create returned None for '{instance_obj.name}'.")
 
         return instance_obj
 
     except Exception as exc:
-        print(f"[End JSON Import]   Could not make library override for '{instance_obj.name}': {exc}")
+        print(f"[Rebirth Map Import]   Could not make library override for '{instance_obj.name}': {exc}")
         return instance_obj
 
 
@@ -1344,12 +1290,12 @@ def ensure_overrideable_collection_instance(
 
         if active_collection is not None and active_collection.library is None:
             print(
-                f"[End JSON Import]   Library override (content) created for "
+                f"[Rebirth Map Import]   Library override (content) created for "
                 f"'{target_instance.name}' -> collection '{active_collection.name}'."
             )
         else:
             print(
-                f"[End JSON Import]   Library override request for "
+                f"[Rebirth Map Import]   Library override request for "
                 f"'{target_instance.name}' did not produce a local collection."
             )
 
@@ -1357,7 +1303,7 @@ def ensure_overrideable_collection_instance(
 
     except Exception as exc:
         print(
-            f"[End JSON Import]   Could not make library override for "
+            f"[Rebirth Map Import]   Could not make library override for "
             f"'{target_instance.name}': {exc}"
         )
         return target_instance
@@ -1402,12 +1348,12 @@ def ensure_top_level_object_overrides(
 
     if overridden_count:
         view_layer.update()
-        print(f"[End JSON Import]   Forced {overridden_count} top-level object override(s) in '{override_collection.name}'.")
+        print(f"[Rebirth Map Import]   Forced {overridden_count} top-level object override(s) in '{override_collection.name}'.")
 
     if failed_names:
         preview = ", ".join(failed_names[:5])
         suffix = "" if len(failed_names) <= 5 else f", +{len(failed_names) - 5} more"
-        print(f"[End JSON Import]   Failed to override {len(failed_names)} object(s) in '{override_collection.name}': {preview}{suffix}.")
+        print(f"[Rebirth Map Import]   Failed to override {len(failed_names)} object(s) in '{override_collection.name}': {preview}{suffix}.")
 
 
 def parent_override_roots_to_wrapper(
@@ -1432,7 +1378,7 @@ def parent_override_roots_to_wrapper(
         reparented_count += 1
 
     if reparented_count:
-        print(f"[End JSON Import]   Parented {reparented_count} override object(s) under '{wrapper_obj.name}'.")
+        print(f"[Rebirth Map Import]   Parented {reparented_count} override object(s) under '{wrapper_obj.name}'.")
 
     bpy.data.objects.remove(instance_obj, do_unlink=True)
 
@@ -1536,7 +1482,7 @@ def process_deferred_attach(
 
     target_instance = bpy.data.objects.get(attach_actor_name)
     if target_instance is None:
-        print(f"[End JSON Import]   AttachSocketName '{attach_socket}': parent '{attach_actor_name}' not found.")
+        print(f"[Rebirth Map Import]   AttachSocketName '{attach_socket}': parent '{attach_actor_name}' not found.")
         return
 
     target_instance = ensure_overrideable_collection_instance(target_instance)
@@ -1610,6 +1556,25 @@ def create_static_asset_instance_from_resolved_asset(
     )
 
 
+def create_static_mesh_instance_from_datablock(
+    mesh: bpy.types.Mesh,
+    name: str,
+    loc: Vector,
+    rot: Euler,
+    static_collection: bpy.types.Collection,
+    rel_scale: Vector,
+) -> bpy.types.Object:
+    """Instance an already-imported package mesh without duplicating its data."""
+    obj = bpy.data.objects.new(name, mesh)
+    obj.location = loc
+    obj.rotation_euler = rot
+    obj.scale = rel_scale
+    if mesh.get("ff7r_virtual_path"):
+        obj["ff7r_virtual_path"] = mesh["ff7r_virtual_path"]
+    static_collection.objects.link(obj)
+    return obj
+
+
 def collect_asset_names_for_import(data: list) -> tuple[set[str], set[str]]:
     static_asset_names: set[str] = set()
     skeletal_asset_names: set[str] = set()
@@ -1634,6 +1599,34 @@ def collect_asset_names_for_import(data: list) -> tuple[set[str], set[str]]:
                 skeletal_asset_names.add(asset_name)
 
     return static_asset_names, skeletal_asset_names
+
+
+def collect_package_static_mesh_paths_for_import(data: list) -> set[str]:
+    """Collect full StaticMesh object paths supplied by a package UMAP payload."""
+    paths: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("Type") not in {
+            "EndEnvironmentStaticMeshComponent", "StaticMeshComponent",
+        }:
+            continue
+        props = entry.get("Properties", {})
+        static_mesh = props.get("StaticMesh", {}) if isinstance(props, dict) else {}
+        game_path = extract_static_mesh_game_path(static_mesh)
+        if game_path:
+            paths.add(game_path)
+    return paths
+
+
+def collect_package_skeletal_mesh_paths_for_import(data: list) -> set[str]:
+    """Collect full SkeletalMesh object paths supplied by a package UMAP payload."""
+    paths: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("Type") != "EndSkeletalMeshComponent":
+            continue
+        _asset_name, template_object_path = extract_skeletal_mesh_name(entry)
+        if template_object_path:
+            paths.add(template_object_path)
+    return paths
 
 
 def create_setpos_object_from_entry(
@@ -1670,7 +1663,7 @@ def create_setpos_object_from_entry(
         )
         obj["setpos_asset_name"] = asset_name or ""
         print(
-            f"[End JSON Import]   SetPos asset '{instance_name}' "
+            f"[Rebirth Map Import]   SetPos asset '{instance_name}' "
             f"(lookup: '{lookup_name}', asset: '{asset_name}', kind: {asset.kind}) | "
             f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
         )
@@ -1678,7 +1671,7 @@ def create_setpos_object_from_entry(
         obj = create_mesh_empty(instance_name, loc, rot, parent_collection, scale=rel_scale)
         obj["component_empty_reason"] = "missing_setpos_asset"
         print(
-            f"[End JSON Import]   SetPos empty '{instance_name}' "
+            f"[Rebirth Map Import]   SetPos empty '{instance_name}' "
             f"(lookup: '{lookup_name}', no matching asset after 10-char prefix trim) | "
             f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
         )
@@ -1712,7 +1705,7 @@ def create_layout_object_pack_object(
         )
         obj["setpos_asset_name"] = asset_name or ""
         print(
-            f"[End JSON Import]   LayoutObjectPack asset '{key}' "
+            f"[Rebirth Map Import]   LayoutObjectPack asset '{key}' "
             f"(lookup: '{lookup_name}', asset: '{asset_name}', kind: {asset.kind}) | "
             f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
         )
@@ -1721,7 +1714,7 @@ def create_layout_object_pack_object(
         if lookup_name:
             obj["component_empty_reason"] = "missing_setpos_asset"
         print(
-            f"[End JSON Import]   LayoutObjectPack empty '{key}' | "
+            f"[Rebirth Map Import]   LayoutObjectPack empty '{key}' | "
             f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
         )
 
@@ -1737,74 +1730,83 @@ def create_layout_object_pack_object(
     return obj
 
 
-def import_json_file(
-    filepath: str,
+def import_map_entries(
+    data: list[dict],
+    source_name: str,
     exposure_mult: float,
     attenuation_radius_mult: float,
-    game_root: str,
-    visited_paths: set[str],
-    recursive_import: bool = True,
-    allow_external_recursive_json: bool = False,
-    recursive_root_dir: str | None = None,
-    import_massive_environment_umaps: bool = True,
-    imported_umap_paths: set[str] | None = None,
-    imported_world_sky_paths: set[str] | None = None,
-    texture_index_cache: TextureIndexCache | None = None,
-    offset_mec_opposite_faces: bool = False,
     import_finite_fog: bool = False,
     location_scale: float = 0.01,
+    static_mesh_resolver=None,
+    skeletal_mesh_resolver=None,
 ) -> tuple[int, set[str]]:
-    filepath = os.path.realpath(filepath)
-    if recursive_root_dir is None:
-        recursive_root_dir = os.path.dirname(filepath)
-    else:
-        recursive_root_dir = os.path.realpath(recursive_root_dir)
-
-    if filepath in visited_paths:
-        print(f"[End JSON Import] Skipping already-visited file: {filepath}")
-        return 0, set()
-    visited_paths.add(filepath)
-    if imported_umap_paths is None:
-        imported_umap_paths = set()
-    if imported_world_sky_paths is None:
-        imported_world_sky_paths = set()
-    if texture_index_cache is None:
-        texture_index_cache = {}
+    """Create Blender map actors from package-decoded export entries."""
     location_scale = _float_or_default(location_scale, 0.01)
 
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Invalid file path: {filepath}")
-
-    print(f"[End JSON Import] Loading: {filepath}")
-
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read JSON: {e}") from e
-
     if not isinstance(data, list):
-        raise ValueError("JSON root must be a list of objects")
+        raise ValueError("Package map entries must be a list of objects")
 
-    print(f"[End JSON Import] JSON parsed - {len(data)} top-level entries.")
+    print(f"[Rebirth Map Import] Decoded {len(data)} top-level entries from {source_name}.")
 
     physics_root_fallback_asset_names = collect_physics_root_fallback_asset_names(data)
 
     static_asset_names, skeletal_asset_names = collect_asset_names_for_import(data)
-    setpos_asset_names = collect_setpos_asset_names_for_import(data)
+    if static_mesh_resolver is not None:
+        static_asset_names = collect_package_static_mesh_paths_for_import(data)
+    if skeletal_mesh_resolver is not None:
+        skeletal_asset_names = collect_package_skeletal_mesh_paths_for_import(data)
+    setpos_asset_names = (
+        collect_setpos_asset_names_for_import(data)
+        if static_mesh_resolver is None
+        else {}
+    )
+    # Package UMAP imports supply resolvers that build StaticMeshes/SkeletalMeshes
+    # straight from Rebirth's mounted files.  Do not touch the Blender asset
+    # library for whichever type has a resolver: a missing game mesh must remain
+    # a visible import error rather than silently resolving to an unrelated
+    # .blend asset.
+    preload_asset_names = set(setpos_asset_names.values())
+    if static_mesh_resolver is None:
+        preload_asset_names |= static_asset_names
+    if skeletal_mesh_resolver is None:
+        preload_asset_names |= skeletal_asset_names
     asset_linking.preload_assets(
-        static_asset_names | skeletal_asset_names | set(setpos_asset_names.values()),
+        preload_asset_names,
         ASSET_LIBRARY_SELECTION,
         include_objects=True,
     )
-    static_asset_cache = {
-        asset_name: find_or_load_asset_cached(asset_name)
-        for asset_name in static_asset_names
-    }
-    skeletal_asset_cache = {
-        asset_name: find_or_load_asset_cached(asset_name)
-        for asset_name in skeletal_asset_names
-    }
+    if static_mesh_resolver is None:
+        static_asset_cache = {
+            asset_name: find_or_load_asset_cached(asset_name)
+            for asset_name in static_asset_names
+        }
+    else:
+        static_asset_cache = {}
+        for asset_name in sorted(static_asset_names, key=str.casefold):
+            try:
+                static_asset_cache[asset_name] = static_mesh_resolver(asset_name)
+            except Exception as exc:
+                static_asset_cache[asset_name] = None
+                print(
+                    f"[Rebirth Map Import] ERROR: Game StaticMesh '{asset_name}' "
+                    f"could not be imported: {exc}"
+                )
+    if skeletal_mesh_resolver is None:
+        skeletal_asset_cache = {
+            asset_name: find_or_load_asset_cached(asset_name)
+            for asset_name in skeletal_asset_names
+        }
+    else:
+        skeletal_asset_cache = {}
+        for asset_name in sorted(skeletal_asset_names, key=str.casefold):
+            try:
+                skeletal_asset_cache[asset_name] = skeletal_mesh_resolver(asset_name)
+            except Exception as exc:
+                skeletal_asset_cache[asset_name] = None
+                print(
+                    f"[Rebirth Map Import] ERROR: Game SkeletalMesh '{asset_name}' "
+                    f"could not be imported: {exc}"
+                )
     setpos_asset_cache = {
         asset_name: find_or_load_asset_cached(asset_name)
         for asset_name in set(setpos_asset_names.values())
@@ -1815,7 +1817,7 @@ def import_json_file(
     def ensure_root_collection() -> bpy.types.Collection:
         nonlocal parent_collection
         if parent_collection is None:
-            parent_collection = ensure_parent_collection_for_file(filepath)
+            parent_collection = ensure_parent_collection_for_source(source_name)
         return parent_collection
 
     def ensure_static_collection() -> bpy.types.Collection:
@@ -1846,60 +1848,22 @@ def import_json_file(
     pending_vector_parameters: list[tuple[int, dict]] = []
     created_count += particles.create_niagara_empties_from_effect_json(
         data,
-        filepath,
+        source_name,
         location_scale=location_scale,
     )
-    if worlds.create_world_from_level_data(data, filepath):
+    if worlds.create_world_from_level_data(data, source_name):
         created_count += 1
     if import_finite_fog:
         created_count += worlds.create_finite_fog_volume_from_level_data(
             data,
-            filepath,
+            source_name,
             location_scale=location_scale,
         )
     created_count += worlds.create_reflection_capture_probes(
         data,
-        filepath,
+        source_name,
         location_scale=location_scale,
     )
-
-    level_streaming_asset_paths = collect_level_streaming_asset_paths(data)
-    use_volume_streaming_fallback = not level_streaming_asset_paths
-    if recursive_import:
-        world_sky_result = worlds.import_world_sky_references(
-            data=data,
-            game_root=game_root,
-            imported_world_sky_paths=imported_world_sky_paths,
-            location_scale=location_scale,
-        )
-        created_count += (
-            world_sky_result.worlds_created
-            + world_sky_result.fog_volumes_created
-            + world_sky_result.probes_created
-        )
-        if not game_root:
-            if level_streaming_asset_paths:
-                print("[End JSON Import]   LevelStreaming entries found but Game Root is not set - skipping.")
-        elif level_streaming_asset_paths:
-            child_created, child_missing = import_streaming_asset_paths(
-                asset_paths=level_streaming_asset_paths,
-                source_label="LevelStreaming",
-                game_root=game_root,
-                exposure_mult=exposure_mult,
-                attenuation_radius_mult=attenuation_radius_mult,
-                location_scale=location_scale,
-                visited_paths=visited_paths,
-                recursive_import=recursive_import,
-                allow_external_recursive_json=allow_external_recursive_json,
-                recursive_root_dir=recursive_root_dir,
-                import_massive_environment_umaps=import_massive_environment_umaps,
-                imported_umap_paths=imported_umap_paths,
-                imported_world_sky_paths=imported_world_sky_paths,
-                texture_index_cache=texture_index_cache,
-                offset_mec_opposite_faces=offset_mec_opposite_faces,
-            )
-            created_count += child_created
-            missing_assets |= child_missing
 
     for entry_index, entry in enumerate(data):
         if not isinstance(entry, dict):
@@ -1915,6 +1879,8 @@ def import_json_file(
             object_name_str = static_mesh.get("ObjectName") if isinstance(static_mesh, dict) else None
 
             asset_name = extract_static_mesh_name(object_name_str)
+            game_asset_path = extract_static_mesh_game_path(static_mesh)
+            asset_key = game_asset_path if static_mesh_resolver is not None else asset_name
             rel_loc = props.get("RelativeLocation", {})
             rel_rot = props.get("RelativeRotation", {})
             rel_scale = scale_from_entry(props, entry)
@@ -1932,7 +1898,7 @@ def import_json_file(
                 else "StaticMeshComponent"
             )
             attach_name = _resolve_outer_name(entry) or asset_name or component_name
-            asset = static_asset_cache.get(asset_name) if asset_name else None
+            asset = static_asset_cache.get(asset_key) if asset_key else None
             if not asset_name:
                 fallback_asset_name = physics_root_fallback_asset_name_for_entry(
                     entry,
@@ -1940,7 +1906,7 @@ def import_json_file(
                 )
                 if not fallback_asset_name:
                     print(
-                        f"[End JSON Import]   Warning: StaticMesh entry has no parseable ObjectName "
+                        f"[Rebirth Map Import]   Warning: StaticMesh entry has no parseable ObjectName "
                         f"for '{attach_name}' and no physics fallback - "
                         "using transform empty."
                     )
@@ -1950,21 +1916,41 @@ def import_json_file(
                     new_obj["component_empty_reason"] = "no_static_mesh_attach_parent"
                 else:
                     asset = static_asset_cache.get(fallback_asset_name)
+                    if static_mesh_resolver is not None and asset is None:
+                        try:
+                            asset = static_mesh_resolver(fallback_asset_name)
+                            static_asset_cache[fallback_asset_name] = asset
+                        except Exception as exc:
+                            static_asset_cache[fallback_asset_name] = None
+                            print(
+                                f"[Rebirth Map Import] ERROR: Game StaticMesh "
+                                f"'{fallback_asset_name}' could not be imported: {exc}"
+                            )
                     if asset is not None:
-                        new_obj = create_static_asset_instance_from_resolved_asset(
-                            asset=asset,
-                            name=attach_name,
-                            loc=loc,
-                            rot=rot,
-                            static_collection=static_collection,
-                            rel_scale=rel_scale,
-                            attach_socket=attach_socket,
-                        )
+                        if static_mesh_resolver is not None:
+                            new_obj = create_static_mesh_instance_from_datablock(
+                                mesh=asset,
+                                name=attach_name,
+                                loc=loc,
+                                rot=rot,
+                                static_collection=static_collection,
+                                rel_scale=rel_scale,
+                            )
+                        else:
+                            new_obj = create_static_asset_instance_from_resolved_asset(
+                                asset=asset,
+                                name=attach_name,
+                                loc=loc,
+                                rot=rot,
+                                static_collection=static_collection,
+                                rel_scale=rel_scale,
+                                attach_socket=attach_socket,
+                            )
                         new_obj["source_name"] = attach_name
                         new_obj["source_type"] = t
                         new_obj["physics_root_fallback_asset_name"] = fallback_asset_name
                         print(
-                            f"[End JSON Import]   Warning: StaticMesh entry has no parseable ObjectName "
+                            f"[Rebirth Map Import]   Warning: StaticMesh entry has no parseable ObjectName "
                             f"for '{attach_name}' - using physics fallback asset "
                             f"'{fallback_asset_name}' | "
                             f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
@@ -1977,26 +1963,36 @@ def import_json_file(
                         new_obj["component_empty_reason"] = "missing_physics_root_fallback_asset"
                         new_obj["physics_root_fallback_asset_name"] = fallback_asset_name
                         print(
-                            f"[End JSON Import]   Warning: StaticMesh entry has no parseable ObjectName "
+                            f"[Rebirth Map Import]   Warning: StaticMesh entry has no parseable ObjectName "
                             f"and physics fallback asset is missing "
                             f"for '{attach_name}': '{fallback_asset_name}' - using transform empty."
                         )
             elif asset is not None:
-                new_obj = create_static_asset_instance_from_resolved_asset(
-                    asset=asset,
-                    name=attach_name,
-                    loc=loc,
-                    rot=rot,
-                    static_collection=static_collection,
-                    rel_scale=rel_scale,
-                    attach_socket=attach_socket,
-                )
+                if static_mesh_resolver is not None:
+                    new_obj = create_static_mesh_instance_from_datablock(
+                        mesh=asset,
+                        name=attach_name,
+                        loc=loc,
+                        rot=rot,
+                        static_collection=static_collection,
+                        rel_scale=rel_scale,
+                    )
+                else:
+                    new_obj = create_static_asset_instance_from_resolved_asset(
+                        asset=asset,
+                        name=attach_name,
+                        loc=loc,
+                        rot=rot,
+                        static_collection=static_collection,
+                        rel_scale=rel_scale,
+                        attach_socket=attach_socket,
+                    )
             else:
-                missing_assets.add(asset_name)
+                missing_assets.add(asset_key or asset_name)
                 placeholder_name = attach_name
                 new_obj = create_mesh_empty(placeholder_name, loc, rot, static_collection, scale=rel_scale)
                 print(
-                    f"[End JSON Import]   StaticMesh fallback empty '{placeholder_name}' | "
+                    f"[Rebirth Map Import]   StaticMesh fallback empty '{placeholder_name}' | "
                     f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
                 )
 
@@ -2049,11 +2045,24 @@ def import_json_file(
                 outer_name = comp_name if isinstance(comp_name, str) else "SkeletalMeshComponent"
             instance_name = outer_name
 
-            asset = skeletal_asset_cache.get(asset_name) if asset_name else None
+            asset_key = template_object_path if skeletal_mesh_resolver is not None else asset_name
+            asset = skeletal_asset_cache.get(asset_key) if asset_key else None
 
             if asset is not None:
                 if asset.kind == "COLLECTION":
                     collection = asset.datablock
+                    # PackageSkeletalMeshResolver caches one shared collection
+                    # (one armature + one mesh) per asset path and reuses it for
+                    # every placement -- it was never library-linked, so there is
+                    # nothing for override_hierarchy_create to duplicate below.
+                    # Only a genuine linked-library collection needs the
+                    # override-then-flatten treatment; doing it for a shared
+                    # package collection would reparent its one-and-only
+                    # armature/mesh onto the first wrapper that claims them and
+                    # leave every later instance of the same asset an empty
+                    # shell (its placeholder gets deleted regardless of whether
+                    # anything was actually reparented).
+                    is_library_linked_collection = collection.library is not None
                     file_collection_under_import_type(collection, skeletal_collection)
                     with _scene_link_collection(collection, skeletal_collection):
                         obj, instance_obj = create_skeletal_wrapper_instance(
@@ -2074,8 +2083,9 @@ def import_json_file(
                             instance_obj,
                             skeletal_collection,
                         )
-                    ensure_top_level_object_overrides(instance_obj)
-                    parent_override_roots_to_wrapper(obj, instance_obj)
+                    if is_library_linked_collection:
+                        ensure_top_level_object_overrides(instance_obj)
+                        parent_override_roots_to_wrapper(obj, instance_obj)
                 else:
                     obj, instance_obj = create_wrapped_linked_object_instance(
                         source_obj=asset.datablock,
@@ -2092,20 +2102,20 @@ def import_json_file(
                         template_object_path,
                     )
                 print(
-                    f"[End JSON Import]   SkeletalMesh wrapper '{instance_name}' "
+                    f"[Rebirth Map Import]   SkeletalMesh wrapper '{instance_name}' "
                     f"(asset lookup: '{asset_name}', kind: {asset.kind}, "
                     f"template: '{template_object_path}') | "
                     f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})"
                 )
             else:
-                if asset_name:
-                    missing_assets.add(asset_name)
+                if asset_key:
+                    missing_assets.add(asset_key)
                 obj = create_mesh_empty(instance_name, loc, rot, skeletal_collection, scale=rel_scale)
                 obj["source_name"] = instance_name
                 if template_object_path:
                     obj["template_object_path"] = template_object_path
                 print(
-                    f"[End JSON Import]   SkeletalMesh empty '{instance_name}' | "
+                    f"[Rebirth Map Import]   SkeletalMesh empty '{instance_name}' | "
                     f"loc=({loc.x:.3f},{loc.y:.3f},{loc.z:.3f})  "
                     f"rot=({math.degrees(rot.x):.2f},{math.degrees(rot.y):.2f},{math.degrees(rot.z):.2f}) deg"
                 )
@@ -2256,52 +2266,10 @@ def import_json_file(
         elif t == "MaterialInstanceDynamic":
             pending_vector_parameters.append((entry_index, entry))
 
-        elif t == "EndStreamingVolume":
-            if not use_volume_streaming_fallback:
-                continue
-            if not recursive_import:
-                continue
-            if not game_root:
-                print("[End JSON Import]   EndStreamingVolume found but Game Root is not set - skipping.")
-                continue
-
-            volume_asset_paths = collect_volume_streaming_asset_paths([entry])
-            if not volume_asset_paths:
-                continue
-            child_created, child_missing = import_streaming_asset_paths(
-                asset_paths=volume_asset_paths,
-                source_label="EndStreamingVolume",
-                game_root=game_root,
-                exposure_mult=exposure_mult,
-                attenuation_radius_mult=attenuation_radius_mult,
-                location_scale=location_scale,
-                visited_paths=visited_paths,
-                recursive_import=recursive_import,
-                allow_external_recursive_json=allow_external_recursive_json,
-                recursive_root_dir=recursive_root_dir,
-                import_massive_environment_umaps=import_massive_environment_umaps,
-                imported_umap_paths=imported_umap_paths,
-                imported_world_sky_paths=imported_world_sky_paths,
-                texture_index_cache=texture_index_cache,
-                offset_mec_opposite_faces=offset_mec_opposite_faces,
-            )
-            created_count += child_created
-            missing_assets |= child_missing
-
-        elif t == "MassiveEnvironmentComponent":
-            if import_massive_environment_umaps:
-                processed, skipped, child_missing = import_massive_environment_umap(
-                    entry,
-                    game_root,
-                    imported_umap_paths,
-                    texture_index_cache,
-                    offset_opposite_faces=offset_mec_opposite_faces,
-                    scale_factor=location_scale,
-                )
-                created_count += processed
-                missing_assets |= child_missing
-                if processed:
-                    print(f"[End JSON Import]   MassiveEnvironment reference import done - {processed} processed, {skipped} skipped.")
+        elif t in {"EndStreamingVolume", "MassiveEnvironmentComponent"}:
+            # Package streaming recursion and MEC geometry are handled by the
+            # package importer, which has direct access to mounted assets.
+            continue
 
         # Other types ignored
 
@@ -2323,8 +2291,8 @@ def import_json_file(
 
     if pending_attaches:
         print(
-            f"[End JSON Import] Processing {len(pending_attaches)} deferred attach request(s) "
-            f"for '{os.path.basename(filepath)}'."
+            f"[Rebirth Map Import] Processing {len(pending_attaches)} deferred attach request(s) "
+            f"for '{os.path.basename(source_name)}'."
         )
         for child_obj, props, attach_socket in pending_attaches:
             process_deferred_attach(child_obj, props, attach_socket, location_scale)
@@ -2362,7 +2330,7 @@ def import_json_file(
             _apply_vector_parameter_props(target, entry.get("Properties", {}))
 
     print(
-        f"[End JSON Import] Finished '{os.path.basename(filepath)}' - "
+        f"[Rebirth Map Import] Finished '{os.path.basename(source_name)}' - "
         f"{created_count} item(s) created, {len(missing_assets)} missing asset(s)."
     )
     return created_count, missing_assets

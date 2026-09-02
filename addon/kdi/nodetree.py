@@ -29,6 +29,8 @@ from typing import Any
 import bpy
 from bpy.props import EnumProperty, IntProperty, StringProperty
 
+from ..reporting import FF7R_LoggedOperator
+
 TREE_TYPE = "FF7R_KDI_NodeTree"
 SOCKET_TYPE = "FF7R_KDI_Socket"
 NODE_TYPE = "FF7R_KDI_Node"
@@ -327,7 +329,7 @@ def _selected_bone_name(context: Any) -> str:
     return active.name if active else ""
 
 
-class FF7R_KDI_OT_visualize(bpy.types.Operator):
+class FF7R_KDI_OT_visualize(FF7R_LoggedOperator):
     """Show a KineDriver rig as a node graph in the Node Editor"""
 
     bl_idname = "kdi.visualize_graph"

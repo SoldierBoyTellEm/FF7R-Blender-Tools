@@ -11,6 +11,8 @@ using CUE4Parse.MappingsProvider.Usmap;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
+using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
@@ -18,10 +20,14 @@ using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Readers;
 using CUE4Parse.UE4.IO.Objects;
 using CUE4Parse.UE4.Objects.Engine;
+using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
+using CUE4Parse.UE4.Objects.Meshes;
 using CUE4Parse.UE4.Readers;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse_Conversion.Textures;
+using CUE4Parse_Conversion.Animations;
+using CUE4Parse_Conversion.Animations.PSA;
 
 if (args.Length < 1)
 {
@@ -249,6 +255,100 @@ static object? NormalizeKdiValue(object? value)
     return value;
 }
 
+// Cooked MaterialInstanceConstant exports only serialize the parameters an
+// instance itself overrides. A character-specific instance (e.g.
+// PC0011_00_BodyB) commonly only overrides its unique diffuse/normal
+// textures and inherits shared parameters -- like a "DetailCoverage" mask
+// constant -- from a parent instance further up the chain. Without this,
+// Blender never sees that parameter at all, so its Image Texture node is
+// left with no image and no fallback constant.
+//
+// This walks Parent up to the root, collecting each ancestor's own
+// TextureParameterValues/VectorParameterValues/ScalarParameterValues, and
+// merges them into *properties* with the root-most ancestor's entries first
+// and the material's own entries last. Python's role lookup keeps the
+// *last* entry for a given parameter name when it builds its name->value
+// map, so this ordering makes a more-derived instance's own override win
+// over an inherited default -- matching Unreal's own resolution order --
+// while still filling in anything the instance never overrode.
+static void MergeInheritedMaterialParameters(
+    CUE4Parse.UE4.Assets.Exports.UObject material,
+    List<object?> properties)
+{
+    string[] MaterialParameterArrayPropertyNames =
+    [
+        "TextureParameterValues",
+        "VectorParameterValues",
+        "ScalarParameterValues",
+    ];
+
+    var ancestorArrays = new List<Dictionary<string, List<object?>>>();
+    var visited = new HashSet<CUE4Parse.UE4.Assets.Exports.UObject> { material };
+    var parent = material.GetOrDefault<FPackageIndex>("Parent", new FPackageIndex()).Load();
+    while (parent != null && visited.Add(parent))
+    {
+        var arrays = new Dictionary<string, List<object?>>();
+        foreach (var property in parent.Properties)
+        {
+            if (Array.IndexOf(MaterialParameterArrayPropertyNames, property.Name.Text) < 0)
+                continue;
+            if (ConvertValue(property) is Dictionary<string, object?> converted &&
+                converted.GetValueOrDefault("value") is List<object?> entries)
+            {
+                arrays[property.Name.Text] = entries;
+            }
+        }
+        ancestorArrays.Add(arrays);
+        parent = parent.GetOrDefault<FPackageIndex>("Parent", new FPackageIndex()).Load();
+    }
+    ancestorArrays.Reverse();
+
+    foreach (var parameterArrayName in MaterialParameterArrayPropertyNames)
+    {
+        var mergedValues = new List<object?>();
+        foreach (var arrays in ancestorArrays)
+        {
+            if (arrays.TryGetValue(parameterArrayName, out var entries))
+                mergedValues.AddRange(entries);
+        }
+
+        var ownEntry = properties
+            .OfType<Dictionary<string, object?>>()
+            .FirstOrDefault(entry => entry.GetValueOrDefault("name") as string == parameterArrayName);
+        if (ownEntry?.GetValueOrDefault("value") is List<object?> ownValues)
+            mergedValues.AddRange(ownValues);
+
+        if (mergedValues.Count == 0)
+            continue;
+
+        if (ownEntry != null)
+            ownEntry["value"] = mergedValues;
+        else
+            properties.Add(new Dictionary<string, object?> { ["name"] = parameterArrayName, ["value"] = mergedValues });
+    }
+}
+
+static Dictionary<string, object?> ExportMaterialInstancePackage(CUE4Parse.UE4.Assets.IPackage package)
+{
+    // Keep this intentionally mapping-agnostic. Rebirth's MaterialInstance
+    // parameter structs are available through the active usmap, while their
+    // C# export classes have varied across CUE4Parse releases. The existing
+    // generic FPropertyTag converter gives Blender the cooked Parent,
+    // TextureParameterValues, VectorParameterValues, and scalar values.
+    var material = package.GetExports().FirstOrDefault(export =>
+        export.ExportType.ToString().Contains("MaterialInstance", StringComparison.OrdinalIgnoreCase));
+    if (material is null)
+        throw new InvalidOperationException("Package does not contain a MaterialInstance export.");
+    var properties = material.Properties.Select(property => ConvertValue(property)).ToList();
+    MergeInheritedMaterialParameters(material, properties);
+    return new Dictionary<string, object?>
+    {
+        ["name"] = material.Name.ToString(),
+        ["type"] = material.ExportType,
+        ["properties"] = properties,
+    };
+}
+
 static byte[] WrapBlockCompressedAsDds(
     int width,
     int height,
@@ -339,28 +439,27 @@ static Dictionary<string, object?> ExportTextureDds(
     };
 }
 
-static Dictionary<string, object?> ExportStaticMeshAsset(UStaticMesh sourceMesh)
+static Dictionary<string, object?> ExportStaticMeshLod(
+    string meshName,
+    FStaticMeshLODResources sourceLod,
+    FStaticMaterial[] staticMaterials,
+    int lodIndex,
+    string sourceType,
+    string renderData)
 {
-    var lods = sourceMesh.RenderData?.LODs
-        ?? throw new InvalidOperationException(
-            "StaticMesh render data is unavailable. This Rebirth layout requires " +
-            "CUE4Parse's packed-tangent support from 2026-08-28 or newer.");
-    var lodIndex = Array.FindIndex(lods, lod =>
-        !lod.SkipLod && lod.PositionVertexBuffer is { NumVertices: > 0 } &&
-        lod.VertexBuffer is { NumVertices: > 0 } && lod.IndexBuffer is { Length: > 0 });
-    if (lodIndex < 0)
-        throw new InvalidOperationException("StaticMesh has no importable conventional LOD.");
-
-    var sourceLod = lods[lodIndex];
-    var positions = sourceLod.PositionVertexBuffer!.Verts;
-    var vertexItems = sourceLod.VertexBuffer!.UV;
-    var indices = sourceLod.IndexBuffer!.Buffer;
+    var positions = sourceLod.PositionVertexBuffer?.Verts
+        ?? throw new InvalidOperationException("StaticMesh position data is unavailable.");
+    var vertexBuffer = sourceLod.VertexBuffer
+        ?? throw new InvalidOperationException("StaticMesh vertex attributes are unavailable.");
+    var vertexItems = vertexBuffer.UV;
+    var indices = sourceLod.IndexBuffer?.Buffer
+        ?? throw new InvalidOperationException("StaticMesh index data is unavailable.");
     if (positions.Length != vertexItems.Length)
         throw new InvalidOperationException(
             $"StaticMesh position/attribute count mismatch ({positions.Length} vs {vertexItems.Length}).");
 
     var uvChannels = new List<object?>();
-    for (var channelIndex = 0; channelIndex < sourceLod.VertexBuffer.NumTexCoords; channelIndex++)
+    for (var channelIndex = 0; channelIndex < vertexBuffer.NumTexCoords; channelIndex++)
     {
         var capturedChannel = channelIndex;
         uvChannels.Add(vertexItems.Select(item =>
@@ -372,8 +471,8 @@ static Dictionary<string, object?> ExportStaticMeshAsset(UStaticMesh sourceMesh)
 
     var sections = sourceLod.Sections.Select(section =>
     {
-        var staticMaterial = section.MaterialIndex >= 0 && section.MaterialIndex < sourceMesh.StaticMaterials.Length
-            ? sourceMesh.StaticMaterials[section.MaterialIndex]
+        var staticMaterial = section.MaterialIndex >= 0 && section.MaterialIndex < staticMaterials.Length
+            ? staticMaterials[section.MaterialIndex]
             : null;
         return (object?)new Dictionary<string, object?>
         {
@@ -388,9 +487,9 @@ static Dictionary<string, object?> ExportStaticMeshAsset(UStaticMesh sourceMesh)
 
     return new Dictionary<string, object?>
     {
-        ["sourceType"] = "UStaticMesh",
-        ["name"] = sourceMesh.Name.ToString(),
-        ["renderData"] = "ConventionalLOD",
+        ["sourceType"] = sourceType,
+        ["name"] = meshName,
+        ["renderData"] = renderData,
         ["lodIndex"] = lodIndex,
         ["vertexCount"] = positions.Length,
         ["triangleCount"] = indices.Length / 3,
@@ -406,6 +505,22 @@ static Dictionary<string, object?> ExportStaticMeshAsset(UStaticMesh sourceMesh)
         ["indices"] = indices,
         ["sections"] = sections,
     };
+}
+
+static Dictionary<string, object?> ExportStaticMeshAsset(UStaticMesh sourceMesh)
+{
+    var lods = sourceMesh.RenderData?.LODs
+        ?? throw new InvalidOperationException(
+            "StaticMesh render data is unavailable. This Rebirth layout requires " +
+            "CUE4Parse's packed-tangent support from 2026-08-28 or newer.");
+    var lodIndex = Array.FindIndex(lods, lod =>
+        !lod.SkipLod && lod.PositionVertexBuffer is { NumVertices: > 0 } &&
+        lod.VertexBuffer is { NumVertices: > 0 } && lod.IndexBuffer is { Length: > 0 });
+    if (lodIndex < 0)
+        throw new InvalidOperationException("StaticMesh has no importable conventional LOD.");
+    return ExportStaticMeshLod(
+        sourceMesh.Name.ToString(), lods[lodIndex], sourceMesh.StaticMaterials ?? [],
+        lodIndex, "UStaticMesh", "ConventionalLOD");
 }
 
 static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
@@ -492,14 +607,196 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
 
     // The first conventional LOD is the import target. This is also what FModel
     // exported for the reference asset before the 1.005 layout change.
+    var lodStart = archive.Position;
     _ = new FStripDataFlags(archive);
     var sourceSections = archive.ReadArray(() => new FStaticMeshSection(archive));
     _ = archive.Read<float>(); // MaxDeviation
     var cookedOut = archive.ReadBoolean();
     var inlined = archive.ReadBoolean();
-    if (cookedOut || inlined)
+    // FByteBulkData handles both inlined payloads and payloads kept in the
+    // matching .ubulk.  Only cooked-out data has no usable render payload.
+    if (cookedOut)
         throw new InvalidOperationException(
             $"Unsupported Rebirth LOD flags (cookedOut={cookedOut}, inlined={inlined}).");
+
+    if (inlined)
+    {
+        Dictionary<string, object?> ExportInlinePackedMesh()
+        {
+        // The August NuGet build predates Rebirth's four-byte packed tangent
+        // frame. Parse the conventional inline streams here using the same
+        // representation as the flattened-layout decoder below.
+        _ = new FStripDataFlags(archive); // buffer strip flags
+
+        var positionStride = archive.Read<int>();
+        var vertexCount = archive.Read<int>();
+        var positionItemSize = archive.Read<int>();
+        var positionCount = archive.Read<int>();
+        if (positionStride != 12 || positionItemSize != 12 ||
+            vertexCount <= 0 || positionCount != vertexCount)
+            throw new InvalidOperationException(
+                $"Unsupported inline StaticMesh position metadata " +
+                $"({positionCount}/{vertexCount} vertices, stride={positionStride}, item={positionItemSize}).");
+        var positions = archive.ReadArray(vertexCount, () =>
+        {
+            var position = archive.Read<FVector>();
+            return new[] { position.X, position.Y, position.Z };
+        });
+
+        _ = new FStripDataFlags(
+            archive,
+            FPackageFileVersion.CreateUE4Version(
+                EUnrealEngineObjectUE4Version.STATIC_SKELETAL_MESH_SERIALIZATION_FIX));
+        var uvChannelCount = archive.Read<int>();
+        var attributeVertexCount = archive.Read<int>();
+        var fullPrecisionUvs = archive.ReadBoolean();
+        var highPrecisionTangents = archive.ReadBoolean();
+        var tangentItemSize = archive.Read<int>();
+        var tangentCount = archive.Read<int>();
+        if (uvChannelCount is < 1 or > 8 || attributeVertexCount != vertexCount ||
+            fullPrecisionUvs || highPrecisionTangents ||
+            tangentItemSize != sizeof(uint) || tangentCount != vertexCount)
+            throw new InvalidOperationException(
+                "Unsupported inline StaticMesh vertex metadata " +
+                $"(vertices={attributeVertexCount}/{vertexCount}, uvs={uvChannelCount}, " +
+                $"fullUV={fullPrecisionUvs}, highTangent={highPrecisionTangents}, " +
+                $"tangents={tangentCount}x{tangentItemSize}).");
+
+        var normals = new float[vertexCount][];
+        var tangents = new float[vertexCount][];
+        for (var vertex = 0; vertex < vertexCount; vertex++)
+        {
+            var packedFrame = archive.Read<uint>();
+            var u = (packedFrame & 1023) / 1023.0;
+            var v = ((packedFrame >> 10) & 1023) / 1023.0;
+            var nx = u - v;
+            var ny = u + v - 1.0;
+            var nz = 1.0 - Math.Abs(nx) - Math.Abs(ny);
+            if ((packedFrame & (1u << 30)) == 0) nz = -nz;
+            var normalLength = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            nx /= normalLength;
+            ny /= normalLength;
+            nz /= normalLength;
+            normals[vertex] = [(float) nx, (float) ny, (float) nz];
+
+            var sign = nz >= 0.0 ? -1.0 : 1.0;
+            var a = 1.0 / (nz - sign);
+            var e1x = 1.0 + sign * nx * nx * a;
+            var e1y = sign * nx * ny * a;
+            var e1z = sign * nx;
+            var e2x = nx * ny * a;
+            var e2y = sign + ny * ny * a;
+            var e2z = ny;
+            var angle = (packedFrame >> 20) & 1023;
+            var t = (angle & 255) / 255.0;
+            var cx = (angle & 256) != 0 ? t : -t;
+            var cy = (angle & 512) != 0 ? 1.0 - t : -(1.0 - t);
+            var circleLength = Math.Sqrt(cx * cx + cy * cy);
+            cx /= circleLength;
+            cy /= circleLength;
+            tangents[vertex] =
+            [
+                (float) (e1x * cx + e2x * cy),
+                (float) (e1y * cx + e2y * cy),
+                (float) (e1z * cx + e2z * cy),
+                (packedFrame & (1u << 31)) != 0 ? 1.0f : -1.0f,
+            ];
+        }
+
+        var uvItemSize = archive.Read<int>();
+        var uvItemCount = archive.Read<int>();
+        if (uvItemSize != 4 || uvItemCount != vertexCount * uvChannelCount)
+            throw new InvalidOperationException(
+                $"Unsupported inline StaticMesh UV metadata ({uvItemCount}x{uvItemSize}).");
+        var uvChannels = Enumerable.Range(0, uvChannelCount)
+            .Select(_ => new float[vertexCount][]).ToArray();
+        for (var vertex = 0; vertex < vertexCount; vertex++)
+        for (var channel = 0; channel < uvChannelCount; channel++)
+            uvChannels[channel][vertex] =
+            [
+                (float) archive.Read<Half>(),
+                (float) archive.Read<Half>(),
+            ];
+
+        _ = new FStripDataFlags(
+            archive,
+            FPackageFileVersion.CreateUE4Version(
+                EUnrealEngineObjectUE4Version.STATIC_SKELETAL_MESH_SERIALIZATION_FIX));
+        var colorStride = archive.Read<int>();
+        var colorCount = archive.Read<int>();
+        int[][]? colors = null;
+        if (colorCount > 0)
+        {
+            var colorItemSize = archive.Read<int>();
+            var serializedColorCount = archive.Read<int>();
+            if (colorStride != 4 || colorItemSize != 4 ||
+                colorCount != vertexCount || serializedColorCount != colorCount)
+                throw new InvalidOperationException(
+                    $"Unsupported inline StaticMesh color metadata ({serializedColorCount}/{colorCount}x{colorItemSize}).");
+            colors = archive.ReadArray(colorCount, () =>
+            {
+                var color = archive.Read<FColor>();
+                return new[] { (int) color.R, (int) color.G, (int) color.B, (int) color.A };
+            });
+        }
+
+        var uses32BitIndices = archive.ReadBoolean();
+        var indexItemSize = archive.Read<int>();
+        var indexByteCount = archive.Read<int>();
+        var expectedIndexItemSize = uses32BitIndices ? 4 : 2;
+        if (indexItemSize != 1 || indexByteCount <= 0 ||
+            indexByteCount % expectedIndexItemSize != 0)
+            throw new InvalidOperationException(
+                $"Unsupported inline StaticMesh index metadata ({indexByteCount} bytes, " +
+                $"item={indexItemSize}, index32={uses32BitIndices}).");
+        var indexCount = indexByteCount / expectedIndexItemSize;
+        var indices = uses32BitIndices
+            ? archive.ReadArray(indexCount, archive.Read<uint>)
+            : archive.ReadArray(indexCount, () => (uint) archive.Read<ushort>());
+
+        var requiredIndexCount = sourceSections.Max(section =>
+            checked((int) section.FirstIndex + (int) section.NumTriangles * 3));
+        if (requiredIndexCount <= 0 || requiredIndexCount > indices.Length ||
+            indices.Any(index => index >= vertexCount))
+            throw new InvalidOperationException(
+                $"Inline StaticMesh index ranges are invalid ({requiredIndexCount}/{indices.Length}).");
+
+        var inlineMaterials = propertyReader.GetOrDefault<FStaticMaterial[]>("StaticMaterials", []);
+        var outputSections = sourceSections.Select(section =>
+        {
+            var staticMaterial = section.MaterialIndex >= 0 && section.MaterialIndex < inlineMaterials.Length
+                ? inlineMaterials[section.MaterialIndex]
+                : null;
+            return (object?) new Dictionary<string, object?>
+            {
+                ["materialIndex"] = section.MaterialIndex,
+                ["materialName"] = staticMaterial?.MaterialSlotName.ToString(),
+                ["materialPath"] = staticMaterial?.MaterialInterface?.GetPathName(),
+                ["firstIndex"] = section.FirstIndex,
+                ["triangleCount"] = section.NumTriangles,
+                ["castShadow"] = section.bCastShadow,
+            };
+        }).ToList();
+            return new Dictionary<string, object?>
+            {
+            ["sourceType"] = "FF7 Rebirth inline UStaticMesh",
+            ["name"] = meshName,
+            ["renderData"] = "InlinePackedTangents",
+            ["lodIndex"] = 0,
+            ["vertexCount"] = vertexCount,
+            ["triangleCount"] = requiredIndexCount / 3,
+            ["positions"] = positions,
+            ["normals"] = normals,
+            ["tangents"] = tangents,
+            ["uvChannels"] = uvChannels,
+            ["colors"] = colors,
+            ["indices"] = indices.Take(requiredIndexCount).ToArray(),
+                ["sections"] = outputSections,
+            };
+        }
+
+        return ExportInlinePackedMesh();
+    }
 
     var bulk = new FByteBulkData(archive);
     var bulkData = bulk.Data;
@@ -528,8 +825,8 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
     var positionCount = archive.Read<int>();
     var colorStride = archive.Read<int>();
     var colorCount = archive.Read<int>();
-    _ = archive.Read<int>(); // legacy index-buffer field
-    _ = archive.ReadBoolean(); // 32-bit indices
+    var legacyIndexBufferField = archive.Read<int>();
+    var legacyUses32BitIndices = archive.ReadBoolean();
 
     var batchCount = archive.Read<int>();
     var meshletIndexCount = archive.Read<int>();
@@ -548,62 +845,16 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
             $"(vertices={vertexCount}, positions={positionCount}x{positionStride}, " +
             $"uvs={uvChannelCount}, fullUV={fullPrecisionUvs}, highTangent={highPrecisionTangents}, " +
             $"colors={colorCount}x{colorStride}).");
-    if (batchCount <= 0 || meshletIndexCount <= 0 || packedTriangleCount <= 0 ||
-        batchIndexCount < 0 || auxiliaryStructCount != 0 || zeroIndex != 0)
-        throw new InvalidOperationException("Unsupported flattened StaticMesh meshlet metadata.");
-
-    // The updated FF7LodInfo tail uses 2/5/6 elements for its ushort/float
-    // arrays (76 bytes total), rather than the older 4/5/14 shape.
-    archive.Position += 24; // retail-only opaque render-data header
-    var sectionLodIndices = archive.ReadArray<int>();
-    var lodInfoCount = archive.Read<int>();
-    if (lodInfoCount is < 1 or > 4096)
-        throw new InvalidOperationException($"Unexpected FF7 LOD-info count {lodInfoCount}.");
-    var lodInfos = new (int BatchesOffset, int BatchesCount, int VerticesOffset, int VerticesCount)[lodInfoCount];
-    for (var index = 0; index < lodInfoCount; index++)
-    {
-        _ = archive.Read<int>(); // Index
-        _ = archive.Read<int>(); // unknown
-        _ = archive.Read<int>(); // Offset
-        _ = archive.Read<int>(); // Count
-        _ = archive.Read<int>(); // IndicesOffset
-        _ = archive.Read<int>(); // IndicesCount
-        var batchesOffset = archive.Read<int>();
-        var batchesCount = archive.Read<int>();
-        var verticesOffset = archive.Read<int>();
-        var verticesCount = archive.Read<int>();
-        archive.Position += 36; // ushort[2], float[5], ushort[6]
-        lodInfos[index] = (batchesOffset, batchesCount, verticesOffset, verticesCount);
-    }
-    if (sectionLodIndices.Length != sourceSections.Length ||
-        sectionLodIndices.Any(index => index < 0 || index >= lodInfos.Length))
-        throw new InvalidOperationException("FF7 section-to-LOD mapping is invalid.");
-
-    _ = archive.ReadArray<int>(); // secondary section indices
-    var secondaryLodInfoCount = archive.Read<int>();
-    if (secondaryLodInfoCount is < 0 or > 4096)
-        throw new InvalidOperationException($"Unexpected secondary FF7 LOD-info count {secondaryLodInfoCount}.");
-    archive.Position += secondaryLodInfoCount * 76L;
-    var trailingIndexCount = archive.Read<int>();
-    var flattenedVersion = archive.Read<int>();
-    var flattenedFlags = archive.Read<int>();
-    if (trailingIndexCount != 0 || flattenedVersion != 1 || flattenedFlags != 0)
-        throw new InvalidOperationException("Unsupported flattened StaticMesh buffer-table header.");
-
-    // The first entries describe the conventional vertex buffers and absent
-    // legacy index buffers. The GPU/meshlet ranges begin 44 bytes later.
-    archive.Position += 44;
-    (int Offset, int Size) ReadRange()
-    {
-        return (archive.Read<int>(), archive.Read<int>());
-    }
-    var batchRange = ReadRange();
-    _ = ReadRange(); // batch-info/internal-LOD data
-    var meshletIndexRange = ReadRange();
-    var packedTriangleRange = ReadRange();
-    _ = ReadRange(); // auxiliary meshlet data A
-    _ = ReadRange(); // auxiliary meshlet data B
-    var batchIndexRange = ReadRange();
+    var hasMeshlets = batchCount > 0 && meshletIndexCount > 0 && packedTriangleCount > 0;
+    var hasNoMeshlets = batchCount == 0 && meshletIndexCount == 0 && packedTriangleCount == 0 &&
+        batchIndexCount == 0 && auxiliaryStructCount == 0 && zeroIndex == 0;
+    if ((!hasMeshlets && !hasNoMeshlets) || batchIndexCount < 0 ||
+        auxiliaryStructCount != 0 || zeroIndex != 0)
+        throw new InvalidOperationException(
+            "Unsupported flattened StaticMesh meshlet metadata " +
+            $"(batches={batchCount}, meshletIndices={meshletIndexCount}, " +
+            $"packedTriangles={packedTriangleCount}, batchIndices={batchIndexCount}, " +
+            $"auxiliary={auxiliaryStructCount}, zeroIndex={zeroIndex}).");
 
     var tangentStride = 4; // 1.005 R10G10B10A2_UNORM tangent frame
     var uvStride = 4; // two half floats
@@ -611,17 +862,89 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
     var tangentOffset = checked(positionOffset + vertexCount * positionStride);
     var uvOffset = checked(tangentOffset + vertexCount * tangentStride);
     var colorOffset = checked(uvOffset + vertexCount * uvChannelCount * uvStride);
+    var vertexPayloadEnd = checked(colorOffset + colorCount * colorStride);
+    if (vertexPayloadEnd > bulkData.Length)
+        throw new InvalidOperationException("Flattened StaticMesh vertex buffers exceed the bulk payload.");
+
+    var sectionLodIndices = Array.Empty<int>();
+    var lodInfos = Array.Empty<(int BatchesOffset, int BatchesCount, int VerticesOffset, int VerticesCount)>();
+    var batchRange = (Offset: 0, Size: 0);
+    var meshletIndexRange = (Offset: 0, Size: 0);
+    var packedTriangleRange = (Offset: 0, Size: 0);
+    var batchIndexRange = (Offset: 0, Size: 0);
+    if (hasMeshlets)
+    {
+        // The updated FF7LodInfo tail uses 2/5/6 elements for its
+        // ushort/float arrays (76 bytes total), rather than the older shape.
+        archive.Position += 24; // retail-only opaque render-data header
+        sectionLodIndices = archive.ReadArray<int>();
+        var lodInfoCount = archive.Read<int>();
+        if (lodInfoCount is < 1 or > 4096)
+            throw new InvalidOperationException($"Unexpected FF7 LOD-info count {lodInfoCount}.");
+        lodInfos = new (int BatchesOffset, int BatchesCount, int VerticesOffset, int VerticesCount)[lodInfoCount];
+        for (var index = 0; index < lodInfoCount; index++)
+        {
+            _ = archive.Read<int>(); // Index
+            _ = archive.Read<int>(); // unknown
+            _ = archive.Read<int>(); // Offset
+            _ = archive.Read<int>(); // Count
+            _ = archive.Read<int>(); // IndicesOffset
+            _ = archive.Read<int>(); // IndicesCount
+            var batchesOffset = archive.Read<int>();
+            var batchesCount = archive.Read<int>();
+            var verticesOffset = archive.Read<int>();
+            var verticesCount = archive.Read<int>();
+            archive.Position += 36; // ushort[2], float[5], ushort[6]
+            lodInfos[index] = (batchesOffset, batchesCount, verticesOffset, verticesCount);
+        }
+        if (sectionLodIndices.Length != sourceSections.Length ||
+            sectionLodIndices.Any(index => index < 0 || index >= lodInfos.Length))
+            throw new InvalidOperationException("FF7 section-to-LOD mapping is invalid.");
+
+        _ = archive.ReadArray<int>(); // secondary section indices
+        var secondaryLodInfoCount = archive.Read<int>();
+        if (secondaryLodInfoCount is < 0 or > 4096)
+            throw new InvalidOperationException($"Unexpected secondary FF7 LOD-info count {secondaryLodInfoCount}.");
+        archive.Position += secondaryLodInfoCount * 76L;
+        var trailingIndexCount = archive.Read<int>();
+        var flattenedVersion = archive.Read<int>();
+        var flattenedFlags = archive.Read<int>();
+        if (trailingIndexCount != 0 || flattenedVersion != 1 || flattenedFlags != 0)
+            throw new InvalidOperationException("Unsupported flattened StaticMesh buffer-table header.");
+
+        archive.Position += 44; // conventional buffer descriptors
+        (int Offset, int Size) ReadRange() => (archive.Read<int>(), archive.Read<int>());
+        batchRange = ReadRange();
+        _ = ReadRange(); // batch-info/internal-LOD data
+        meshletIndexRange = ReadRange();
+        packedTriangleRange = ReadRange();
+        _ = ReadRange(); // auxiliary meshlet data A
+        _ = ReadRange(); // auxiliary meshlet data B
+        batchIndexRange = ReadRange();
+    }
+    else
+    {
+        var requiredIndexCount = sourceSections.Max(section =>
+            checked((int) section.FirstIndex + (int) section.NumTriangles * 3));
+        if (legacyIndexBufferField < requiredIndexCount)
+            throw new InvalidOperationException(
+                $"Legacy index count {legacyIndexBufferField} is smaller than the section ranges ({requiredIndexCount}).");
+        var indexStride = legacyUses32BitIndices ? 4 : 2;
+        if (vertexPayloadEnd + checked(legacyIndexBufferField * indexStride) > bulkData.Length)
+            throw new InvalidOperationException("Legacy StaticMesh indices exceed the bulk payload.");
+    }
+
     var batchOffset = batchRange.Offset;
     var meshletIndexOffset = meshletIndexRange.Offset;
     var packedTriangleOffset = packedTriangleRange.Offset;
-    if (batchOffset != checked(colorOffset + colorCount * colorStride) ||
+    if (hasMeshlets && (batchOffset != vertexPayloadEnd ||
         batchRange.Size != checked(batchCount * 16) ||
         meshletIndexRange.Size != checked(meshletIndexCount * sizeof(uint)) ||
         packedTriangleRange.Size != checked(packedTriangleCount * sizeof(uint)) ||
         batchIndexRange.Size != checked(batchIndexCount * sizeof(uint)) ||
         batchOffset < 0 || meshletIndexOffset < batchOffset + batchRange.Size ||
         packedTriangleOffset < meshletIndexOffset + meshletIndexRange.Size ||
-        packedTriangleOffset + packedTriangleRange.Size > bulkData.Length)
+        packedTriangleOffset + packedTriangleRange.Size > bulkData.Length))
         throw new InvalidOperationException("Flattened StaticMesh bulk-buffer ranges overlap or exceed the payload.");
 
     static uint ReadU32(byte[] data, int offset) =>
@@ -693,31 +1016,49 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
         }
     }
 
-    var fullIndices = new List<uint>(packedTriangleCount * 3);
-    for (var batch = 0; batch < batchCount; batch++)
+    var fullIndices = new List<uint>(hasMeshlets ? packedTriangleCount * 3 : legacyIndexBufferField);
+    if (!hasMeshlets)
     {
-        var offset = batchOffset + batch * 16;
-        var totalVertices = ReadI32(bulkData, offset + 4);
-        var triangleCount = ReadI32(bulkData, offset + 8);
-        var totalTriangles = ReadI32(bulkData, offset + 12);
-        if (totalVertices < 0 || triangleCount < 0 || totalTriangles < 0 ||
-            totalTriangles + triangleCount > packedTriangleCount)
-            throw new InvalidOperationException($"Invalid FF7 meshlet batch {batch}.");
-        for (var triangle = 0; triangle < triangleCount; triangle++)
+        var indexStride = legacyUses32BitIndices ? 4 : 2;
+        for (var index = 0; index < legacyIndexBufferField; index++)
         {
-            var packed = ReadU32(bulkData, packedTriangleOffset + (totalTriangles + triangle) * 4);
-            var local0 = (int) (packed & 0x3ff);
-            var local1 = (int) ((packed >> 10) & 0x3ff);
-            var local2 = (int) ((packed >> 20) & 0x3ff);
-            foreach (var local in new[] { local0, local1, local2 })
+            var offset = vertexPayloadEnd + index * indexStride;
+            var vertexIndex = legacyUses32BitIndices
+                ? ReadU32(bulkData, offset)
+                : BinaryPrimitives.ReadUInt16LittleEndian(bulkData.AsSpan(offset, 2));
+            if (vertexIndex >= vertexCount)
+                throw new InvalidOperationException(
+                    $"Legacy StaticMesh index {index} references vertex {vertexIndex}/{vertexCount}.");
+            fullIndices.Add(vertexIndex);
+        }
+    }
+    else
+    {
+        for (var batch = 0; batch < batchCount; batch++)
+        {
+            var offset = batchOffset + batch * 16;
+            var totalVertices = ReadI32(bulkData, offset + 4);
+            var triangleCount = ReadI32(bulkData, offset + 8);
+            var totalTriangles = ReadI32(bulkData, offset + 12);
+            if (totalVertices < 0 || triangleCount < 0 || totalTriangles < 0 ||
+                totalTriangles + triangleCount > packedTriangleCount)
+                throw new InvalidOperationException($"Invalid FF7 meshlet batch {batch}.");
+            for (var triangle = 0; triangle < triangleCount; triangle++)
             {
-                var meshletIndex = totalVertices + local;
-                if (meshletIndex < 0 || meshletIndex >= meshletIndexCount)
-                    throw new InvalidOperationException($"FF7 meshlet {batch} has an invalid local vertex index.");
-                var vertexIndex = ReadU32(bulkData, meshletIndexOffset + meshletIndex * 4);
-                if (vertexIndex >= vertexCount)
-                    throw new InvalidOperationException($"FF7 meshlet {batch} references vertex {vertexIndex}/{vertexCount}.");
-                fullIndices.Add(vertexIndex);
+                var packed = ReadU32(bulkData, packedTriangleOffset + (totalTriangles + triangle) * 4);
+                var local0 = (int) (packed & 0x3ff);
+                var local1 = (int) ((packed >> 10) & 0x3ff);
+                var local2 = (int) ((packed >> 20) & 0x3ff);
+                foreach (var local in new[] { local0, local1, local2 })
+                {
+                    var meshletIndex = totalVertices + local;
+                    if (meshletIndex < 0 || meshletIndex >= meshletIndexCount)
+                        throw new InvalidOperationException($"FF7 meshlet {batch} has an invalid local vertex index.");
+                    var vertexIndex = ReadU32(bulkData, meshletIndexOffset + meshletIndex * 4);
+                    if (vertexIndex >= vertexCount)
+                        throw new InvalidOperationException($"FF7 meshlet {batch} references vertex {vertexIndex}/{vertexCount}.");
+                    fullIndices.Add(vertexIndex);
+                }
             }
         }
     }
@@ -728,10 +1069,14 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
     for (var sectionIndex = 0; sectionIndex < sourceSections.Length; sectionIndex++)
     {
         var sourceSection = sourceSections[sectionIndex];
-        var lodInfo = lodInfos[sectionLodIndices[sectionIndex]];
         var firstIndex = selectedIndices.Count;
-        var sourceFirstIndex = checked(lodInfo.BatchesOffset * 3);
-        var sourceIndexCount = checked(lodInfo.BatchesCount * 3);
+        var sourceFirstIndex = hasMeshlets
+            ? checked(lodInfos[sectionLodIndices[sectionIndex]].BatchesOffset * 3)
+            : checked((int) sourceSection.FirstIndex);
+        var sourceTriangleCount = hasMeshlets
+            ? lodInfos[sectionLodIndices[sectionIndex]].BatchesCount
+            : checked((int) sourceSection.NumTriangles);
+        var sourceIndexCount = checked(sourceTriangleCount * 3);
         if (sourceFirstIndex < 0 || sourceIndexCount < 0 ||
             sourceFirstIndex + sourceIndexCount > fullIndices.Count)
             throw new InvalidOperationException($"FF7 section {sectionIndex} index range is invalid.");
@@ -746,7 +1091,7 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
             ["materialName"] = staticMaterial?.MaterialSlotName.ToString(),
             ["materialPath"] = staticMaterial?.MaterialInterface?.GetPathName(),
             ["firstIndex"] = firstIndex,
-            ["triangleCount"] = lodInfo.BatchesCount,
+            ["triangleCount"] = sourceTriangleCount,
             ["castShadow"] = sourceSection.bCastShadow,
         });
     }
@@ -773,9 +1118,11 @@ static Dictionary<string, object?> ExportRebirthFlattenedStaticMesh(
 
     return new Dictionary<string, object?>
     {
-        ["sourceType"] = "FF7 Rebirth flattened UStaticMesh",
+        ["sourceType"] = hasMeshlets
+            ? "FF7 Rebirth flattened UStaticMesh"
+            : "FF7 Rebirth legacy-indexed flattened UStaticMesh",
         ["name"] = meshName,
-        ["renderData"] = "FlattenedMeshlets",
+        ["renderData"] = hasMeshlets ? "FlattenedMeshlets" : "FlattenedLegacyIndices",
         ["lodIndex"] = 0,
         ["vertexCount"] = compactPositions.Length,
         ["triangleCount"] = remappedIndices.Length / 3,
@@ -932,7 +1279,11 @@ static Dictionary<string, object?> ExportRebirthSkeletalMesh(
         !lod.SkipLod && lod.VertexBufferGPUSkin.VertsFloat.Length > 0 &&
         lod.Indices?.Buffer is { Length: > 0 });
     if (lodIndex < 0)
+    {
+        if (package is CUE4Parse.UE4.Assets.IoPackage ioPackage)
+            return ExportRebirthInlineSkeletalMesh(provider, assetPath, ioPackage, sourceMesh);
         throw new InvalidOperationException("SkeletalMesh has no importable Rebirth LOD.");
+    }
 
     var sourceLod = lods[lodIndex];
     var vertices = sourceLod.VertexBufferGPUSkin.VertsFloat;
@@ -1047,6 +1398,154 @@ static Dictionary<string, object?> ExportRebirthSkeletalMesh(
     };
 }
 
+static Dictionary<string, object?> ExportRebirthInlineSkeletalMesh(
+    DefaultFileProvider provider,
+    string assetPath,
+    CUE4Parse.UE4.Assets.IoPackage package,
+    USkeletalMesh sourceMesh)
+{
+    var usage = ReadRebirthMeshUsage(provider, assetPath, package);
+    var payload = usage.Reader.InlineLod
+        ?? throw new InvalidOperationException("SkeletalMesh has no supported inline Rebirth LOD.");
+    var sourceLod = usage.Reader.Lods.FirstOrDefault()
+        ?? throw new InvalidOperationException("SkeletalMesh has no inline render-section data.");
+    var vertices = payload.Positions;
+    var indices = payload.Indices;
+    if (vertices.Length == 0 || indices.Length == 0)
+        throw new InvalidOperationException("SkeletalMesh inline payload has no render geometry.");
+    if (payload.PackedFrames.Length != vertices.Length || payload.Weights.Length != vertices.Length)
+        throw new InvalidOperationException("SkeletalMesh inline vertex streams have inconsistent lengths.");
+
+    var vertexSections = Enumerable.Repeat(-1, vertices.Length).ToArray();
+    for (var sectionIndex = 0; sectionIndex < sourceLod.Sections.Length; sectionIndex++)
+    {
+        var section = sourceLod.Sections[sectionIndex];
+        var firstVertex = checked((int)section.BaseVertexIndex);
+        var lastVertex = checked(firstVertex + section.NumVertices);
+        if (firstVertex < 0 || lastVertex > vertices.Length)
+            throw new InvalidOperationException($"SkeletalMesh section {sectionIndex} vertex range is invalid.");
+        for (var vertexIndex = firstVertex; vertexIndex < lastVertex; vertexIndex++)
+            vertexSections[vertexIndex] = sectionIndex;
+    }
+    if (vertexSections.Any(sectionIndex => sectionIndex < 0) || indices.Any(index => index >= vertices.Length))
+        throw new InvalidOperationException("SkeletalMesh inline geometry has invalid vertex references.");
+
+    var requiredIndexCount = sourceLod.Sections.Length == 0 ? indices.Length : sourceLod.Sections.Max(section =>
+        checked((int)section.BaseIndex + section.NumTriangles * 3));
+    if (requiredIndexCount <= 0 || requiredIndexCount > indices.Length)
+        throw new InvalidOperationException("SkeletalMesh inline section index ranges are invalid.");
+
+    var normals = new float[vertices.Length][];
+    var tangents = new float[vertices.Length][];
+    for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+        DecodeRebirthPackedFrame(payload.PackedFrames[vertexIndex], out normals[vertexIndex], out tangents[vertexIndex]);
+
+    var referenceBones = usage.Reader.ReferenceSkeleton.FinalRefBoneInfo;
+    var weights = new List<object?>(vertices.Length);
+    for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+    {
+        var influence = payload.Weights[vertexIndex];
+        var section = sourceLod.Sections[vertexSections[vertexIndex]];
+        var divisor = influence.bUse16BitBoneWeight ? 65535.0f : 255.0f;
+        var vertexWeights = new List<object?>();
+        for (var influenceIndex = 0; influenceIndex < influence.BoneIndex.Length; influenceIndex++)
+        {
+            var weight = influence.BoneWeight[influenceIndex];
+            if (weight == 0)
+                continue;
+            var localBoneIndex = influence.BoneIndex[influenceIndex];
+            if (localBoneIndex >= section.BoneMap.Length)
+                throw new InvalidOperationException($"SkeletalMesh vertex {vertexIndex} has an invalid section-local bone index.");
+            var skeletonBoneIndex = section.BoneMap[localBoneIndex];
+            if (skeletonBoneIndex >= referenceBones.Length)
+                throw new InvalidOperationException($"SkeletalMesh vertex {vertexIndex} references an invalid skeleton bone.");
+            vertexWeights.Add(new[] { (float)skeletonBoneIndex, weight / divisor });
+        }
+        weights.Add(vertexWeights);
+    }
+
+    var materials = sourceMesh.SkeletalMaterials;
+    var sections = sourceLod.Sections.Select(section =>
+    {
+        var material = section.MaterialIndex >= 0 && section.MaterialIndex < materials.Length
+            ? materials[section.MaterialIndex]
+            : null;
+        return (object?)new Dictionary<string, object?>
+        {
+            ["materialIndex"] = section.MaterialIndex,
+            ["materialName"] = material?.MaterialSlotName.ToString(),
+            ["materialPath"] = material?.Material?.GetPathName(),
+            ["firstIndex"] = section.BaseIndex,
+            ["triangleCount"] = section.NumTriangles,
+            ["castShadow"] = section.bCastShadow,
+        };
+    }).ToList();
+
+    return new Dictionary<string, object?>
+    {
+        ["sourceType"] = "FF7 Rebirth inline USkeletalMesh",
+        ["name"] = sourceMesh.Name.ToString(),
+        ["lodIndex"] = 0,
+        ["vertexCount"] = vertices.Length,
+        ["triangleCount"] = requiredIndexCount / 3,
+        ["positions"] = vertices.Select(vertex => new[] { vertex.X, vertex.Y, vertex.Z }).ToArray(),
+        ["normals"] = normals,
+        ["tangents"] = tangents,
+        ["normalFormat"] = "R10G10B10A2 packed tangent frame",
+        ["uvChannels"] = payload.UvChannels,
+        ["colors"] = null,
+        ["indices"] = indices.Take(requiredIndexCount).ToArray(),
+        ["sections"] = sections,
+        ["boneNames"] = referenceBones.Select(bone => bone.Name.ToString()).ToArray(),
+        ["weights"] = weights,
+        ["linkedSkeletonPath"] = GetLinkedSkeletonPath(sourceMesh),
+        ["skeletonPath"] = ObjectPathToVirtualAssetPath(GetLinkedSkeletonPath(sourceMesh)),
+    };
+}
+
+static void DecodeRebirthPackedFrame(uint packedFrame, out float[] normal, out float[] tangent)
+{
+    var u = (packedFrame & 1023) / 1023.0f;
+    var v = ((packedFrame >> 10) & 1023) / 1023.0f;
+    var nx = u - v;
+    var ny = u + v - 1.0f;
+    var nz = 1.0f - MathF.Abs(nx) - MathF.Abs(ny);
+    if ((packedFrame & (1u << 30)) == 0)
+        nz = -nz;
+    var normalLength = MathF.Sqrt(nx * nx + ny * ny + nz * nz);
+    if (normalLength <= float.Epsilon)
+        throw new InvalidOperationException("SkeletalMesh inline payload contains a degenerate tangent frame.");
+    nx /= normalLength;
+    ny /= normalLength;
+    nz /= normalLength;
+    normal = [nx, ny, nz];
+
+    var sign = nz >= 0.0f ? -1.0f : 1.0f;
+    var a = 1.0f / (nz - sign);
+    var e1x = 1.0f + sign * nx * nx * a;
+    var e1y = sign * nx * ny * a;
+    var e1z = sign * nx;
+    var e2x = nx * ny * a;
+    var e2y = sign + ny * ny * a;
+    var e2z = ny;
+    var angle = (packedFrame >> 20) & 1023;
+    var t = (angle & 255) / 255.0f;
+    var cx = (angle & 256) != 0 ? t : -t;
+    var cy = (angle & 512) != 0 ? 1.0f - t : -(1.0f - t);
+    var circleLength = MathF.Sqrt(cx * cx + cy * cy);
+    if (circleLength <= float.Epsilon)
+        throw new InvalidOperationException("SkeletalMesh inline payload contains a degenerate tangent direction.");
+    cx /= circleLength;
+    cy /= circleLength;
+    tangent =
+    [
+        e1x * cx + e2x * cy,
+        e1y * cx + e2y * cy,
+        e1z * cx + e2z * cy,
+        (packedFrame & (1u << 31)) != 0 ? 1.0f : -1.0f,
+    ];
+}
+
 static Dictionary<string, object?> ExportKdiAsset(CUE4Parse.UE4.Assets.IPackage package)
 {
     var export = package.GetExports().FirstOrDefault()
@@ -1072,12 +1571,45 @@ static Dictionary<string, object?> ExportKdiAsset(CUE4Parse.UE4.Assets.IPackage 
     };
 }
 
+// Walk a component's Template chain looking for the first non-null value of
+// any of the given properties. Blueprint-derived component instances often
+// omit their asset reference from their own serialized properties; the value
+// instead lives on some ancestor in the Template chain -- typically the
+// Blueprint's class-default-object subobject (e.g. a Gimmick prop's chair
+// mesh, which fmodel shows serialized on Default__BG2202_00_Chair_Standard_C's
+// own "SkeletalMeshComponent0", never on the level-placed instance).
+//
+// This walks plain UObject rather than a specific component subclass
+// (compare the typed UStaticMeshComponent.GetStaticMesh() usage below) because
+// this game's custom component classes (e.g. "EndSkeletalMeshComponent") do
+// not reliably construct as their matching native CUE4Parse type, which made
+// a typed Template-walk helper silently miss these values.
+static FPackageIndex? ResolveInheritedComponentProperty(
+    CUE4Parse.UE4.Assets.Exports.UObject component,
+    params string[] propertyNames)
+{
+    var visited = new HashSet<CUE4Parse.UE4.Assets.Exports.UObject>();
+    var current = component;
+    while (current != null && visited.Add(current))
+    {
+        foreach (var propertyName in propertyNames)
+        {
+            var value = current.GetOrDefault<FPackageIndex>(propertyName, new FPackageIndex());
+            if (!value.IsNull)
+                return value;
+        }
+        current = current.Template?.Load();
+    }
+    return null;
+}
+
 static Dictionary<string, object?> ExportUmapActors(CUE4Parse.UE4.Assets.IPackage package)
 {
     var supportedTypes = new HashSet<string>(StringComparer.Ordinal)
     {
         "EndEnvironmentStaticMeshComponent",
         "StaticMeshComponent",
+        "EndStaticMeshPhysicsPartsComponent",
         "EndSkeletalMeshComponent",
         "PointLightComponent",
         "SpotLightComponent",
@@ -1097,6 +1629,30 @@ static Dictionary<string, object?> ExportUmapActors(CUE4Parse.UE4.Assets.IPackag
             properties[name.ToString()!] = converted.TryGetValue("value", out var value)
                 ? NormalizeKdiValue(value)
                 : null;
+        }
+
+        // Blueprint-derived component instances commonly omit StaticMesh from
+        // their own serialized properties. UStaticMeshComponent resolves that
+        // inherited value through its Template chain, so expose the resolved
+        // package reference in the same shape as an explicit property.
+        if (export is UStaticMeshComponent staticMeshComponent &&
+            !properties.ContainsKey("StaticMesh"))
+        {
+            var staticMesh = staticMeshComponent.GetStaticMesh();
+            if (!staticMesh.IsNull)
+                properties["StaticMesh"] = ConvertValue(staticMesh);
+        }
+
+        // EndSkeletalMeshComponent instances have the same template-inheritance
+        // behavior. Export the resolved asset reference so Blender can build the
+        // mesh-and-armature source collection instead of creating an empty.
+        if (export.ExportType == "EndSkeletalMeshComponent" &&
+            !properties.ContainsKey("SkeletalMesh") &&
+            !properties.ContainsKey("SkinnedAsset"))
+        {
+            var skeletalMesh = ResolveInheritedComponentProperty(export, "SkeletalMesh", "SkinnedAsset");
+            if (skeletalMesh != null)
+                properties["SkeletalMesh"] = ConvertValue(skeletalMesh);
         }
 
         // The existing JSON map importer uses Outer only to give component-derived
@@ -1399,6 +1955,7 @@ static Dictionary<string, object?> ExportRebirthMeshUsage(
     result["sourceType"] = "USkeletalMesh (Rebirth narrow reader)";
     result["nativeExportOffset"] = usage.ExportOffset;
     result["nativeExportSize"] = usage.ExportSize;
+    result["cookedLodPayloads"] = reader.CookedLodPayloads;
     result["lods"] = reader.Lods.Select(lod => (object?)new Dictionary<string, object?>
     {
         ["requiredBones"] = ExportBoneIndices(lod.RequiredBones),
@@ -1524,6 +2081,139 @@ static Dictionary<string, object?> FindMeshAssetsByExportType(
         ["staticMeshes"] = staticMeshes,
         ["skeletalMeshes"] = skeletalMeshes,
         ["failures"] = failures,
+    };
+}
+
+static string? GetAnimationSkeletonPath(UAnimationAsset animation)
+{
+    try
+    {
+        return animation.Skeleton?.ResolvedObject?.GetPathName();
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+static Dictionary<string, object?> FindAnimationAssetsForSkeleton(
+    DefaultFileProvider provider,
+    string skeletonAssetPath,
+    string? searchPath = null,
+    string? searchToken = null)
+{
+    var targetObjectPath = VirtualAssetToObjectPath(skeletonAssetPath);
+    var animations = new List<object?>();
+    var failures = 0;
+
+    // Package export maps are inexpensive to inspect.  Deserialize only files
+    // which actually contain an AnimSequence export, then resolve the Skeleton
+    // property to keep the Blender picker limited to the selected rig.
+    foreach (var path in provider.Files.Keys
+        .Where(path => path.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
+        .Where(path => string.IsNullOrWhiteSpace(searchPath) ||
+            path.StartsWith(searchPath, StringComparison.OrdinalIgnoreCase))
+        .Where(path => string.IsNullOrWhiteSpace(searchToken) ||
+            path.Contains(searchToken, StringComparison.OrdinalIgnoreCase))
+        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+    {
+        try
+        {
+            if (provider.LoadPackage(path) is not CUE4Parse.UE4.Assets.IoPackage package)
+                continue;
+            var hasAnimSequence = package.ExportMap.Any(export => string.Equals(
+                package.ResolveObjectIndex(export.ClassIndex)?.Name.ToString(),
+                "AnimSequence", StringComparison.OrdinalIgnoreCase));
+            if (!hasAnimSequence)
+                continue;
+
+            foreach (var animation in ((CUE4Parse.UE4.Assets.IPackage) package)
+                .GetExports().OfType<UAnimSequence>())
+            {
+                var linkedSkeletonPath = GetAnimationSkeletonPath(animation);
+                if (!string.Equals(linkedSkeletonPath, targetObjectPath,
+                    StringComparison.OrdinalIgnoreCase))
+                    continue;
+                animations.Add(new Dictionary<string, object?>
+                {
+                    ["assetPath"] = path,
+                    ["name"] = animation.Name.ToString(),
+                    ["type"] = animation.ExportType,
+                    ["skeletonPath"] = skeletonAssetPath,
+                });
+            }
+        }
+        catch
+        {
+            // Cooked packages which cannot be read are unrelated to this picker's
+            // result.  Keep scanning so one bad asset cannot hide a character's clips.
+            failures++;
+        }
+    }
+    return new Dictionary<string, object?>
+    {
+        ["animations"] = animations,
+        ["failures"] = failures,
+    };
+}
+
+static float[] ExportVector(CUE4Parse.UE4.Objects.Core.Math.FVector value)
+    => [value.X, value.Y, value.Z];
+
+static float[] ExportQuaternion(CUE4Parse.UE4.Objects.Core.Math.FQuat value)
+    => [value.X, value.Y, value.Z, value.W];
+
+static float[] KeyTimes(float[] times, int keyCount, int numFrames)
+{
+    if (times.Length == keyCount && keyCount > 0)
+        return times;
+    if (keyCount <= 1)
+        return keyCount == 0 ? [] : [0.0f];
+    var lastFrame = Math.Max(1, numFrames - 1);
+    return Enumerable.Range(0, keyCount)
+        .Select(index => index * (float) lastFrame / (keyCount - 1))
+        .ToArray();
+}
+
+static Dictionary<string, object?> ExportAnimationPackage(CUE4Parse.UE4.Assets.IPackage package)
+{
+    var source = package.GetExports().OfType<UAnimSequence>().FirstOrDefault()
+        ?? throw new InvalidOperationException("Package does not contain a UAnimSequence export.");
+    var skeleton = source.Skeleton?.Load<USkeleton>()
+        ?? throw new InvalidOperationException("Animation does not resolve a USkeleton.");
+    var converted = skeleton.ConvertAnims(source);
+    var sequence = converted.Sequences.FirstOrDefault()
+        ?? throw new InvalidOperationException("CUE4Parse did not produce an animation sequence.");
+    var boneInfo = skeleton.ReferenceSkeleton.FinalRefBoneInfo;
+    var bonePose = skeleton.ReferenceSkeleton.FinalRefBonePose;
+    var tracks = new List<object?>();
+    for (var index = 0; index < Math.Min(boneInfo.Length, sequence.Tracks.Count); index++)
+    {
+        var track = sequence.Tracks[index];
+        if (!track.HasKeys())
+            continue;
+        tracks.Add(new Dictionary<string, object?>
+        {
+            ["boneName"] = boneInfo[index].Name.ToString(),
+            ["bindTranslation"] = index < bonePose.Length ? ExportVector(bonePose[index].Translation) : new float[] { 0, 0, 0 },
+            ["bindRotation"] = index < bonePose.Length ? ExportQuaternion(bonePose[index].Rotation) : new float[] { 0, 0, 0, 1 },
+            ["bindScale"] = index < bonePose.Length ? ExportVector(bonePose[index].Scale3D) : new float[] { 1, 1, 1 },
+            ["translations"] = track.KeyPos.Select(ExportVector).ToArray(),
+            ["translationFrames"] = KeyTimes(track.KeyPosTime, track.KeyPos.Length, sequence.NumFrames),
+            ["rotations"] = track.KeyQuat.Select(ExportQuaternion).ToArray(),
+            ["rotationFrames"] = KeyTimes(track.KeyQuatTime, track.KeyQuat.Length, sequence.NumFrames),
+            ["scales"] = track.KeyScale.Select(ExportVector).ToArray(),
+            ["scaleFrames"] = KeyTimes(track.KeyScaleTime, track.KeyScale.Length, sequence.NumFrames),
+        });
+    }
+    return new Dictionary<string, object?>
+    {
+        ["name"] = sequence.Name,
+        ["skeletonPath"] = ObjectPathToVirtualAssetPath(GetAnimationSkeletonPath(source)),
+        ["numFrames"] = sequence.NumFrames,
+        ["duration"] = sequence.AnimEndTime,
+        ["framesPerSecond"] = sequence.FramesPerSecond,
+        ["tracks"] = tracks,
     };
 }
 
@@ -1715,6 +2405,25 @@ try
                     Console.Out.Flush();
                     continue;
                 }
+                if (string.Equals(action, "animation_index", StringComparison.OrdinalIgnoreCase))
+                {
+                    var skeletonAssetPath = requestRoot.GetProperty("skeletonAssetPath").GetString()
+                        ?? throw new ArgumentException("Animation index request has no skeletonAssetPath.");
+                    var searchPath = requestRoot.TryGetProperty("searchPath", out var searchPathElement)
+                        ? searchPathElement.GetString()
+                        : null;
+                    var searchToken = requestRoot.TryGetProperty("searchToken", out var searchTokenElement)
+                        ? searchTokenElement.GetString()
+                        : null;
+                    Console.WriteLine(JsonSerializer.Serialize(new
+                    {
+                        ok = true,
+                        action,
+                        animationIndex = FindAnimationAssetsForSkeleton(provider, skeletonAssetPath, searchPath, searchToken),
+                    }));
+                    Console.Out.Flush();
+                    continue;
+                }
                 var requestAsset = requestRoot.GetProperty("assetPath").GetString()
                     ?? throw new ArgumentException("Asset request has no assetPath.");
                 if (string.Equals(action, "raw", StringComparison.OrdinalIgnoreCase))
@@ -1791,6 +2500,17 @@ try
                         skeleton = ExportSkeletonPackage(requestPackage)
                     }));
                 }
+                else if (string.Equals(action, "animation", StringComparison.OrdinalIgnoreCase))
+                {
+                    var requestPackage = provider.LoadPackage(requestAsset);
+                    Console.WriteLine(JsonSerializer.Serialize(new
+                    {
+                        ok = true,
+                        action,
+                        assetPath = requestAsset,
+                        animation = ExportAnimationPackage(requestPackage)
+                    }));
+                }
                 else if (string.Equals(action, "static_mesh", StringComparison.OrdinalIgnoreCase))
                 {
                     var requestPackage = provider.LoadPackage(requestAsset) as CUE4Parse.UE4.Assets.IoPackage
@@ -1801,6 +2521,17 @@ try
                         action,
                         assetPath = requestAsset,
                         staticMesh = ExportRebirthStaticMesh(provider, requestAsset, requestPackage)
+                    }));
+                }
+                else if (string.Equals(action, "material", StringComparison.OrdinalIgnoreCase))
+                {
+                    var requestPackage = provider.LoadPackage(requestAsset);
+                    Console.WriteLine(JsonSerializer.Serialize(new
+                    {
+                        ok = true,
+                        action,
+                        assetPath = requestAsset,
+                        material = ExportMaterialInstancePackage(requestPackage),
                     }));
                 }
                 else if (string.Equals(action, "skeletal_mesh", StringComparison.OrdinalIgnoreCase))
@@ -2034,14 +2765,15 @@ catch (Exception ex)
 }
 
 /// <summary>
-/// Rebirth's streamed skeletal render payload changes after the LOD bone tables.
-/// This reader intentionally stops before that vertex payload: only the bind hierarchy,
-/// RequiredBones, ActiveBoneIndices, and section BoneMaps are needed for rig analysis.
+/// Reads the Rebirth skeletal render header plus the inline render layout used by
+/// small environment rigs.  Larger meshes still use CUE4Parse's bulk decoder.
 /// </summary>
 sealed class RebirthSkeletalMeshUsageReader : UObject
 {
     public FReferenceSkeleton ReferenceSkeleton { get; private set; } = null!;
     public List<FStaticLODModel> Lods { get; } = [];
+    public List<Dictionary<string, object?>> CookedLodPayloads { get; } = [];
+    public RebirthInlineSkeletalLod? InlineLod { get; private set; }
 
     public override void Deserialize(FAssetArchive archive, long validPos)
     {
@@ -2079,7 +2811,7 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
 
         var cookedLodCount = archive.Read<int>();
         if (cookedLodCount > 0)
-            Lods.Add(ReadCookedLod(archive));
+            Lods.Add(ReadCookedLod(archive, CookedLodPayloads));
 
         // The remaining streamed LOD payload contains the changed vertex format,
         // including normal packing. LOD 0 provides the full mesh's used-bone set,
@@ -2087,12 +2819,14 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
         _ = vertexColorChannels;
     }
 
-    private static FStaticLODModel ReadCookedLod(FAssetArchive archive)
+    private FStaticLODModel ReadCookedLod(
+        FAssetArchive archive,
+        List<Dictionary<string, object?>> cookedLodPayloads)
     {
         var lod = new FStaticLODModel();
         var stripDataFlags = new FStripDataFlags(archive);
         var isCookedOut = archive.ReadBoolean();
-        _ = archive.ReadBoolean(); // bInlined: the omitted payload begins after our data.
+        var isInlined = archive.ReadBoolean();
         lod.RequiredBones = archive.ReadArray<short>();
         if (isCookedOut)
             return lod;
@@ -2105,6 +2839,93 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
         });
         lod.ActiveBoneIndices = archive.ReadArray<short>();
         _ = archive.Read<uint>(); // BuffersSize
+        if (isInlined)
+        {
+            var payloadOffset = archive.Position;
+            InlineLod = ReadInlineLodPayload(archive);
+            cookedLodPayloads.Add(new Dictionary<string, object?>
+            {
+                ["inlined"] = true,
+                ["payloadOffset"] = payloadOffset,
+                ["vertexCount"] = InlineLod.Positions.Length,
+                ["indexCount"] = InlineLod.Indices.Length,
+            });
+            return lod;
+        }
+        var bulkData = new FByteBulkData(archive);
+        var data = bulkData.Data;
+        cookedLodPayloads.Add(new Dictionary<string, object?>
+        {
+            ["inlined"] = false,
+            ["flags"] = bulkData.BulkDataFlags.ToString(),
+            ["elementCount"] = bulkData.Header.ElementCount,
+            ["sizeOnDisk"] = bulkData.Header.SizeOnDisk,
+            ["offsetInFile"] = bulkData.Header.OffsetInFile,
+            ["dataLength"] = data?.Length,
+        });
         return lod;
     }
+
+    private static RebirthInlineSkeletalLod ReadInlineLodPayload(FAssetArchive archive)
+    {
+        _ = new FStripDataFlags(archive);
+        var indexBuffer = new FMultisizeIndexContainer(archive);
+        var indices = indexBuffer.Buffer ?? throw new InvalidOperationException("Inline SkeletalMesh has no index stream.");
+        var positions = new FPositionVertexBuffer(archive).Verts;
+
+        _ = new FStripDataFlags(
+            archive,
+            FPackageFileVersion.CreateUE4Version(
+                EUnrealEngineObjectUE4Version.STATIC_SKELETAL_MESH_SERIALIZATION_FIX));
+        var uvChannelCount = archive.Read<int>();
+        var attributeVertexCount = archive.Read<int>();
+        var fullPrecisionUvs = archive.ReadBoolean();
+        var highPrecisionTangents = archive.ReadBoolean();
+        var tangentItemSize = archive.Read<int>();
+        var tangentItemCount = archive.Read<int>();
+        if (positions.Length == 0 || attributeVertexCount != positions.Length ||
+            uvChannelCount is < 1 or > 8 || fullPrecisionUvs || highPrecisionTangents ||
+            tangentItemSize != sizeof(uint) || tangentItemCount != positions.Length)
+            throw new InvalidOperationException(
+                "Unsupported inline Rebirth SkeletalMesh vertex metadata " +
+                $"(vertices={attributeVertexCount}/{positions.Length}, uvs={uvChannelCount}, " +
+                $"fullUV={fullPrecisionUvs}, highTangent={highPrecisionTangents}, " +
+                $"tangents={tangentItemCount}x{tangentItemSize}).");
+        var packedFrames = archive.ReadArray<uint>(tangentItemCount);
+
+        var uvItemSize = archive.Read<int>();
+        var uvItemCount = archive.Read<int>();
+        if (uvItemSize != sizeof(ushort) * 2 || uvItemCount != positions.Length * uvChannelCount)
+            throw new InvalidOperationException(
+                $"Unsupported inline Rebirth SkeletalMesh UV metadata ({uvItemCount}x{uvItemSize}).");
+        var uvChannels = Enumerable.Range(0, uvChannelCount)
+            .Select(_ => new float[positions.Length][]).ToArray();
+        for (var vertexIndex = 0; vertexIndex < positions.Length; vertexIndex++)
+        for (var channelIndex = 0; channelIndex < uvChannelCount; channelIndex++)
+            uvChannels[channelIndex][vertexIndex] =
+            [
+                (float)archive.Read<Half>(),
+                (float)archive.Read<Half>(),
+            ];
+
+        var weights = new FSkinWeightVertexBuffer(archive, false).Weights;
+        if (weights.Length != positions.Length)
+            throw new InvalidOperationException(
+                $"Inline Rebirth SkeletalMesh weight count {weights.Length} does not match {positions.Length} vertices.");
+        return new RebirthInlineSkeletalLod(indices, positions, packedFrames, uvChannels, weights);
+    }
+}
+
+sealed class RebirthInlineSkeletalLod(
+    uint[] indices,
+    FVector[] positions,
+    uint[] packedFrames,
+    float[][][] uvChannels,
+    FSkinWeightInfo[] weights)
+{
+    public uint[] Indices { get; } = indices;
+    public FVector[] Positions { get; } = positions;
+    public uint[] PackedFrames { get; } = packedFrames;
+    public float[][][] UvChannels { get; } = uvChannels;
+    public FSkinWeightInfo[] Weights { get; } = weights;
 }
