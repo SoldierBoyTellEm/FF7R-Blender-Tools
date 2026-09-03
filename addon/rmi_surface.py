@@ -30,6 +30,70 @@ _COMMON_EYE_PLAYER_NG = "/game/character/common/eye/texture/common_eye_player_ng
 _RENDERER_CONSTANT_TEXTURE = re.compile(
     r"(?:^|/)([0-9a-f]{8})_(srgb|bc4|bc5|hdr)(?:\.[^/]*)?$", re.IGNORECASE
 )
+_LIMBAL_BONE_NAME = "C_Limbal"
+_EYE_PATH_LABEL = "eye path (SM 9)"
+
+
+def _eye_path_nodes(material: bpy.types.Material) -> list[bpy.types.Node]:
+    """Return the material's top-level RMI eye-path group instances."""
+    tree = material.node_tree
+    if tree is None:
+        return []
+    return [
+        node for node in tree.nodes
+        if node.bl_idname == "ShaderNodeGroup"
+        and node.label == _EYE_PATH_LABEL
+        and node.inputs.get("Light Position") is not None
+    ]
+
+
+def _set_limbal_driver(socket: bpy.types.NodeSocket, armature: bpy.types.Object) -> None:
+    """Drive a vector socket from ``C_Limbal`` in world space."""
+    for component, transform_type in enumerate(("LOC_X", "LOC_Y", "LOC_Z")):
+        try:
+            socket.driver_remove("default_value", component)
+        except (TypeError, ValueError, RuntimeError):
+            pass
+        fcurve = socket.driver_add("default_value", component)
+        driver = fcurve.driver
+        driver.type = "AVERAGE"
+        variable = driver.variables.new()
+        variable.name = "limbal"
+        variable.type = "TRANSFORMS"
+        target = variable.targets[0]
+        target.id = armature
+        target.bone_target = _LIMBAL_BONE_NAME
+        target.transform_type = transform_type
+        target.transform_space = "WORLD_SPACE"
+
+
+def configure_limbal_eye_drivers(
+        obj: bpy.types.Object,
+        armature: bpy.types.Object,
+) -> int:
+    """Give this object's RMI eye materials world-space C_Limbal drivers.
+
+    The RMI master graph carries an eye-path group even for non-eye variants,
+    so the material's variant-selected Shading Model is the authoritative test
+    here.  Materials are deliberately not copied or renamed for this setup.
+    """
+    if armature is None or armature.type != "ARMATURE":
+        return 0
+    if armature.pose is None or armature.pose.bones.get(_LIMBAL_BONE_NAME) is None:
+        return 0
+
+    configured = 0
+    for slot in obj.material_slots:
+        material = slot.material
+        if material is None or material.get("Shading Model") != 5:
+            continue
+        eye_nodes = _eye_path_nodes(material)
+        if not eye_nodes:
+            continue
+        for eye_node in eye_nodes:
+            _set_limbal_driver(eye_node.inputs["Light Position"], armature)
+            configured += 1
+    return configured
 
 
 def _source_files() -> tuple[Path, Path, Path]:

@@ -22,6 +22,20 @@ DEGENERATE_LENGTH = 1.0e-5
 DEFAULT_BONE_LENGTH = 0.05
 LEAF_LENGTH_RATIO = 0.5
 
+# The artist-facing limbal controller is placed one international foot in front
+# of the character's eyes.  Package skeletons use Blender units after their
+# centimeter-to-unit import scale, so this is deliberately a scene-unit value
+# rather than a source-data distance.
+LIMBAL_BONE_NAME = "C_Limbal"
+# The root of the KineDriver helper-bone subtree: pure rigging machinery that
+# drives shape-key/material parameters via bone transforms, not mesh skinning.
+# It and every descendant must never deform geometry.
+KDI_ROOT_BONE_NAME = "C_KDIRoot"
+FACE_BASE_BONE_NAME = "C_FaceBase_a"
+FACE_BASE_CHILD_WIDGET_NAME = "WGT_Cube"
+LIMBAL_DISTANCE = 0.3048
+EYE_BONE_NAMES: frozenset[str] = frozenset(("l_eye", "r_eye"))
+
 # A bone's real successor in the skeleton chain sits exactly along its +X (measured
 # at 0.00 degrees throughout Cloud's skeleton); accessory children -- cloth, armour,
 # prop holders -- are all >= 3 degrees off. A small tolerance therefore separates
@@ -57,8 +71,35 @@ CONNECT_DISTANCE_THRESHOLD = 0.0001
 # sideways. This is deliberately bare-bones -- the user still has to add and
 # aim their own target objects; it just saves the constraint/limit busywork.
 IK_END_BONES: tuple[str, ...] = ("R_Foot_a", "L_Foot_a", "R_Hand_a", "L_Hand_a")
-IK_CHAIN_COUNT = 3
+IK_CHAIN_COUNT = 2
 IK_HINGE_BONES: tuple[str, ...] = ("L_Foreleg_a", "R_Foreleg_a", "L_Forearm_a", "R_Forearm_a")
+
+# ``face_y_forward`` rotates the whole finished skeleton -90 degrees about Z, so a
+# root bone originally aimed down Blender's +X (Unreal's own forward axis, once
+# mirrored) ends up facing -Y instead (Blender's own forward convention). It is applied once to each root bone's
+# armature-space matrix -- every descendant is composed from its parent's matrix
+# (see ``_build_edit_bones``), so the rotation propagates through the whole
+# hierarchy for free without needing a separate per-bone quaternion conversion.
+Y_FORWARD_ROTATION = Matrix.Rotation(math.radians(-90.0), 4, "Z")
+
+# The two forward-axis choices, and the armature property recording which one an
+# import used. Defined here rather than next to the operator's enum so the
+# animation importer can read the choice back without importing the UI module,
+# and so the stored value and the enum value can never drift apart.
+FACE_FORWARD_UNREAL = "UNREAL"
+FACE_FORWARD_BLENDER = "BLENDER"
+FACE_FORWARD_PROPERTY = "ff7r_face_forward"
+
+
+def armature_face_forward(armature_obj: Any) -> str:
+    """Which forward axis an armature was built with.
+
+    Armatures imported before this was recorded, and any rig built elsewhere,
+    report ``FACE_FORWARD_UNREAL`` -- the operator default, and the only value
+    that was ever produced without the option being set.
+    """
+    value = armature_obj.get(FACE_FORWARD_PROPERTY) if armature_obj else None
+    return FACE_FORWARD_BLENDER if value == FACE_FORWARD_BLENDER else FACE_FORWARD_UNREAL
 
 
 def apply_naive_ik(armature_obj: bpy.types.Object) -> tuple[int, int]:
@@ -75,6 +116,7 @@ def apply_naive_ik(armature_obj: bpy.types.Object) -> tuple[int, int]:
             continue
         constraint = pose_bone.constraints.new(type="IK")
         constraint.chain_count = IK_CHAIN_COUNT
+        constraint.use_tail = False
         end_bones_configured += 1
 
     hinge_bones_configured = 0
@@ -161,6 +203,8 @@ def build_armature_from_bones(
         create_socket_empties: bool = True,
         create_socket_bones: bool = False,
         setup_naive_ik: bool = False,
+        face_y_forward: bool = False,
+        create_limbal_bone: bool = False,
 ) -> bpy.types.Object:
     """Create a new armature object with one edit-bone per entry in `bones`.
 
@@ -190,6 +234,14 @@ def build_armature_from_bones(
 
     ``setup_naive_ik`` additionally calls ``apply_naive_ik`` -- see there for
     what it does.
+
+    ``face_y_forward`` rotates the whole armature -90 degrees about Z so it
+    faces Blender's -Y axis instead of the default +X -- see
+    ``Y_FORWARD_ROTATION`` above.
+
+    ``create_limbal_bone`` adds the non-deforming ``C_Limbal`` controller when
+    the hierarchy contains ``L_Eye`` or ``R_Eye``.  It is placed from the
+    character's forward convention, never from the eye bone's local axes.
     """
 
     if not bones:
@@ -205,13 +257,20 @@ def build_armature_from_bones(
 
     bpy.ops.object.mode_set(mode="EDIT")
     try:
-        armature_space = _build_edit_bones(armature_data, bones, scale_factor, connect_bones)
+        armature_space = _build_edit_bones(
+            armature_data, bones, scale_factor, connect_bones, face_y_forward
+        )
         socket_bone_names = (
             _build_socket_edit_bones(
                 armature_data, sockets, bones, armature_space, scale_factor
             )
             if sockets and create_socket_bones
             else {}
+        )
+        limbal_created = (
+            _build_limbal_edit_bone(armature_data, bones, face_y_forward)
+            if create_limbal_bone
+            else False
         )
     except Exception:
         # Never leave a half-built armature behind for the user to clean up.
@@ -220,6 +279,17 @@ def build_armature_from_bones(
         bpy.data.armatures.remove(armature_data)
         raise
     bpy.ops.object.mode_set(mode="OBJECT")
+
+    # Record the forward axis: it is baked into the bone rest matrices and cannot
+    # be recovered from them afterwards, but importing animation onto this rig
+    # needs to know which convention its root bones were built in.
+    armature_obj[FACE_FORWARD_PROPERTY] = (
+        FACE_FORWARD_BLENDER if face_y_forward else FACE_FORWARD_UNREAL
+    )
+
+    if limbal_created:
+        _add_limbal_face_constraint(context, armature_obj)
+        _assign_face_base_child_custom_shapes(context, armature_obj)
 
     if sockets:
         armature_obj["ff7r_sockets"] = json.dumps(sockets, ensure_ascii=False)
@@ -235,6 +305,112 @@ def build_armature_from_bones(
         apply_naive_ik(armature_obj)
 
     return armature_obj
+
+
+def _build_limbal_edit_bone(
+        armature_data: Any,
+        bones: list[dict[str, Any]],
+        face_y_forward: bool,
+) -> bool:
+    """Add ``C_Limbal`` at eye height in front of the character, if possible.
+
+    The source hierarchy's order is authoritative when both eyes are present:
+    the first ``L_Eye``/``R_Eye`` encountered supplies the vertical level.  Its
+    lateral position is intentionally discarded so the controller is centered
+    on the character.  This makes the result independent of which eye appears
+    first, and of the eye bone's local rotation.
+    """
+    edit_bones = armature_data.edit_bones
+    if edit_bones.get(LIMBAL_BONE_NAME) is not None:
+        return False
+
+    eye_name = next(
+        (str(bone.get("name", "")) for bone in bones
+         if str(bone.get("name", "")).casefold() in EYE_BONE_NAMES),
+        None,
+    )
+    eye_bone = edit_bones.get(eye_name) if eye_name else None
+    if eye_bone is None:
+        return False
+
+    # Default imports face Unreal's +X; the optional Blender convention rotates
+    # the complete character to face -Y.  Keep the other horizontal coordinate
+    # at zero so this controller sits on the character's center line.
+    if face_y_forward:
+        head = Vector((0.0, eye_bone.head.y - LIMBAL_DISTANCE, eye_bone.head.z))
+        forward = Vector((0.0, -1.0, 0.0))
+    else:
+        head = Vector((eye_bone.head.x + LIMBAL_DISTANCE, 0.0, eye_bone.head.z))
+        forward = Vector((1.0, 0.0, 0.0))
+
+    limbal = edit_bones.new(LIMBAL_BONE_NAME)
+    limbal.head = head
+    limbal.tail = head + forward * DEFAULT_BONE_LENGTH
+    limbal.use_deform = False
+    return True
+
+
+def _add_limbal_face_constraint(context: Any, armature_obj: bpy.types.Object) -> bool:
+    """Have the unparented ``C_Limbal`` follow ``C_FaceBase_a`` by default."""
+    limbal = armature_obj.pose.bones.get(LIMBAL_BONE_NAME)
+    face_base = armature_obj.pose.bones.get(FACE_BASE_BONE_NAME)
+    if limbal is None or face_base is None:
+        return False
+
+    constraint = limbal.constraints.new(type="CHILD_OF")
+    constraint.name = f"Child Of {FACE_BASE_BONE_NAME}"
+    constraint.target = armature_obj
+    constraint.subtarget = FACE_BASE_BONE_NAME
+    constraint.target_space = "WORLD"
+    constraint.owner_space = "WORLD"
+    context.view_layer.update()
+    constraint.inverse_matrix = (
+        armature_obj.matrix_world @ face_base.matrix
+    ).inverted()
+    return True
+
+
+def _assign_face_base_child_custom_shapes(context: Any, armature_obj: bpy.types.Object) -> int:
+    """Set up widget display and collection membership for face-base children."""
+    armature_data = armature_obj.data
+    face_base = armature_data.bones.get(FACE_BASE_BONE_NAME)
+    if face_base is None or not face_base.children:
+        return 0
+    face_collection = armature_data.collections.get("Face")
+    if face_collection is None:
+        face_collection = armature_data.collections.new("Face")
+
+    shape = bpy.data.objects.get(FACE_BASE_CHILD_WIDGET_NAME)
+    if shape is None:
+        # The default Add > Mesh > Cube is a two-metre cube centered on origin.
+        mesh = bpy.data.meshes.new(f"{FACE_BASE_CHILD_WIDGET_NAME}Mesh")
+        vertices = [
+            (-1.0, -1.0, -1.0), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+        ]
+        faces = [
+            (0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+            (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
+        ]
+        mesh.from_pydata(vertices, [], faces)
+        mesh.update()
+        shape = bpy.data.objects.new(FACE_BASE_CHILD_WIDGET_NAME, mesh)
+        context.collection.objects.link(shape)
+    shape.display_type = "WIRE"
+    shape.hide_render = True
+    # The mesh exists solely as a pose-bone widget, not scene geometry.
+    shape.hide_set(True)
+    for child in face_base.children:
+        if face_collection not in list(child.collections):
+            face_collection.assign(child)
+        child.show_wire = True
+        pose_bone = armature_obj.pose.bones.get(child.name)
+        if pose_bone is None:
+            continue
+        pose_bone.custom_shape = shape
+        pose_bone.use_custom_shape_bone_size = False
+        pose_bone.custom_shape_scale_xyz = (0.008, 0.008, 0.008)
+    return len(face_base.children)
 
 
 def _socket_local_matrix(socket: dict[str, Any], scale_factor: float) -> Matrix:
@@ -408,6 +584,7 @@ def _build_edit_bones(
         bones: list[dict[str, Any]],
         scale_factor: float,
         connect_bones: bool,
+        face_y_forward: bool = False,
 ) -> list[Matrix]:
     """Populate an armature's edit bones. Must be called in Edit mode.
 
@@ -435,7 +612,11 @@ def _build_edit_bones(
             created[index].parent = created[parent_index]
             children_of.setdefault(parent_index, []).append(index)
         else:
-            armature_space[index] = local_matrix
+            # A root bone: this is the one place the -Y-forward rotation is
+            # introduced. Every descendant's matrix is composed from its
+            # parent's above, so the rotation carries through the whole
+            # hierarchy automatically.
+            armature_space[index] = Y_FORWARD_ROTATION @ local_matrix if face_y_forward else local_matrix
         created[index].matrix = armature_space[index]
 
     bone_length: dict[int, float] = {}
@@ -499,4 +680,31 @@ def _build_edit_bones(
                 edit_bone.parent.tail = head
                 edit_bone.use_connect = True
 
+    _disable_kdi_root_deform(bones, created, children_of)
+
     return armature_space
+
+
+def _disable_kdi_root_deform(
+        bones: list[dict[str, Any]],
+        created: list[Any],
+        children_of: dict[int, list[int]],
+) -> None:
+    """Turn off Deform on ``C_KDIRoot`` and every one of its descendants.
+
+    KDI bones exist to be driven by KineDriver, not to skin geometry -- see
+    ``KDI_ROOT_BONE_NAME``. Walks ``children_of`` (already built by the caller
+    from each bone's parent index) rather than re-deriving the hierarchy.
+    """
+    root_index = next(
+        (index for index, bone in enumerate(bones) if bone["name"] == KDI_ROOT_BONE_NAME),
+        None,
+    )
+    if root_index is None:
+        return
+
+    stack = [root_index]
+    while stack:
+        index = stack.pop()
+        created[index].use_deform = False
+        stack.extend(children_of.get(index, ()))

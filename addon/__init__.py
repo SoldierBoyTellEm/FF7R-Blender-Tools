@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FF7R Rebirth Tools",
-    "author": "GargoyleTech, GhoulCulture",
-    "version": (0, 5, 0),
+    "author": "GargoyleTech",
+    "version": (0, 5, 2),
     "blender": (4, 0, 0),
     "location": "File > Import > FF7R Rebirth; Object > Retrilogy tools",
     "description": "FF7R package/static-mesh, UMAP, KineDriver, and cleanup tools",
@@ -171,6 +171,15 @@ class FF7R_ImportPreferences(AddonPreferences):
         ),
         default=False,
     )
+    last_import_settings_json: StringProperty(
+        name="Last Import Settings",
+        description=(
+            "Internal: each importer's remembered dialog settings, keyed by "
+            "operator id, as JSON. Not user-editable"
+        ),
+        default="{}",
+        options={"HIDDEN"},
+    )
 
     def draw(self, _context):
         layout = self.layout
@@ -241,7 +250,15 @@ class FF7R_REBIRTH_OT_import_cutscene_json(FF7R_LoggedOperator):
         default="",
     )
 
-    def execute(self, _context):
+    _persisted_props = (
+        "import_lights",
+        "import_cameras",
+        "clear_existing_cameras",
+        "import_characters",
+        "camera_prefix",
+    )
+
+    def execute(self, context):
         render_settings.ensure_cycles_transparent_bounces()
 
         manual_path_error = _validate_manual_asset_library_path(
@@ -268,6 +285,7 @@ class FF7R_REBIRTH_OT_import_cutscene_json(FF7R_LoggedOperator):
             asset_library_selection=asset_selection,
         )
 
+        self._save_last_import_settings(context)
         self.report({"INFO"}, f"Imported cutscene JSON: {Path(file_prefix).name}")
         return {"FINISHED"}
 
@@ -276,6 +294,7 @@ class FF7R_REBIRTH_OT_import_cutscene_json(FF7R_LoggedOperator):
         if prefs is not None:
             self.asset_library_selection = prefs.asset_library_selection
             self.manual_asset_library_path = prefs.manual_asset_library_path
+        self._load_last_import_settings(context)
         if self.filepath:
             return context.window_manager.invoke_props_dialog(self)
         context.window_manager.fileselect_add(self)
@@ -446,6 +465,13 @@ def menu_func_object(self, _context):
     self.layout.menu(OBJECT_MT_ff7r_rebirth_tools.bl_idname)
 
 
+def menu_func_pose_bone(self, context):
+    """Put the graph focus command on a bone's right-click menu."""
+    if kdi_nodetree.selected_bone_has_kdi_driver(context):
+        self.layout.separator()
+        self.layout.operator(kdi_nodetree.FF7R_KDI_OT_focus_selected_bone.bl_idname)
+
+
 class ARMATURE_MT_ff7r_rebirth_tools(Menu):
     """Edit-mode helpers for the active armature bone."""
 
@@ -528,17 +554,21 @@ classes = tuple(cls for cls in (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    kdi_nodetree.register_add_menu()
     game_packages.register_runtime_properties()
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.VIEW3D_MT_object.append(menu_func_object)
     bpy.types.VIEW3D_MT_edit_armature.append(menu_func_edit_armature)
+    bpy.types.VIEW3D_MT_pose_context_menu.append(menu_func_pose_bone)
     kdi_drivers.register()
 
 
 def unregister():
     kdi_drivers.unregister()
+    kdi_nodetree.unregister_add_menu()
     bpy.types.VIEW3D_MT_edit_armature.remove(menu_func_edit_armature)
     bpy.types.VIEW3D_MT_object.remove(menu_func_object)
+    bpy.types.VIEW3D_MT_pose_context_menu.remove(menu_func_pose_bone)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     game_packages.unregister_runtime_properties()
     for cls in reversed(classes):

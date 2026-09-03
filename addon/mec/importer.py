@@ -371,10 +371,21 @@ class FF7R_REBIRTH_OT_import_mec_umap(FF7R_LoggedOperator):
     
     filepath: bpy.props.StringProperty(subtype='FILE_PATH', options={'SKIP_SAVE', 'HIDDEN'})
 
+    _persisted_props = (
+        "import_originals",
+        "offset_opposite_faces",
+        "import_sway",
+        "lod_mode",
+        "lod_quality",
+        "lod_level",
+        "scale_factor",
+    )
+
     def invoke(self, context, event):
         prefs = _get_addon_preferences(context)
         if prefs:
             self.offset_opposite_faces = getattr(prefs, "offset_mec_opposite_faces", False)
+        self._load_last_import_settings(context)
         if self.files:              # called from drag-and-drop (files already resolved)
             return context.window_manager.invoke_props_dialog(self)
         context.window_manager.fileselect_add(self)
@@ -449,6 +460,7 @@ class FF7R_REBIRTH_OT_import_mec_umap(FF7R_LoggedOperator):
                 f"{unresolved_count} unknown texture hash(es) - see console for details",
             )
 
+        self._save_last_import_settings(context)
         return {'FINISHED'}
 
 if hasattr(bpy.types, "FileHandler"):

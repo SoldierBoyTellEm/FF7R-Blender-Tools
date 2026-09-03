@@ -23,10 +23,14 @@ from .reporting import FF7R_LoggedOperator, report
 from .kdi.drivers import (
     AXIS_ORDER_ITEMS,
     COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
-    SWAP_BEND_ST_DESCRIPTION,
     COORDINATE_PROFILE_REFERENCE,
 )
-from .skeleton.importer import _bones_from_bridge, build_armature_from_bones
+from .skeleton.importer import (
+    _bones_from_bridge,
+    build_armature_from_bones,
+    FACE_FORWARD_BLENDER,
+    FACE_FORWARD_UNREAL,
+)
 
 
 _VIRTUAL_UMAPS: list[str] = []
@@ -47,6 +51,42 @@ _NATURAL_PATH_TOKEN = re.compile(r"(\d+)")
 _LAST_UMAP_BROWSER_DIRECTORY = "End/Content/Level/Game/Field"
 KDI_COORDINATE_PROFILE_PROPERTY = "ff7r_kdi_coordinate_profile"
 SKELETON_ASSET_PATH_PROPERTY = "ff7r_skeleton_asset_path"
+
+OFFSET_FACES_NONE = "NONE"
+OFFSET_FACES_BAKED = "BAKED"
+OFFSET_FACES_MODIFIER = "MODIFIER"
+OFFSET_FACES_ITEMS = (
+    (OFFSET_FACES_NONE, "None", "Do not offset overlapping opposite-facing faces"),
+    (OFFSET_FACES_BAKED, "Baked", "Offset opposite-facing vertices during mesh import"),
+    (
+        OFFSET_FACES_MODIFIER,
+        "Modifier",
+        "Add the Retrilogy Alpha Displace modifier and vertex-group mask",
+    ),
+)
+
+ATTACHMENT_SOCKETS_NONE = "NONE"
+ATTACHMENT_SOCKETS_EMPTIES = "EMPTIES"
+ATTACHMENT_SOCKETS_BONES = "BONES"
+ATTACHMENT_SOCKETS_ITEMS = (
+    (ATTACHMENT_SOCKETS_NONE, "None", "Do not create attachment socket objects or bones"),
+    (
+        ATTACHMENT_SOCKETS_EMPTIES,
+        "Empties",
+        "Create bone-parented Empty objects for attachment sockets",
+    ),
+    (
+        ATTACHMENT_SOCKETS_BONES,
+        "Bones",
+        "Create hidden non-deforming bones for attachment sockets",
+    ),
+)
+
+FACE_FORWARD_ITEMS = (
+    (FACE_FORWARD_UNREAL, "+X (Unreal)", "Keep the imported asset facing Unreal's +X axis"),
+    (FACE_FORWARD_BLENDER, "-Y (Blender)", "Rotate the imported asset to face Blender's -Y axis"),
+)
+
 DEFAULT_STATIC_MESH_PATH = (
     "End/Content/Environment/Machine/Model/Machine_MagicStore_01A.uasset"
 )
@@ -176,6 +216,20 @@ def _package_config_key(game_root: str, oodle_dll: str, usmap_path: str) -> tupl
         os.path.normcase(os.path.abspath(value)) if value else ""
         for value in (game_root, oodle_dll, usmap_path)
     )
+
+
+def _normalize_offset_faces_mode(value: bool | str | None) -> str:
+    """Accept the legacy boolean flag as well as the mesh-import enum values."""
+    if value is True:
+        return OFFSET_FACES_BAKED
+    if value in {OFFSET_FACES_NONE, OFFSET_FACES_BAKED, OFFSET_FACES_MODIFIER}:
+        return value
+    return OFFSET_FACES_NONE
+
+
+def _face_y_forward_enabled(value: bool | str | None) -> bool:
+    """Accept the legacy boolean flag as well as the forward-axis enum values."""
+    return value is True or value == FACE_FORWARD_BLENDER
 
 
 def _mesh_package_signature(game_root: str) -> list[tuple[str, int, int]]:
@@ -422,6 +476,76 @@ def _search_virtual_static_meshes(_self, _context, edit_text):
 def _search_virtual_skeletal_meshes(_self, _context, edit_text):
     return _search_virtual_paths(
         _VIRTUAL_SKELETAL_MESHES, edit_text, sort_key=_natural_path_key
+    )
+
+
+_MESH_SEARCH_POPULATING = False
+
+
+def _mesh_search_source(operator) -> list[str]:
+    if operator.mesh_search_kind == "SKELETAL":
+        return _VIRTUAL_SKELETAL_MESHES
+    return _VIRTUAL_STATIC_MESHES
+
+
+def _populate_mesh_search(operator) -> None:
+    """Populate an inline list in natural order, bypassing Blender's fuzzy ranking."""
+    global _MESH_SEARCH_POPULATING
+    matches = _search_virtual_paths(
+        _mesh_search_source(operator),
+        operator.mesh_search_text,
+        sort_key=_natural_path_key,
+    )
+    selected_path = operator.virtual_path
+    selected_index = -1
+    _MESH_SEARCH_POPULATING = True
+    try:
+        operator.mesh_search_results.clear()
+        for index, path in enumerate(matches):
+            entry = operator.mesh_search_results.add()
+            entry.virtual_path = path
+            if path == selected_path:
+                selected_index = index
+        operator.mesh_search_result_index = selected_index
+    finally:
+        _MESH_SEARCH_POPULATING = False
+
+
+def _mesh_search_filter_changed(operator, _context):
+    _populate_mesh_search(operator)
+
+
+def _mesh_search_selection_changed(operator, _context):
+    if _MESH_SEARCH_POPULATING:
+        return
+    index = operator.mesh_search_result_index
+    if 0 <= index < len(operator.mesh_search_results):
+        operator.virtual_path = operator.mesh_search_results[index].virtual_path
+
+
+class FF7R_PG_mesh_search_entry(bpy.types.PropertyGroup):
+    virtual_path: bpy.props.StringProperty()
+
+
+class FF7R_UL_mesh_search_results(bpy.types.UIList):
+    def draw_item(
+            self, _context, layout, _data, item, _icon,
+            _active_data, _active_propname, _index,
+    ):
+        layout.label(text=item.virtual_path, icon='MESH_DATA')
+
+
+def _draw_mesh_search(layout, operator) -> None:
+    layout.prop(operator, "virtual_path", icon='PACKAGE')
+    layout.prop(operator, "mesh_search_text", text="Search", icon='VIEWZOOM')
+    layout.template_list(
+        FF7R_UL_mesh_search_results.__name__,
+        operator.mesh_search_kind,
+        operator,
+        "mesh_search_results",
+        operator,
+        "mesh_search_result_index",
+        rows=7,
     )
 
 
@@ -872,16 +996,35 @@ def _static_mesh_material(name: str, virtual_path: str):
     return material
 
 
+def _apply_face_y_forward(vectors: np.ndarray) -> np.ndarray:
+    """Rotate an (N, 3) array of already-UE-mirrored Blender vectors -90 deg about Z.
+
+    The base UE->Blender conversion elsewhere in this module is the mirror
+    ``(X, -Y, Z)``. Composing a further -90 degree Z rotation on top of that
+    mirror algebraically reduces to swapping the mirrored X/Y columns and
+    negating the new Y (see ``face_y_forward`` in ``skeleton/importer.py`` for
+    the same identity applied to bones). It is a pure rotation stacked on the
+    existing mirror, so it is safe to apply identically to positions, normals,
+    and tangents -- the overall handedness flip (needed for the tangent sign)
+    is unchanged.
+    """
+    swapped = vectors[:, [1, 0, 2]].copy()
+    swapped[:, 1] *= -1.0
+    return swapped
+
+
 def import_static_mesh_asset(
         context,
         static_mesh: dict,
         virtual_path: str,
         *,
         scale_factor: float = 0.01,
-        offset_opposite_faces: bool = False,
+        offset_opposite_faces: bool | str = False,
         material_session: PackageAssetSession | None = None,
+        face_y_forward: bool = False,
 ):
     """Build one Blender mesh from the bridge's selected Rebirth static-mesh LOD."""
+    offset_mode = _normalize_offset_faces_mode(offset_opposite_faces)
     positions = static_mesh.get("positions") or []
     normals = static_mesh.get("normals") or []
     tangents = static_mesh.get("tangents") or []
@@ -910,8 +1053,11 @@ def import_static_mesh_asset(
         (float(value[0]), -float(value[1]), float(value[2]))
         for value in normals
     ], dtype=np.float32)
+    if face_y_forward:
+        vertices = _apply_face_y_forward(vertices)
+        converted_normals = _apply_face_y_forward(converted_normals)
     offset_count = 0
-    if offset_opposite_faces:
+    if offset_mode == OFFSET_FACES_BAKED:
         offset_count = offset_opposite_face_geometry(
             vertices,
             converted_normals,
@@ -925,7 +1071,7 @@ def import_static_mesh_asset(
     try:
         mesh.from_pydata(vertices.tolist(), [], faces.tolist())
         mesh.update()
-        if offset_opposite_faces:
+        if offset_mode == OFFSET_FACES_BAKED:
             # Store this on the datablock because UMAP actors reuse it after the
             # temporary source object has been removed.
             mesh["ff7r_opposite_face_offset_vertices"] = offset_count
@@ -968,11 +1114,17 @@ def import_static_mesh_asset(
             # invalidate an earlier RNA data view. Reacquire both before writes.
             tangent_layer = mesh.attributes["ff7r_tangent"]
             tangent_sign_layer = mesh.attributes["ff7r_tangent_sign"]
+            converted_tangents = np.asarray([
+                (float(tangent[0]), -float(tangent[1]), float(tangent[2]))
+                for tangent in tangents
+            ], dtype=np.float32)
+            if face_y_forward:
+                converted_tangents = _apply_face_y_forward(converted_tangents)
             for vertex_index, tangent in enumerate(tangents):
-                tangent_layer.data[vertex_index].vector = (
-                    float(tangent[0]), -float(tangent[1]), float(tangent[2])
-                )
-                # Mirroring Unreal Y changes the tangent-frame handedness.
+                tangent_layer.data[vertex_index].vector = tuple(converted_tangents[vertex_index])
+                # Mirroring Unreal Y changes the tangent-frame handedness; the
+                # optional +90 degree Z rotation on top is a pure rotation and
+                # does not affect this sign.
                 tangent_sign_layer.data[vertex_index].value = -float(tangent[3])
 
         material_count = max(
@@ -1028,6 +1180,14 @@ def import_static_mesh_asset(
                 except Exception as exc:
                     # Surface material failures must never discard imported mesh data.
                     print(f"  Warning: RMI material '{material_path}' could not be built: {exc}")
+        if offset_mode == OFFSET_FACES_MODIFIER:
+            # Use the same implementation as Object > Retrilogy tools >
+            # Find Opposite Faces so the generated vertex group, material mask,
+            # and Alpha Displace modifier stay identical.
+            from .z_fighting import MESH_OT_find_opposite_faces
+
+            if MESH_OT_find_opposite_faces.process_object(obj):
+                mesh["ff7r_opposite_face_offset_mode"] = OFFSET_FACES_MODIFIER
         return obj
     except Exception:
         if obj is not None:
@@ -1087,8 +1247,9 @@ def import_skeletal_mesh_asset(
         *,
         armature_obj=None,
         scale_factor: float = 0.01,
-        offset_opposite_faces: bool = False,
+        offset_opposite_faces: bool | str = False,
         material_session: PackageAssetSession | None = None,
+        face_y_forward: bool = False,
 ):
     """Build a Rebirth SkeletalMesh and transfer its section-local bone weights.
 
@@ -1105,6 +1266,7 @@ def import_skeletal_mesh_asset(
         scale_factor=scale_factor,
         offset_opposite_faces=offset_opposite_faces,
         material_session=material_session,
+        face_y_forward=face_y_forward,
     )
     bone_names = skeletal_mesh.get("boneNames") or []
     weights = skeletal_mesh.get("weights") or []
@@ -1148,8 +1310,13 @@ def import_skeletal_mesh_asset(
                 )
             modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
             modifier.object = armature_obj
+            modifier.use_deform_preserve_volume = True
             obj["ff7r_armature"] = armature_obj.name
             obj["ff7r_matching_bones"] = matching_bones
+
+            limbal_drivers = rmi_surface.configure_limbal_eye_drivers(obj, armature_obj)
+            if limbal_drivers:
+                obj["ff7r_limbal_eye_drivers"] = limbal_drivers
 
         obj["ff7r_skeletal_mesh_lod"] = int(skeletal_mesh.get("lodIndex", 0))
         obj["ff7r_normal_format"] = skeletal_mesh.get("normalFormat") or ""
@@ -1254,8 +1421,23 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(FF7R_LoggedOperator):
         name="Static Mesh Path",
         description="Mounted Unreal virtual path to an indexed StaticMesh .uasset",
         default=DEFAULT_STATIC_MESH_PATH,
-        search=_search_virtual_static_meshes,
-        search_options={'SUGGESTION'},
+    )
+    mesh_search_kind: bpy.props.StringProperty(
+        default="STATIC", options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    mesh_search_text: bpy.props.StringProperty(
+        name="Search",
+        description="Filter indexed StaticMesh paths while preserving numeric order",
+        options={'SKIP_SAVE'},
+        update=_mesh_search_filter_changed,
+    )
+    mesh_search_results: bpy.props.CollectionProperty(
+        type=FF7R_PG_mesh_search_entry, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    mesh_search_result_index: bpy.props.IntProperty(
+        default=-1,
+        options={'HIDDEN', 'SKIP_SAVE'},
+        update=_mesh_search_selection_changed,
     )
     scale_factor: bpy.props.FloatProperty(
         name="Scale",
@@ -1264,21 +1446,29 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(FF7R_LoggedOperator):
         min=0.0001,
         max=100.0,
     )
-    offset_opposite_faces: bpy.props.BoolProperty(
-        name="Offset opposite overlapping faces",
-        description=(
-            "Directly offset vertices on coincident opposite-facing faces to reduce "
-            "z-fighting; no modifiers or material changes"
-        ),
-        default=False,
+    offset_opposite_faces: bpy.props.EnumProperty(
+        name="Offset Faces",
+        description="Choose how overlapping opposite-facing faces are handled",
+        items=OFFSET_FACES_ITEMS,
+        default=OFFSET_FACES_BAKED,
     )
+    face_y_forward: bpy.props.EnumProperty(
+        name="Face Forward",
+        description="Choose the imported mesh's forward axis",
+        items=FACE_FORWARD_ITEMS,
+        default=FACE_FORWARD_UNREAL,
+    )
+
+    _persisted_props = ("scale_factor", "offset_opposite_faces", "face_y_forward")
 
     def invoke(self, context, _event):
         prefs = _preferences(context)
         if prefs is None:
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
-        self.offset_opposite_faces = prefs.offset_mec_opposite_faces
+        self.offset_opposite_faces = (
+            OFFSET_FACES_BAKED if prefs.offset_mec_opposite_faces else OFFSET_FACES_NONE
+        )
         try:
             refresh_mesh_indices(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1288,13 +1478,17 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(FF7R_LoggedOperator):
         except Exception as exc:
             self.report({'ERROR'}, f"Package mesh index failed: {exc}")
             return {'CANCELLED'}
+        self.mesh_search_text = ""
+        _populate_mesh_search(self)
+        self._load_last_import_settings(context)
         return context.window_manager.invoke_props_dialog(self, width=850)
 
     def draw(self, _context):
         layout = self.layout
-        layout.prop(self, "virtual_path", icon='PACKAGE')
+        _draw_mesh_search(layout, self)
         layout.prop(self, "scale_factor")
         layout.prop(self, "offset_opposite_faces")
+        layout.prop(self, "face_y_forward")
         layout.label(
             text=f"{len(_VIRTUAL_STATIC_MESHES):,} StaticMesh assets indexed ({_MESH_CACHE_SOURCE or 'memory'})",
             icon='PACKAGE',
@@ -1323,10 +1517,12 @@ class FF7R_REBIRTH_OT_import_static_mesh_game_packages(FF7R_LoggedOperator):
                     scale_factor=self.scale_factor,
                     offset_opposite_faces=self.offset_opposite_faces,
                     material_session=session,
+                    face_y_forward=_face_y_forward_enabled(self.face_y_forward),
                 )
         except Exception as exc:
             self.report({'ERROR'}, f"Package StaticMesh import failed: {exc}")
             return {'CANCELLED'}
+        self._save_last_import_settings(context)
         self.report(
             {'INFO'},
             f"Imported '{obj.name}': {len(obj.data.vertices):,} vertices, "
@@ -1345,8 +1541,23 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
         name="Skeletal Mesh Path",
         description="Mounted Unreal virtual path to an indexed SkeletalMesh .uasset",
         default="",
-        search=_search_virtual_skeletal_meshes,
-        search_options={'SUGGESTION'},
+    )
+    mesh_search_kind: bpy.props.StringProperty(
+        default="SKELETAL", options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    mesh_search_text: bpy.props.StringProperty(
+        name="Search",
+        description="Filter indexed SkeletalMesh paths while preserving numeric order",
+        options={'SKIP_SAVE'},
+        update=_mesh_search_filter_changed,
+    )
+    mesh_search_results: bpy.props.CollectionProperty(
+        type=FF7R_PG_mesh_search_entry, options={'HIDDEN', 'SKIP_SAVE'}
+    )
+    mesh_search_result_index: bpy.props.IntProperty(
+        default=-1,
+        options={'HIDDEN', 'SKIP_SAVE'},
+        update=_mesh_search_selection_changed,
     )
     scale_factor: bpy.props.FloatProperty(
         name="Scale",
@@ -1355,13 +1566,11 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
         min=0.0001,
         max=100.0,
     )
-    offset_opposite_faces: bpy.props.BoolProperty(
-        name="Offset opposite overlapping faces",
-        description=(
-            "Directly offset vertices on coincident opposite-facing faces to reduce "
-            "z-fighting; no modifiers or material changes"
-        ),
-        default=False,
+    offset_opposite_faces: bpy.props.EnumProperty(
+        name="Offset Faces",
+        description="Choose how overlapping opposite-facing faces are handled",
+        items=OFFSET_FACES_ITEMS,
+        default=OFFSET_FACES_BAKED,
     )
     bind_active_armature: bpy.props.BoolProperty(
         name="Bind Active Armature",
@@ -1377,18 +1586,61 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
         ),
         default=True,
     )
-    import_socket_bones: bpy.props.BoolProperty(
-        name="Import attachment sockets as hidden non-deform bones",
-        description=(
-            "When building the associated Skeleton, use a hidden Sockets bone collection "
-            "instead of creating socket Empty objects"
-        ),
-        default=False,
+    attachment_sockets: bpy.props.EnumProperty(
+        name="Attachment Sockets",
+        description="Choose how attachment sockets are materialized on the generated armature",
+        items=ATTACHMENT_SOCKETS_ITEMS,
+        default=ATTACHMENT_SOCKETS_EMPTIES,
     )
     import_kdi: bpy.props.BoolProperty(
         name="Also import KDI",
         description="After building the skeleton, also import its KineDriver rig (and any secondary passes)",
         default=True,
+    )
+    setup_naive_ik: bpy.props.BoolProperty(
+        name="Setup IK (naive)",
+        description=(
+            "Add a chain-length-3 IK constraint (no target) to R_Foot_a/L_Foot_a/"
+            "R_Hand_a/L_Hand_a, and lock Y/Z rotation to 0 on R_Foreleg_a/L_Foreleg_a/"
+            "R_Forearm_a/L_Forearm_a so they only bend as a hinge. Bones not present "
+            "on this skeleton are skipped"
+        ),
+        default=False,
+    )
+    create_limbal_bone: bpy.props.BoolProperty(
+        name="Create C_Limbal eye controller",
+        description=(
+            "When L_Eye or R_Eye exists, create a centered non-deforming controller "
+            "one foot in front of the character and use it for imported eye materials"
+        ),
+        default=False,
+    )
+    create_variant_bone_collections: bpy.props.BoolProperty(
+        name="Create variant bone collections",
+        description=(
+            "For player skeletons, scan meshes sharing this skeleton and create a "
+            "collection named after each variant that has uniquely weighted bones"
+        ),
+        default=True,
+    )
+    face_y_forward: bpy.props.EnumProperty(
+        name="Face Forward",
+        description="Choose the imported mesh and armature's forward axis",
+        items=FACE_FORWARD_ITEMS,
+        default=FACE_FORWARD_UNREAL,
+    )
+
+    _persisted_props = (
+        "scale_factor",
+        "offset_opposite_faces",
+        "bind_active_armature",
+        "build_skeleton",
+        "attachment_sockets",
+        "import_kdi",
+        "setup_naive_ik",
+        "create_limbal_bone",
+        "create_variant_bone_collections",
+        "face_y_forward",
     )
 
     def invoke(self, context, _event):
@@ -1396,7 +1648,9 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
         if prefs is None:
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
-        self.offset_opposite_faces = prefs.offset_mec_opposite_faces
+        self.offset_opposite_faces = (
+            OFFSET_FACES_BAKED if prefs.offset_mec_opposite_faces else OFFSET_FACES_NONE
+        )
         try:
             refresh_mesh_indices(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1406,11 +1660,14 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
         except Exception as exc:
             self.report({'ERROR'}, f"Package mesh index failed: {exc}")
             return {'CANCELLED'}
+        self.mesh_search_text = ""
+        _populate_mesh_search(self)
+        self._load_last_import_settings(context)
         return context.window_manager.invoke_props_dialog(self, width=850)
 
     def draw(self, _context):
         layout = self.layout
-        layout.prop(self, "virtual_path", icon='PACKAGE')
+        _draw_mesh_search(layout, self)
         layout.prop(self, "scale_factor")
         layout.prop(self, "offset_opposite_faces")
         bind_row = layout.row()
@@ -1419,10 +1676,20 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
         layout.prop(self, "build_skeleton")
         socket_row = layout.row()
         socket_row.enabled = self.build_skeleton
-        socket_row.prop(self, "import_socket_bones")
+        socket_row.prop(self, "attachment_sockets")
         kdi_row = layout.row()
         kdi_row.enabled = self.build_skeleton
         kdi_row.prop(self, "import_kdi")
+        ik_row = layout.row()
+        ik_row.enabled = self.build_skeleton
+        ik_row.prop(self, "setup_naive_ik")
+        limbal_row = layout.row()
+        limbal_row.enabled = self.build_skeleton
+        limbal_row.prop(self, "create_limbal_bone")
+        variant_row = layout.row()
+        variant_row.enabled = self.build_skeleton
+        variant_row.prop(self, "create_variant_bone_collections")
+        layout.prop(self, "face_y_forward")
         layout.label(
             text=f"{len(_VIRTUAL_SKELETAL_MESHES):,} SkeletalMesh assets indexed ({_MESH_CACHE_SOURCE or 'memory'})",
             icon='PACKAGE',
@@ -1467,8 +1734,11 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
                         virtual_path=skeleton_path,
                         scale_factor=self.scale_factor,
                         import_kdi=self.import_kdi,
-                        create_socket_empties=not self.import_socket_bones,
-                        create_socket_bones=self.import_socket_bones,
+                        attachment_sockets=self.attachment_sockets,
+                        setup_naive_ik=self.setup_naive_ik,
+                        create_limbal_bone=self.create_limbal_bone,
+                        create_variant_bone_collections=self.create_variant_bone_collections,
+                        face_y_forward=self.face_y_forward,
                     )
                     if result != {'FINISHED'}:
                         raise RuntimeError("Building the associated Skeleton failed.")
@@ -1483,10 +1753,12 @@ class FF7R_REBIRTH_OT_import_skeletal_mesh_game_packages(FF7R_LoggedOperator):
                     scale_factor=self.scale_factor,
                     offset_opposite_faces=self.offset_opposite_faces,
                     material_session=session,
+                    face_y_forward=_face_y_forward_enabled(self.face_y_forward),
                 )
         except Exception as exc:
             self.report({'ERROR'}, f"Package SkeletalMesh import failed: {exc}")
             return {'CANCELLED'}
+        self._save_last_import_settings(context)
         binding_note = f", bound to '{armature_obj.name}'" if armature_obj else ""
         self.report(
             {'INFO'},
@@ -1547,6 +1819,19 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(FF7R_LoggedOperator):
     lod_level: bpy.props.IntProperty(name="Level", default=0, min=-13, max=0)
     scale_factor: bpy.props.FloatProperty(name="Scale", default=0.01, min=0.0001, max=100.0)
 
+    _persisted_props = (
+        "import_originals",
+        "offset_opposite_faces",
+        "import_sway",
+        "import_textures",
+        "import_actors",
+        "recursive_import",
+        "lod_mode",
+        "lod_quality",
+        "lod_level",
+        "scale_factor",
+    )
+
     def invoke(self, context, _event):
         prefs = _preferences(context)
         if prefs is None:
@@ -1554,6 +1839,7 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(FF7R_LoggedOperator):
             return {'CANCELLED'}
         self.offset_opposite_faces = prefs.offset_mec_opposite_faces
         self.scale_factor = prefs.map_scale_factor
+        self._load_last_import_settings(context)
         try:
             paths = refresh_umap_index(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1816,6 +2102,7 @@ class FF7R_REBIRTH_OT_import_mec_game_packages(FF7R_LoggedOperator):
                 f"{len(actor_missing_total)} actor asset(s) could not be loaded: "
                 + ", ".join(missing_preview)
             )
+        self._save_last_import_settings(context)
         self.report({'INFO'}, message)
         return {'FINISHED'}
 
@@ -1850,6 +2137,12 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(FF7R_LoggedOperator):
         default="YZX",
     )
 
+    # Deliberately excludes translation/scale axis order: those are re-derived
+    # from the active armature's coordinate profile below on every invoke, and
+    # persisting a stale value could silently pick the wrong convention for a
+    # different rig type.
+    _persisted_props = ("replace_previous_generated",)
+
     def invoke(self, context, _event):
         prefs = _preferences(context)
         if prefs is None:
@@ -1864,6 +2157,7 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(FF7R_LoggedOperator):
             else:
                 self.translation_axis_order = "XZY"
                 self.scale_axis_order = "XZY"
+        self._load_last_import_settings(context)
         try:
             paths = refresh_kdi_index(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -1933,6 +2227,7 @@ class FF7R_REBIRTH_OT_import_kdi_game_packages(FF7R_LoggedOperator):
         if result != {'FINISHED'}:
             self.report({'ERROR'}, "The KDI driver generator could not complete.")
             return {'CANCELLED'}
+        self._save_last_import_settings(context)
         self.report({'INFO'}, f"Imported KDI drivers from {virtual_path}")
         return {'FINISHED'}
 
@@ -1968,8 +2263,6 @@ def _secondary_kdi_paths_for_skeleton(virtual_path: str, available: list[str]) -
 def _import_secondary_kdi_passes(
         secondary_assets: list[tuple[str, dict]],
         temp_dir: str,
-        *,
-        swap_bend_st: bool,
 ) -> str:
     """Stack a character's secondary KDI passes onto the main layer.
 
@@ -1999,7 +2292,6 @@ def _import_secondary_kdi_passes(
                 translation_axis_order="YZX",
                 scale_axis_order="YZX",
                 coordinate_profile=COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
-                swap_bend_st=swap_bend_st,
             )
             (imported if result == {'FINISHED'} else skipped).append(label)
         except Exception as exc:
@@ -2135,21 +2427,11 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
         ),
         default=False,
     )
-    create_socket_empties: bpy.props.BoolProperty(
-        name="Create socket empties",
-        description=(
-            "Add a bone-parented Empty for each attachment socket, matching what "
-            "the UMAP importer looks for when resolving an actor's AttachSocketName"
-        ),
-        default=True,
-    )
-    create_socket_bones: bpy.props.BoolProperty(
-        name="Import attachment sockets as hidden non-deform bones",
-        description=(
-            "Use a hidden Sockets bone collection instead of separate Empty objects; "
-            "takes precedence over Create socket empties"
-        ),
-        default=False,
+    attachment_sockets: bpy.props.EnumProperty(
+        name="Attachment Sockets",
+        description="Choose how attachment sockets are materialized on the generated armature",
+        items=ATTACHMENT_SOCKETS_ITEMS,
+        default=ATTACHMENT_SOCKETS_EMPTIES,
     )
     setup_naive_ik: bpy.props.BoolProperty(
         name="Setup IK (naive)",
@@ -2158,6 +2440,14 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
             "R_Hand_a/L_Hand_a, and lock Y/Z rotation to 0 on R_Foreleg_a/L_Foreleg_a/"
             "R_Forearm_a/L_Forearm_a so they only bend as a hinge. Bones not present "
             "on this skeleton are skipped"
+        ),
+        default=False,
+    )
+    create_limbal_bone: bpy.props.BoolProperty(
+        name="Create C_Limbal eye controller",
+        description=(
+            "When L_Eye or R_Eye exists, create a centered non-deforming controller "
+            "one foot in front of the character for imported eye materials"
         ),
         default=False,
     )
@@ -2170,11 +2460,6 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
             "layer already drives are left alone"
         ),
         default=True,
-    )
-    swap_bend_st: bpy.props.BoolProperty(
-        name="Swap BendS/BendT interpretation",
-        description=SWAP_BEND_ST_DESCRIPTION,
-        default=False,
     )
     import_kdi: bpy.props.BoolProperty(
         name="Import associated KDI",
@@ -2202,12 +2487,32 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
         ),
         default=False,
     )
+    face_y_forward: bpy.props.EnumProperty(
+        name="Face Forward",
+        description="Choose the generated armature's forward axis",
+        items=FACE_FORWARD_ITEMS,
+        default=FACE_FORWARD_UNREAL,
+    )
+
+    _persisted_props = (
+        "scale_factor",
+        "connect_bones",
+        "attachment_sockets",
+        "setup_naive_ik",
+        "create_limbal_bone",
+        "import_secondary_kdi",
+        "import_kdi",
+        "create_variant_bone_collections",
+        "import_mesh_referenced_bones_only",
+        "face_y_forward",
+    )
 
     def invoke(self, context, _event):
         prefs = _preferences(context)
         if prefs is None:
             self.report({'ERROR'}, "FF7R Rebirth add-on preferences are unavailable.")
             return {'CANCELLED'}
+        self._load_last_import_settings(context)
         try:
             paths = refresh_skeleton_index(
                 bpy.path.abspath(prefs.rebirth_install_root),
@@ -2230,18 +2535,16 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
         layout.prop(self, "armature_name")
         layout.prop(self, "scale_factor")
         layout.prop(self, "connect_bones")
-        layout.prop(self, "create_socket_empties")
-        layout.prop(self, "create_socket_bones")
+        layout.prop(self, "attachment_sockets")
         layout.prop(self, "setup_naive_ik")
+        layout.prop(self, "create_limbal_bone")
         layout.prop(self, "import_kdi")
         secondary = layout.row()
         secondary.enabled = self.import_kdi
         secondary.prop(self, "import_secondary_kdi")
-        kdi_debug = layout.row()
-        kdi_debug.enabled = self.import_kdi
-        kdi_debug.prop(self, "swap_bend_st")
         layout.prop(self, "create_variant_bone_collections")
         layout.prop(self, "import_mesh_referenced_bones_only")
+        layout.prop(self, "face_y_forward")
 
     def execute(self, context):
         prefs = _preferences(context)
@@ -2335,18 +2638,29 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
                 skeleton_stem = os.path.basename(virtual_path)
                 if skeleton_stem.lower().endswith(".uasset"):
                     skeleton_stem = skeleton_stem[: -len(".uasset")]
+                socket_data = (
+                    skeleton_asset.get("sockets") or []
+                    if self.attachment_sockets != ATTACHMENT_SOCKETS_NONE
+                    else []
+                )
                 armature_obj = build_armature_from_bones(
                     context,
                     self.armature_name.strip()
                     or skeleton_asset.get("name")
                     or skeleton_stem,
                     _bones_from_bridge(skeleton_asset),
-                    skeleton_asset.get("sockets") or [],
+                    socket_data,
                     scale_factor=self.scale_factor,
                     connect_bones=self.connect_bones,
-                    create_socket_empties=self.create_socket_empties,
-                    create_socket_bones=self.create_socket_bones,
+                    create_socket_empties=(
+                        self.attachment_sockets == ATTACHMENT_SOCKETS_EMPTIES
+                    ),
+                    create_socket_bones=(
+                        self.attachment_sockets == ATTACHMENT_SOCKETS_BONES
+                    ),
                     setup_naive_ik=self.setup_naive_ik,
+                    create_limbal_bone=self.create_limbal_bone,
+                    face_y_forward=_face_y_forward_enabled(self.face_y_forward),
                 )
                 armature_obj[SKELETON_ASSET_PATH_PROPERTY] = virtual_path
                 armature_obj[KDI_COORDINATE_PROFILE_PROPERTY] = COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90
@@ -2379,7 +2693,6 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
                             translation_axis_order="YZX",
                             scale_axis_order="YZX",
                             coordinate_profile=COORDINATE_PROFILE_PACKAGE_SKELETON_ROLL_90,
-                            swap_bend_st=self.swap_bend_st,
                         )
                         kdi_note = (
                             f"; also imported KDI drivers from {kdi_virtual_path}"
@@ -2390,18 +2703,20 @@ class FF7R_REBIRTH_OT_import_skeleton_game_packages(FF7R_LoggedOperator):
                             kdi_note += _import_secondary_kdi_passes(
                                 secondary_kdi_assets,
                                 temp_dir,
-                                swap_bend_st=self.swap_bend_st,
                             )
                     except RuntimeError as exc:
                         kdi_note = f"; the associated KDI could not be imported: {exc}"
         except Exception as exc:
             self.report({'ERROR'}, f"Package Skeleton import failed: {exc}")
             return {'CANCELLED'}
+        self._save_last_import_settings(context)
         self.report({'INFO'}, f"Imported skeleton as '{armature_obj.name}'{reduced_bone_note}{collection_note}{kdi_note}")
         return {'FINISHED'}
 
 
 CLASSES = (
+    FF7R_PG_mesh_search_entry,
+    FF7R_UL_mesh_search_results,
     FF7R_PG_package_browser_entry,
     FF7R_PG_package_browser_state,
     FF7R_UL_package_umaps,

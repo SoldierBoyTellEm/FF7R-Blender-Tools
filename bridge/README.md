@@ -5,6 +5,11 @@ REBIRTH package data directly from a mounted game install via
 [CUE4Parse](https://github.com/FabianFG/CUE4Parse) (Apache-2.0 — see
 [../NOTICE.md](../NOTICE.md)).
 
+Most of it lives in `Program.cs`. AnimSequence is the exception: Rebirth's layout
+defeats CUE4Parse and its key frames are ACL compressed clips that CUE4Parse cannot
+decode, so `RebirthAnimSequence.cs`, `AclDecoder.cs` and `AclDecompressor.cs` handle
+that path. See [../docs/REBIRTH_ANIMSEQUENCE_FORMAT.md](../docs/REBIRTH_ANIMSEQUENCE_FORMAT.md).
+
 The compiled binaries already sit in `../addon/bridge/` so the add-on works
 without building anything. Rebuild from here only if you're changing the
 bridge itself or want to verify the shipped binaries yourself.

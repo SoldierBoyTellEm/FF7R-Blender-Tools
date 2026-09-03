@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Collections;
 using System.Reflection;
@@ -9,6 +9,7 @@ using CUE4Parse.Compression;
 using CUE4Parse.MappingsProvider;
 using CUE4Parse.MappingsProvider.Usmap;
 using CUE4Parse.UE4.Versions;
+using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Component.SkeletalMesh;
@@ -26,8 +27,8 @@ using CUE4Parse.UE4.Objects.Meshes;
 using CUE4Parse.UE4.Readers;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse_Conversion.Textures;
-using CUE4Parse_Conversion.Animations;
-using CUE4Parse_Conversion.Animations.PSA;
+using Ff7r.Acl;
+using Ff7r.Rebirth;
 
 if (args.Length < 1)
 {
@@ -1312,7 +1313,6 @@ static Dictionary<string, object?> ExportRebirthSkeletalMesh(
     }
     if (vertexSections.Any(sectionIndex => sectionIndex < 0))
         throw new InvalidOperationException("SkeletalMesh has vertices outside all render sections.");
-
     var uvChannelCount = sourceLod.VertexBufferGPUSkin.NumTexCoords;
     var uvChannels = new List<object?>();
     for (var channelIndex = 0; channelIndex < uvChannelCount; channelIndex++)
@@ -1367,10 +1367,31 @@ static Dictionary<string, object?> ExportRebirthSkeletalMesh(
             ["firstIndex"] = section.BaseIndex,
             ["triangleCount"] = section.NumTriangles,
             ["castShadow"] = section.bCastShadow,
+            ["recomputeTangents"] = section.bRecomputeTangent,
+            ["recomputeTangentMaskChannel"] = section.RecomputeTangentsVertexMaskChannel.ToString(),
         };
     }).ToList();
 
     var colors = sourceLod.ColorVertexBuffer.Data;
+    var colorStreamSource = "CUE4Parse";
+    var declaredColorCount = colors.Length;
+    var colorStreamOffset = -1;
+    var colorStreamBulkBytes = 0;
+    // Rebirth records its color stream in the cooked LOD metadata even when
+    // LODInfo.bHasPerLODVertexColors is absent.  CUE4Parse uses that property
+    // as a gate and consequently leaves ColorVertexBuffer empty for assets
+    // such as PC0000_00.  Recover the explicitly declared stream instead of
+    // treating the optional property as authoritative.
+    if (colors.Length == 0 && package is CUE4Parse.UE4.Assets.IoPackage colorIoPackage &&
+        TryReadRebirthSkeletalColorStream(provider, assetPath, colorIoPackage, vertices.Length,
+            out var recoveredColorStream))
+    {
+        colors = recoveredColorStream.Colors;
+        colorStreamSource = "Rebirth cooked LOD metadata";
+        declaredColorCount = recoveredColorStream.DeclaredCount;
+        colorStreamOffset = recoveredColorStream.Offset;
+        colorStreamBulkBytes = recoveredColorStream.BulkByteLength;
+    }
     if (colors.Length != 0 && colors.Length != vertices.Length)
         throw new InvalidOperationException("SkeletalMesh color stream does not match its vertex stream.");
     return new Dictionary<string, object?>
@@ -1389,6 +1410,16 @@ static Dictionary<string, object?> ExportRebirthSkeletalMesh(
         ["uvChannels"] = uvChannels,
         ["colors"] = colors.Length == 0 ? null : colors.Select(color =>
             new[] { (int)color.R, (int)color.G, (int)color.B, (int)color.A }).ToArray(),
+        ["colorStream"] = new Dictionary<string, object?>
+        {
+            ["source"] = colorStreamSource,
+            ["declaredVertexCount"] = declaredColorCount,
+            ["decodedVertexCount"] = colors.Length,
+            ["meshVertexCount"] = vertices.Length,
+            ["coverage"] = vertices.Length == 0 ? 0.0 : (double)colors.Length / vertices.Length,
+            ["offset"] = colorStreamOffset,
+            ["bulkByteLength"] = colorStreamBulkBytes,
+        },
         ["indices"] = indices,
         ["sections"] = sections,
         ["boneNames"] = referenceBones.Select(bone => bone.Name.ToString()).ToArray(),
@@ -1493,7 +1524,8 @@ static Dictionary<string, object?> ExportRebirthInlineSkeletalMesh(
         ["tangents"] = tangents,
         ["normalFormat"] = "R10G10B10A2 packed tangent frame",
         ["uvChannels"] = payload.UvChannels,
-        ["colors"] = null,
+        ["colors"] = payload.Colors.Length == 0 ? null : payload.Colors.Select(color =>
+            new[] { (int)color.R, (int)color.G, (int)color.B, (int)color.A }).ToArray(),
         ["indices"] = indices.Take(requiredIndexCount).ToArray(),
         ["sections"] = sections,
         ["boneNames"] = referenceBones.Select(bone => bone.Name.ToString()).ToArray(),
@@ -1944,6 +1976,57 @@ static (RebirthSkeletalMeshUsageReader Reader, string MeshName, long ExportOffse
     return (reader, meshName, foundPosition, (long)export.CookedSerialSize);
 }
 
+static bool TryReadRebirthSkeletalColorStream(
+    DefaultFileProvider provider,
+    string assetPath,
+    CUE4Parse.UE4.Assets.IoPackage package,
+    int meshVertexCount,
+    out RebirthSkeletalColorStream colorStream)
+{
+    colorStream = null!;
+    try
+    {
+        var usage = ReadRebirthMeshUsage(provider, assetPath, package);
+        var recovered = usage.Reader.BulkColorStream;
+        if (recovered is null || recovered.DeclaredCount != meshVertexCount)
+            return false;
+        var colors = recovered.Colors ?? ReadRebirthSkeletalBulkColors(provider, assetPath, recovered);
+        if (colors is null || colors.Length != meshVertexCount)
+            return false;
+        colorStream = new RebirthSkeletalColorStream(
+            colors, recovered.DeclaredCount, recovered.Offset, recovered.BulkByteLength,
+            recovered.SizeOnDisk, recovered.OffsetInFile);
+        return true;
+    }
+    // The stock CUE4Parse path remains usable for layouts this narrow reader
+    // does not cover.  A failed recovery must not turn a mesh that has no
+    // color stream into an import failure.
+    catch (Exception)
+    {
+        return false;
+    }
+}
+
+static FColor[]? ReadRebirthSkeletalBulkColors(
+    DefaultFileProvider provider,
+    string assetPath,
+    RebirthSkeletalColorStream stream)
+{
+    var bulkPath = Path.ChangeExtension(assetPath, ".ubulk").Replace('\\', '/');
+    if (!provider.Files.TryGetValue(bulkPath, out var bulkFile))
+        return null;
+    var completeBulk = bulkFile.Read(null);
+    var size = checked((int)stream.SizeOnDisk);
+    var offset = completeBulk.Length == size ? 0 : checked((int)stream.OffsetInFile);
+    if (size <= 0 || offset < 0 || offset > completeBulk.Length - size ||
+        stream.Offset > size - checked(stream.DeclaredCount * sizeof(uint)))
+        return null;
+    using var bulk = new FByteArchive(
+        "RebirthSkeletalColorStream", completeBulk.AsSpan(offset, size).ToArray(), provider.Versions);
+    bulk.Position = stream.Offset;
+    return bulk.ReadArray<FColor>(stream.DeclaredCount);
+}
+
 static Dictionary<string, object?> ExportRebirthMeshUsage(
     DefaultFileProvider provider,
     string assetPath,
@@ -2128,7 +2211,7 @@ static Dictionary<string, object?> FindAnimationAssetsForSkeleton(
                 continue;
 
             foreach (var animation in ((CUE4Parse.UE4.Assets.IPackage) package)
-                .GetExports().OfType<UAnimSequence>())
+                .GetExports().OfType<URebirthAnimSequence>())
             {
                 var linkedSkeletonPath = GetAnimationSkeletonPath(animation);
                 if (!string.Equals(linkedSkeletonPath, targetObjectPath,
@@ -2163,56 +2246,89 @@ static float[] ExportVector(CUE4Parse.UE4.Objects.Core.Math.FVector value)
 static float[] ExportQuaternion(CUE4Parse.UE4.Objects.Core.Math.FQuat value)
     => [value.X, value.Y, value.Z, value.W];
 
-static float[] KeyTimes(float[] times, int keyCount, int numFrames)
-{
-    if (times.Length == keyCount && keyCount > 0)
-        return times;
-    if (keyCount <= 1)
-        return keyCount == 0 ? [] : [0.0f];
-    var lastFrame = Math.Max(1, numFrames - 1);
-    return Enumerable.Range(0, keyCount)
-        .Select(index => index * (float) lastFrame / (keyCount - 1))
-        .ToArray();
-}
-
 static Dictionary<string, object?> ExportAnimationPackage(CUE4Parse.UE4.Assets.IPackage package)
 {
-    var source = package.GetExports().OfType<UAnimSequence>().FirstOrDefault()
+    var source = package.GetExports().OfType<URebirthAnimSequence>().FirstOrDefault()
         ?? throw new InvalidOperationException("Package does not contain a UAnimSequence export.");
     var skeleton = source.Skeleton?.Load<USkeleton>()
         ?? throw new InvalidOperationException("Animation does not resolve a USkeleton.");
-    var converted = skeleton.ConvertAnims(source);
-    var sequence = converted.Sequences.FirstOrDefault()
-        ?? throw new InvalidOperationException("CUE4Parse did not produce an animation sequence.");
+
+    var clip = AclClip.Find(source.CompressedPayload, out var clipError)
+        ?? throw new InvalidOperationException(clipError);
+    var decompressor = new AclDecompressor(clip);
+
+    var trackMap = source.TrackToBoneIndex;
+    if (trackMap.Length != decompressor.NumBones)
+        throw new InvalidOperationException(
+            $"Animation has {trackMap.Length} track(s) in TrackToSkeletonMapTable but its ACL clip " +
+            $"holds {decompressor.NumBones}; the clip does not belong to this AnimSequence.");
+
     var boneInfo = skeleton.ReferenceSkeleton.FinalRefBoneInfo;
     var bonePose = skeleton.ReferenceSkeleton.FinalRefBonePose;
-    var tracks = new List<object?>();
-    for (var index = 0; index < Math.Min(boneInfo.Length, sequence.Tracks.Count); index++)
+    var numSamples = decompressor.NumSamples;
+    var numTracks = decompressor.NumBones;
+
+    // Decompress pose by pose, then transpose: ACL stores whole poses, the add-on wants
+    // whole tracks.
+    var translations = new float[numTracks][][];
+    var rotations = new float[numTracks][][];
+    var scales = new float[numTracks][][];
+    for (var track = 0; track < numTracks; track++)
     {
-        var track = sequence.Tracks[index];
-        if (!track.HasKeys())
+        translations[track] = new float[numSamples][];
+        rotations[track] = new float[numSamples][];
+        scales[track] = new float[numSamples][];
+    }
+
+    var poseRotations = new System.Numerics.Quaternion[numTracks];
+    var poseTranslations = new System.Numerics.Vector3[numTracks];
+    var poseScales = new System.Numerics.Vector3[numTracks];
+    for (var sample = 0; sample < numSamples; sample++)
+    {
+        decompressor.DecompressPose(sample, poseRotations, poseTranslations, poseScales);
+        for (var track = 0; track < numTracks; track++)
+        {
+            translations[track][sample] = [poseTranslations[track].X, poseTranslations[track].Y, poseTranslations[track].Z];
+            rotations[track][sample] = [poseRotations[track].X, poseRotations[track].Y, poseRotations[track].Z, poseRotations[track].W];
+            scales[track][sample] = [poseScales[track].X, poseScales[track].Y, poseScales[track].Z];
+        }
+    }
+
+    // Every track is sampled on every frame, so all three channels share one frame list.
+    var frames = Enumerable.Range(0, numSamples).Select(index => (float) index).ToArray();
+
+    var tracks = new List<object?>();
+    for (var track = 0; track < numTracks; track++)
+    {
+        var boneIndex = trackMap[track];
+        if (boneIndex < 0 || boneIndex >= boneInfo.Length)
             continue;
         tracks.Add(new Dictionary<string, object?>
         {
-            ["boneName"] = boneInfo[index].Name.ToString(),
-            ["bindTranslation"] = index < bonePose.Length ? ExportVector(bonePose[index].Translation) : new float[] { 0, 0, 0 },
-            ["bindRotation"] = index < bonePose.Length ? ExportQuaternion(bonePose[index].Rotation) : new float[] { 0, 0, 0, 1 },
-            ["bindScale"] = index < bonePose.Length ? ExportVector(bonePose[index].Scale3D) : new float[] { 1, 1, 1 },
-            ["translations"] = track.KeyPos.Select(ExportVector).ToArray(),
-            ["translationFrames"] = KeyTimes(track.KeyPosTime, track.KeyPos.Length, sequence.NumFrames),
-            ["rotations"] = track.KeyQuat.Select(ExportQuaternion).ToArray(),
-            ["rotationFrames"] = KeyTimes(track.KeyQuatTime, track.KeyQuat.Length, sequence.NumFrames),
-            ["scales"] = track.KeyScale.Select(ExportVector).ToArray(),
-            ["scaleFrames"] = KeyTimes(track.KeyScaleTime, track.KeyScale.Length, sequence.NumFrames),
+            ["boneName"] = boneInfo[boneIndex].Name.ToString(),
+            ["bindTranslation"] = boneIndex < bonePose.Length ? ExportVector(bonePose[boneIndex].Translation) : new float[] { 0, 0, 0 },
+            ["bindRotation"] = boneIndex < bonePose.Length ? ExportQuaternion(bonePose[boneIndex].Rotation) : new float[] { 0, 0, 0, 1 },
+            ["bindScale"] = boneIndex < bonePose.Length ? ExportVector(bonePose[boneIndex].Scale3D) : new float[] { 1, 1, 1 },
+            ["translations"] = translations[track],
+            ["translationFrames"] = frames,
+            ["rotations"] = rotations[track],
+            ["rotationFrames"] = frames,
+            ["scales"] = scales[track],
+            ["scaleFrames"] = frames,
         });
     }
+
+    var sampleRate = decompressor.SampleRate > 0.0f ? decompressor.SampleRate : 30.0f;
+    var duration = source.SequenceLength > 0.0f
+        ? source.SequenceLength
+        : Math.Max(0, numSamples - 1) / sampleRate;
     return new Dictionary<string, object?>
     {
-        ["name"] = sequence.Name,
+        ["name"] = source.Name,
         ["skeletonPath"] = ObjectPathToVirtualAssetPath(GetAnimationSkeletonPath(source)),
-        ["numFrames"] = sequence.NumFrames,
-        ["duration"] = sequence.AnimEndTime,
-        ["framesPerSecond"] = sequence.FramesPerSecond,
+        ["numFrames"] = numSamples,
+        ["duration"] = duration,
+        ["framesPerSecond"] = sampleRate,
         ["tracks"] = tracks,
     };
 }
@@ -2343,6 +2459,9 @@ try
             throw new FileNotFoundException("Oodle DLL was not found.", oodlePath);
         OodleHelper.Initialize(oodlePath);
     }
+    // Rebirth lays out AnimSequence bytes differently from stock UE4.26; see
+    // docs/REBIRTH_ANIMSEQUENCE_FORMAT.md.
+    ObjectTypeRegistry.RegisterClass("AnimSequence", typeof(URebirthAnimSequence));
     var pakDirectory = Path.Combine(gameDirectory, "End", "Content", "Paks");
     if (!Directory.Exists(pakDirectory))
         pakDirectory = gameDirectory;
@@ -2774,11 +2893,20 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
     public List<FStaticLODModel> Lods { get; } = [];
     public List<Dictionary<string, object?>> CookedLodPayloads { get; } = [];
     public RebirthInlineSkeletalLod? InlineLod { get; private set; }
+    public RebirthSkeletalColorStream? BulkColorStream { get; private set; }
 
     public override void Deserialize(FAssetArchive archive, long validPos)
     {
         base.Deserialize(archive, validPos);
-        var hasVertexColors = GetOrDefault<bool>("bHasVertexColors");
+        // Rebirth's cooked USkeletalMesh never tags the legacy mesh-wide
+        // bHasVertexColors bool -- only LODInfo[lodIndex].bHasPerLODVertexColors
+        // is present (the engine version this game is built on moved vertex-color
+        // presence to a per-LOD flag so it can be stripped per-LOD). The cooked
+        // LOD this reader decodes is always LOD 0. Reading the legacy flag as a
+        // fallback keeps this working if some asset still carries it instead.
+        var lodInfos = GetOrDefault<FStructFallback[]>("LODInfo", []);
+        var hasVertexColors = GetOrDefault<bool>("bHasVertexColors") ||
+            (lodInfos.Length > 0 && lodInfos[0].GetOrDefault<bool>("bHasPerLODVertexColors"));
         var vertexColorChannels = GetOrDefault<byte>("NumVertexColorChannels");
         var stripDataFlags = new FStripDataFlags(archive);
         _ = new CUE4Parse.UE4.Objects.Core.Math.FBoxSphereBounds(archive);
@@ -2811,7 +2939,7 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
 
         var cookedLodCount = archive.Read<int>();
         if (cookedLodCount > 0)
-            Lods.Add(ReadCookedLod(archive, CookedLodPayloads));
+            Lods.Add(ReadCookedLod(archive, CookedLodPayloads, hasVertexColors));
 
         // The remaining streamed LOD payload contains the changed vertex format,
         // including normal packing. LOD 0 provides the full mesh's used-bone set,
@@ -2821,7 +2949,8 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
 
     private FStaticLODModel ReadCookedLod(
         FAssetArchive archive,
-        List<Dictionary<string, object?>> cookedLodPayloads)
+        List<Dictionary<string, object?>> cookedLodPayloads,
+        bool hasVertexColors)
     {
         var lod = new FStaticLODModel();
         var stripDataFlags = new FStripDataFlags(archive);
@@ -2842,18 +2971,28 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
         if (isInlined)
         {
             var payloadOffset = archive.Position;
-            InlineLod = ReadInlineLodPayload(archive);
+            InlineLod = ReadInlineLodPayload(archive, hasVertexColors);
             cookedLodPayloads.Add(new Dictionary<string, object?>
             {
                 ["inlined"] = true,
                 ["payloadOffset"] = payloadOffset,
                 ["vertexCount"] = InlineLod.Positions.Length,
                 ["indexCount"] = InlineLod.Indices.Length,
+                ["hasVertexColors"] = hasVertexColors,
+                ["colorCount"] = InlineLod.Colors.Length,
             });
             return lod;
         }
         var bulkData = new FByteBulkData(archive);
         var data = bulkData.Data;
+        // FF7's bulk LOD header includes the color count and its byte offset.
+        // Read it regardless of bHasVertexColors: that UProperty is omitted
+        // from valid Rebirth meshes, while this serialized descriptor is the
+        // actual source of truth for the render stream.
+        var colorStream = TryReadRebirthBulkColorStream(
+            archive, data, bulkData.Header.SizeOnDisk, bulkData.Header.OffsetInFile);
+        if (colorStream is not null)
+            BulkColorStream = colorStream;
         cookedLodPayloads.Add(new Dictionary<string, object?>
         {
             ["inlined"] = false,
@@ -2862,11 +3001,69 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
             ["sizeOnDisk"] = bulkData.Header.SizeOnDisk,
             ["offsetInFile"] = bulkData.Header.OffsetInFile,
             ["dataLength"] = data?.Length,
+            ["colorDeclaredVertexCount"] = colorStream?.DeclaredCount ?? 0,
+            ["colorDecodedVertexCount"] = colorStream?.Colors?.Length ?? 0,
+            ["colorOffset"] = colorStream?.Offset ?? -1,
+            ["colorCoverage"] = colorStream is null || colorStream.DeclaredCount == 0
+                ? 0.0
+                : (double)colorStream.Colors.Length / colorStream.DeclaredCount,
         });
         return lod;
     }
 
-    private static RebirthInlineSkeletalLod ReadInlineLodPayload(FAssetArchive archive)
+    private static RebirthSkeletalColorStream? TryReadRebirthBulkColorStream(
+        FAssetArchive archive,
+        byte[]? bulkData,
+        long sizeOnDisk,
+        long offsetInFile)
+    {
+        // CUE4Parse's FF7FStaticLodModel reads this fixed 161-byte metadata
+        // descriptor to locate every bulk stream.  Its color branch is gated
+        // on bHasVertexColors; preserve the descriptor parsing but remove that
+        // gate.  A negative offset is the explicit "no color stream" marker.
+        using var metadata = new FByteArchive("RebirthSkeletalLodMetadata", archive.ReadBytes(161));
+        _ = metadata.Read<byte>();       // index stride
+        _ = metadata.Read<int>();        // index count
+        _ = metadata.Read<int>();        // UV channel count
+        _ = metadata.Read<int>();        // vertex count
+        _ = metadata.ReadBoolean();      // full precision UVs
+        _ = metadata.ReadBoolean();      // high precision tangents
+        _ = metadata.Read<int>();        // tangent offset
+        _ = metadata.Read<int>();        // tangent stride
+        _ = metadata.Read<int>();        // tangent count
+        var colorCount = metadata.Read<int>();
+        _ = metadata.ReadBoolean();
+        _ = metadata.Read<int>();        // max bone influences
+        _ = metadata.Read<int>();        // skin-weight stride
+        _ = metadata.Read<int>();        // skin-weight count
+        _ = metadata.ReadBoolean();      // 16-bit bone indices
+        _ = metadata.Read<int>();        // skin-weight padding/offset field
+        _ = metadata.ReadArray(archive.ReadFName);
+        _ = metadata.Read<int>();        // position offset
+        _ = metadata.Read<int>();
+        _ = metadata.Read<int>();        // tangent stream offset
+        _ = metadata.Read<int>();
+        _ = metadata.Read<int>();        // UV stream offset
+        _ = metadata.Read<int>();
+        metadata.Position += 8;
+        _ = metadata.Read<int>();        // skin-weight offset
+        _ = metadata.Read<int>();
+        var colorOffset = metadata.Read<int>();
+
+        if (bulkData is null || colorCount <= 0 || colorOffset < 0)
+            return new RebirthSkeletalColorStream(
+                null, colorCount, colorOffset, checked((int)sizeOnDisk), sizeOnDisk, offsetInFile);
+        if (colorOffset > bulkData.Length - checked(colorCount * sizeof(uint)))
+            return null;
+
+        using var bulk = new FByteArchive("RebirthSkeletalColorStream", bulkData, archive.Versions);
+        bulk.Position = colorOffset;
+        var colors = bulk.ReadArray<FColor>(colorCount);
+        return new RebirthSkeletalColorStream(
+            colors, colorCount, colorOffset, bulkData.Length, sizeOnDisk, offsetInFile);
+    }
+
+    private static RebirthInlineSkeletalLod ReadInlineLodPayload(FAssetArchive archive, bool hasVertexColors)
     {
         _ = new FStripDataFlags(archive);
         var indexBuffer = new FMultisizeIndexContainer(archive);
@@ -2908,11 +3105,26 @@ sealed class RebirthSkeletalMeshUsageReader : UObject
                 (float)archive.Read<Half>(),
             ];
 
+        // Vertex colors sit between the tangent/UV block and the skin-weight
+        // buffer, matching the GPU vertex-factory declaration order. The mesh's
+        // bHasVertexColors flag (read once for the whole USkeletalMesh) gates
+        // whether this buffer is present at all, unlike the static-mesh
+        // ColorVertexBuffer, which always writes a (possibly empty) header.
+        var colors = Array.Empty<FColor>();
+        if (hasVertexColors)
+        {
+            var colorBuffer = new FColorVertexBuffer(archive);
+            if (colorBuffer.Data.Length != 0 && colorBuffer.Data.Length != positions.Length)
+                throw new InvalidOperationException(
+                    $"Inline Rebirth SkeletalMesh color count {colorBuffer.Data.Length} does not match {positions.Length} vertices.");
+            colors = colorBuffer.Data;
+        }
+
         var weights = new FSkinWeightVertexBuffer(archive, false).Weights;
         if (weights.Length != positions.Length)
             throw new InvalidOperationException(
                 $"Inline Rebirth SkeletalMesh weight count {weights.Length} does not match {positions.Length} vertices.");
-        return new RebirthInlineSkeletalLod(indices, positions, packedFrames, uvChannels, weights);
+        return new RebirthInlineSkeletalLod(indices, positions, packedFrames, uvChannels, weights, colors);
     }
 }
 
@@ -2921,11 +3133,29 @@ sealed class RebirthInlineSkeletalLod(
     FVector[] positions,
     uint[] packedFrames,
     float[][][] uvChannels,
-    FSkinWeightInfo[] weights)
+    FSkinWeightInfo[] weights,
+    FColor[] colors)
 {
     public uint[] Indices { get; } = indices;
     public FVector[] Positions { get; } = positions;
     public uint[] PackedFrames { get; } = packedFrames;
     public float[][][] UvChannels { get; } = uvChannels;
     public FSkinWeightInfo[] Weights { get; } = weights;
+    public FColor[] Colors { get; } = colors;
+}
+
+sealed class RebirthSkeletalColorStream(
+    FColor[]? colors,
+    int declaredCount,
+    int offset,
+    int bulkByteLength,
+    long sizeOnDisk,
+    long offsetInFile)
+{
+    public FColor[]? Colors { get; } = colors;
+    public int DeclaredCount { get; } = declaredCount;
+    public int Offset { get; } = offset;
+    public int BulkByteLength { get; } = bulkByteLength;
+    public long SizeOnDisk { get; } = sizeOnDisk;
+    public long OffsetInFile { get; } = offsetInFile;
 }

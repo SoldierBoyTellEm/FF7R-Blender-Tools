@@ -23,7 +23,7 @@ group and do not require restructuring the ubershader:
 
     FF7R Eye Disc / FF7R Cornea / FF7R Limbal Occlusion
     UE Frame To World (explicit TBN) / UE Limbal Occlusion (directional)
-    FF7R Hair Strand / UE Unpack Normal (RG) / UE Tangent To World (mikktspace)
+    FF7R Hair Strand / UE Tangent To World (mikktspace)
 
 The current lighting-side cross-reference is the older-build RenderDoc dump
 `C:\\temp\\hair_and_eye\\rd_graphics_shaders\\
@@ -339,13 +339,16 @@ EYE_UV_CENTER = (0.5, 0.5)
 EYE_UV_RADIUS = 0.25
 _INV = 1.0 / EYE_UV_RADIUS
 UV_MAP = ""                         # "" = the object's ACTIVE uv layer
+# Shared strength for texture-derived Normal Map nodes.  The synthetic map in
+# util_tbn() stays at 1.0 because it recovers tangent handedness, not detail.
+NORMAL_MAP_STRENGTH = 0.7
 
 # hair  (from ff7r_hair_material.py -- measured values, not guesses)
 MIN_VDOTT = 0.05                    # shader clamps |dot(V, strand)| off zero
 HAIR_SPECULAR_F0 = 0.046520         # GBufferA.a 0.684779 through the remap
-ROUGHNESS_CURVATURE = 0.18          # specular-AA curvature term, saturated
+ROUGHNESS_CURVATURE = 1          # specular-AA curvature term, saturated
 HAIR_ANISOTROPIC = 1.0
-FLOW_INFLUENCE = 0.0                # 0 = capture-exact
+FLOW_INFLUENCE = 0.5                # 0 = capture-exact
 
 # blood
 BLOOD_R = (0.0802, 0.8328)          # channel = a + b*s
@@ -539,6 +542,28 @@ def _fix_conventions(tree):
         _MISSING_CONVENTION.remove(node)
 
 
+def _decode_tangent_normal(tree, name, loc, label="", parent=None):
+    """Create the non-destructive part of a normal-map decode in *tree*.
+
+    The returned pair is ``(signed, normal)``: connect a texture colour to
+    ``signed`` and use ``normal`` downstream.  The vector deliberately stays
+    in the authored DirectX convention.  On Blender 5.2+, the one final
+    Normal Map node performs the Y inversion through ``convention='DIRECTX'``;
+    this avoids mutating the texture colours merely to satisfy Blender's
+    default convention.
+    """
+    signed = _new(tree, "ShaderNodeVectorMath", name, loc,
+                  label or "normal rgb * 2 - 1", parent)
+    _prop(signed, "operation", "MULTIPLY_ADD")
+    _sv(signed, 1, (2.0, 2.0, 2.0))
+    _sv(signed, 2, (-1.0, -1.0, -1.0))
+    normal = _new(tree, "ShaderNodeVectorMath", name + " Normalize",
+                  (loc[0] + 190, loc[1]), "normalise tangent vector", parent)
+    _prop(normal, "operation", "NORMALIZE")
+    _link(tree, signed, 0, normal, 0)
+    return signed, normal
+
+
 # ------------------------------------------------------- custom properties ---
 
 # Defaults used by the original 47-switch implementation. The current-build
@@ -567,12 +592,19 @@ _SWITCH_DEFAULTS = dict([
     ("Gradient_", 0.0), ("Isotropy_", 0.0),
 ])
 
-# Exact union of StaticSwitchParameters in the 104 current-build
-# Renderer/MaterialInstance/Surface/RMI_Surface_*.json parents.
+# Coordinate switches only tell UE which of its vertex UV slots a permutation
+# reads. Blender resolves the corresponding UV-map names directly on the mesh,
+# so they have no artist-facing material purpose and must not become custom
+# properties. They remain present in renderer_ground_truth.json for provenance.
+ENGINE_ONLY_SWITCHES = (
+    "Coordinate0_", "Coordinate1_", "Coordinate2_", "Coordinate3_",
+)
+
+# Static switches exposed as material controls. This is the exact ground-truth
+# union minus ENGINE_ONLY_SWITCHES.
 KNOWN_SWITCHES = [
     "AnimateTime_", "Blood_", "BrokenFlowEmissive0_", "BrokenFlowEmissive1_",
-    "BrokenFlow_", "Color_", "Convex_", "Coordinate0_", "Coordinate1_",
-    "Coordinate2_", "Coordinate3_", "CoverageIdentifierCoordinate2_",
+    "BrokenFlow_", "Color_", "Convex_", "CoverageIdentifierCoordinate2_",
     "CoverageIdentifierCoordinate3_", "CoverageIdentifier_", "Coverage_",
     "CylindricalNormal_", "Deform_", "DetailColor_", "DetailCoverage_",
     "DetailFoam_", "DetailMetallic_", "DetailNormal_", "DetailOcclusion_",
@@ -666,7 +698,7 @@ ENUM_PROPS = [
     ("Coverage Mode", 0, 0, 2,
      "0 Alpha (native) | 1 Hard cutout | 2 Dithered (faithful)"),
     ("Detail Blend", 0, 0, 2,
-     "0 Slerp (character) | 1 Chained preview | 2 RNM (MEC); Isotropy_ forces RNM"),
+     "0 Additive slerp (character) | 1 Chained preview | 2 RNM (MEC); Isotropy_ forces RNM"),
     ("Vertex Expression Source", 0, 0, 2,
      "0 Constant | 1 Geometry attribute | 2 Object property"),
 ]
@@ -690,6 +722,8 @@ FLOAT_PROPS = [
     ("Eye Limbal Softness", LIMBAL_SOFTNESS, 0.0, 2.0, "Limbal edge hardness"),
     ("Eye Limbal Aperture", LIMBAL_APERTURE, 0.0, 8.0, "Off-axis closing rate"),
     ("Eye Limbal Amount", 1.0, 0.0, 1.0, "Limbal occlusion strength"),
+    ("Eye Iris AO Factor", 1, 0.0, 1.0,
+     "Iris-occlusion multiplication amount; 0.5 is the import default"),
     ("Pupil Dilation", 1.0, 0.05, 4.0, "Iris UV exponent; 1.0 = neutral"),
     # --- hair (ff7r_hair_material.py -- measured) ---
     ("Hair Min VdotT", MIN_VDOTT, 0.001, 0.5,
@@ -704,6 +738,9 @@ FLOAT_PROPS = [
      "Fold the flow map into the strand axis; 0 = capture-exact"),
     ("Hair Specular F0", HAIR_SPECULAR_F0, 0.0, 0.16,
      "Measured 0.046520 from GBufferA.a = 0.684779"),
+    # --- shared normal-map calibration ---
+    ("Normal Map Strength", NORMAL_MAP_STRENGTH, 0.0, 2.0,
+     "Shared Blender Normal Map slope strength; 0.7 is the import default"),
     # --- detail layer ---
     ("Detail Normal Strength", 0.5, 0.0, 1.0,
      "DetailNormal intensity; 1.0 = the authored map, 0.5 = the import default"),
@@ -732,6 +769,12 @@ def _ensure_props(mat):
     Re-running over a material written by an older version of this script
     rewrites any switch still stored as a float, so the type upgrade is not
     stranded behind the "already present" check."""
+    # Retire coordinate-routing flags emitted by earlier builds. They do not
+    # control any Blender material path: the UV nodes use the mesh's actual
+    # layers, so retaining these ID properties only creates dead UI controls.
+    for name in ENGINE_ONLY_SWITCHES:
+        if name in mat:
+            del mat[name]
     for name, members, default in SWITCH_CONTROLS:
         # Upgrade the old one-property-per-flag layout without losing an enabled
         # member: a grouped control becomes true if ANY legacy member was true.
@@ -911,6 +954,7 @@ OUT_POS = {                 # <5.2 ladder build, arranged in 4.5
 OUT_POS_MENU = {            # 5.2 Menu Switch build, arranged in 5.2
     "SM_BaseColor": (4425, 1925), "SM_Normal_Hair": (4559, 1455),
     "SM_Normal": (4758, 1447), "SM_Roughness": (4596, 1671),
+    "SM_Roughness_Eye": (4770, 1671),
     "BloodOverride": (4591, 1925), "Principled BSDF": (5173, 1261),
     "Material Output": (5573, 1261), "EmissionSum": (4649, 559),
     "EmissionStrength": (4819, 416), "MetallicGate": (4558, 1226),
@@ -1091,6 +1135,7 @@ def util_tbn():
         geo = _new(g, "ShaderNodeNewGeometry", "Geometry", (-620, -80))
         nmap = _new(g, "ShaderNodeNormalMap", "Signed B", (-620, -320),
                     "flat green map -> signed bitangent")
+        # Synthetic handedness probe, not a sampled normal map.
         _sv(nmap, "Strength", 1.0)
         _sv(nmap, "Color", (0.5, 1.0, 0.5, 1.0))
         cr = _new(g, "ShaderNodeVectorMath", "cross", (-380, -20), "cross(N, T)")
@@ -1116,85 +1161,6 @@ def util_tbn():
     return _rebuild_group("FF7R Util/TBN", _b)
 
 
-def util_unpack_bc5():
-    """Loaded normal-map RGB -> a DirectX-authored tangent-space vector.
-
-    Blender's DDS loader (including DDS files supplied by the CUE4Parse bridge)
-    already exposes BC5 images with their blue/Z channel reconstructed.  Do not
-    reconstruct Z a second time here: preserve the loader's full RGB result,
-    remap it to -1..1, and only apply the DirectX green-channel convention.
-    The tangent-space result is retained because the master blends several
-    normal layers before its final tangent-to-world conversion."""
-    def _b(g):
-        _sock(g, "Normal", "OUTPUT", "NodeSocketVector")
-        _sock(g, "RG", "INPUT", "NodeSocketColor", (0.5, 0.5, 1.0, 1.0))
-        _sock(g, "Flip Green", "INPUT", "NodeSocketFloat", 1.0, 0.0, 1.0)
-        gi = _new(g, "NodeGroupInput", "Group Input", (-760, 0))
-        go = _new(g, "NodeGroupOutput", "Group Output", (620, 0))
-        raw = _new(g, "ShaderNodeVectorMath", "rgb_signed", (-520, 120),
-                   "loader-reconstructed RGB * 2 - 1")
-        _prop(raw, "operation", "MULTIPLY_ADD")
-        _sv(raw, 1, (2.0, 2.0, 2.0))
-        _sv(raw, 2, (-1.0, -1.0, -1.0))
-        flip = _new(g, "ShaderNodeVectorMath", "green_flip", (-300, -80),
-                    "DirectX -> Blender: (x, -y, z)")
-        _prop(flip, "operation", "MULTIPLY")
-        _sv(flip, 1, (1.0, -1.0, 1.0))
-        choose = _new(g, "ShaderNodeMix", "convention", (-60, 100),
-                      "OpenGL / DirectX")
-        _prop(choose, "data_type", "VECTOR")
-        nrm = _new(g, "ShaderNodeVectorMath", "normalize", (220, 100))
-        _prop(nrm, "operation", "NORMALIZE")
-        _link(g, gi, "RG", raw, 0)
-        _link(g, raw, 0, flip, 0)
-        _link(g, gi, "Flip Green", choose, "Factor")
-        _link(g, raw, 0, choose, "A")
-        _link(g, flip, 0, choose, "B")
-        _link(g, choose, "Result", nrm, 0)
-        _link(g, nrm, 0, go, "Normal")
-    return _rebuild_group("UE Unpack Normal (RG)", _b)
-
-
-def util_unpack_rgb():
-    """Decode a genuine three-channel tangent-space direction.
-
-    Hair Material_Texture2D_14/WideBentNormal is BC1, not BC5. The hair base
-    pass reads all three channels as normalize(rgb*2-1), transforms that vector
-    through the UV0 tangent frame, and writes it to GBufferD. Reconstructing Z
-    from RG (the old ubershader behavior) destroys authored negative Z values.
-    The green flip is the Blender/DirectX convention bridge confirmed by the
-    standalone hair reconstruction; it is not present as a separate operation
-    in UE because UE's tangent basis already uses the DirectX convention."""
-    def _b(g):
-        _sock(g, "Normal", "OUTPUT", "NodeSocketVector")
-        _sock(g, "RGB", "INPUT", "NodeSocketColor", (0.5, 0.5, 1.0, 1.0))
-        _sock(g, "Flip Green", "INPUT", "NodeSocketFloat", 1.0, 0.0, 1.0)
-        gi = _new(g, "NodeGroupInput", "Group Input", (-760, 0))
-        go = _new(g, "NodeGroupOutput", "Group Output", (620, 0))
-        raw = _new(g, "ShaderNodeVectorMath", "rgb_signed", (-520, 120),
-                   "rgb * 2 - 1  (full RGB; no BC5 Z reconstruction)")
-        _prop(raw, "operation", "MULTIPLY_ADD")
-        _sv(raw, 1, (2.0, 2.0, 2.0))
-        _sv(raw, 2, (-1.0, -1.0, -1.0))
-        flip = _new(g, "ShaderNodeVectorMath", "green_flip", (-300, -80),
-                    "DirectX -> Blender: (x, -y, z)")
-        _prop(flip, "operation", "MULTIPLY")
-        _sv(flip, 1, (1.0, -1.0, 1.0))
-        choose = _new(g, "ShaderNodeMix", "convention", (-60, 100),
-                      "OpenGL / DirectX")
-        _prop(choose, "data_type", "VECTOR")
-        norm = _new(g, "ShaderNodeVectorMath", "normalize", (220, 100))
-        _prop(norm, "operation", "NORMALIZE")
-        _link(g, gi, "RGB", raw, 0)
-        _link(g, raw, 0, flip, 0)
-        _link(g, gi, "Flip Green", choose, "Factor")
-        _link(g, raw, 0, choose, "A")
-        _link(g, flip, 0, choose, "B")
-        _link(g, choose, "Result", norm, 0)
-        _link(g, norm, 0, go, "Normal")
-    return _rebuild_group("UE Unpack Normal (RGB)", _b)
-
-
 def util_tangent_to_world(uv_map=UV_MAP):
     """Tangent-space vector -> world, through a mikktspace Normal Map node.
 
@@ -1203,12 +1169,19 @@ def util_tangent_to_world(uv_map=UV_MAP):
     texture was sampled on -- so UV0 is the shader-exact basis for slot 14 too,
     even though slot 14 is sampled on UV1. Named-UV variants are separate node
     groups so importing a mesh with another UV0 name cannot rewrite the basis
-    underneath materials that already use this transform."""
+    underneath materials that already use this transform.
+
+    ``Vector`` stays in the source map's DirectX convention through all
+    tangent-space layer maths.  Blender 5.2+'s Normal Map node converts it to
+    Blender's convention exactly once here; older builds receive the same
+    conversion through ``_fix_conventions`` after the group is built."""
     group_name = ("UE Tangent To World (mikktspace)" if not uv_map else
                   "UE Tangent To World (mikktspace, %s)" % uv_map)
     def _b(g):
         _sock(g, "Vector", "OUTPUT", "NodeSocketVector")
         _sock(g, "Vector", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Normal Map Strength", "INPUT", "NodeSocketFloat",
+              NORMAL_MAP_STRENGTH, 0.0, 2.0)
         gi = _new(g, "NodeGroupInput", "Group Input", (-520, 0))
         go = _new(g, "NodeGroupOutput", "Group Output", (320, 0))
         enc = _new(g, "ShaderNodeVectorMath", "encode", (-300, 0),
@@ -1219,10 +1192,12 @@ def util_tangent_to_world(uv_map=UV_MAP):
         nm = _new(g, "ShaderNodeNormalMap", "TBN", (-80, 0),
                   "mikktspace TBN (%s basis)" % (uv_map or "active UV"))
         _prop(nm, "uv_map", uv_map)
-        _sv(nm, "Strength", 1.0)
+        _convention(nm, "DIRECTX")
         _link(g, gi, "Vector", enc, 0)
         _link(g, enc, 0, nm, "Color")
+        _link(g, gi, "Normal Map Strength", nm, "Strength")
         _link(g, nm, "Normal", go, "Vector")
+        _fix_conventions(g)
     return _rebuild_group(group_name, _b)
 
 
@@ -1347,6 +1322,38 @@ def util_slerp():
         _link(g, lpn, 0, sel, "B")
         _link(g, sel, "Result", go, "Normal")
     return _rebuild_group("FF7R Util/Normal Slerp", _b)
+
+
+def util_detail_normal_additive():
+    """Apply a detail normal as a tangent-space perturbation of ``Base``.
+
+    A detail normal is *not* a second complete surface normal to interpolate
+    toward.  In particular, the neutral texel (0, 0, 1) means "no detail",
+    so it must leave Base unchanged at every mask value.  The character shader
+    uses a spherical ramp for the detail amount; retain that ramp by slerping
+    from the flat tangent normal to Detail, then compose that delta over Base
+    with RNM.  Slerping Base directly to Detail instead biases every base map
+    toward flat whenever a detail layer is enabled.
+    """
+    def _b(g):
+        _sock(g, "Normal", "OUTPUT", "NodeSocketVector")
+        _sock(g, "Base", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Detail", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "t", "INPUT", "NodeSocketFloat", 0.0, 0.0, 1.0)
+        gi = _new(g, "NodeGroupInput", "Group Input", (-720, 0))
+        go = _new(g, "NodeGroupOutput", "Group Output", (560, 0))
+        amount = _grp(g, "FF7R Util/Normal Slerp", "detail_amount", (-480, -120),
+                      "flat -> detail (spherical amount)")
+        _sv(amount, "A", (0.0, 0.0, 1.0))
+        compose = _grp(g, "FF7R Util/RNM", "compose", (120, 40),
+                       "Base + detail perturbation")
+        _sv(compose, "Strength", 1.0)
+        _link(g, gi, "Detail", amount, "B")
+        _link(g, gi, "t", amount, "t")
+        _link(g, gi, "Base", compose, "Base")
+        _link(g, amount, "Normal", compose, "Detail")
+        _link(g, compose, "Normal", go, "Normal")
+    return _rebuild_group("FF7R Util/Detail Normal Additive", _b)
 
 
 def util_rnm():
@@ -2000,7 +2007,7 @@ def eye_uv():
         _sock(g, "T2", "OUTPUT", "NodeSocketVector")
         _sock(g, "B2", "OUTPUT", "NodeSocketVector")
         _sock(g, "UV0", "INPUT", "NodeSocketVector")
-        _sock(g, "Cornea Normal Map", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Gaze Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
         _sock(g, "Pupil Dilation", "INPUT", "NodeSocketFloat", 1.0, 0.05, 4.0)
         gi = _new(g, "NodeGroupInput", "Group Input", (-1400, 0))
         go = _new(g, "NodeGroupOutput", "Group Output", (700, 0))
@@ -2026,17 +2033,17 @@ def eye_uv():
 
         _link(g, gi, "UV0", disc, "UV0")
         _link(g, tbn, "T", b2, 1)
-        _link(g, gi, "Cornea Normal Map", b2, 0)
+        _link(g, gi, "Gaze Normal", b2, 0)
         _link(g, b2, 0, b2n, 0)
         _link(g, b2n, 0, b2w, 0)
         _link(g, tbn, "w", b2w, "Scale")
         _link(g, b2w, 0, t2, 0)
-        _link(g, gi, "Cornea Normal Map", t2, 1)
+        _link(g, gi, "Gaze Normal", t2, 1)
         _link(g, t2, 0, t2n, 0)
         _link(g, t2n, 0, t2w, 0)
         _link(g, tbn, "w", t2w, "Scale")
 
-        _link(g, gi, "Cornea Normal Map", cornea, "N8")
+        _link(g, gi, "Gaze Normal", cornea, "N8")
         _link(g, geo, "Incoming", cornea, "Incoming")
         _link(g, t2w, 0, cornea, "T2")
         _link(g, b2w, 0, cornea, "B2")
@@ -2071,18 +2078,19 @@ def grp_eye():
         _sock(g, "Sclera Color", "INPUT", "NodeSocketColor", (0.6, 0.6, 0.6, 1.0))
         _sock(g, "Iris Color", "INPUT", "NodeSocketColor", (0.3, 0.2, 0.1, 1.0))
         _sock(g, "Iris Occlusion", "INPUT", "NodeSocketFloat", 1.0, 0.0, 1.0)
+        _sock(g, "Iris AO Factor", "INPUT", "NodeSocketFloat", 0.5, 0.0, 1.0)
         _sock(g, "Iris Emissive", "INPUT", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0))
-        _sock(g, "Sclera Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Sclera Base Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Sclera Secondary Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
         _sock(g, "Gaze Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
-        _sock(g, "Cornea Normal Map", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
-        _sock(g, "Iris Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Iris Detail Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
         _sock(g, "Cornea Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
         _sock(g, "uvC2", "INPUT", "NodeSocketVector", (0.0, 0.0, 0.0))
         _sock(g, "r", "INPUT", "NodeSocketFloat", 0.0, 0.0, 2.0)
         _sock(g, "Sclera Mask", "INPUT", "NodeSocketFloat", 0.0, 0.0, 1.0)
         _sock(g, "T2", "INPUT", "NodeSocketVector", (1.0, 0.0, 0.0))
         _sock(g, "B2", "INPUT", "NodeSocketVector", (0.0, 1.0, 0.0))
-        _sock(g, "Light Position", "INPUT", "NodeSocketVector", (0.0, 0.0, 3.0))
+        _sock(g, "Light Position", "INPUT", "NodeSocketVector", (17.0, 0.0, 17.0))
         _sock(g, "IrisEmissive_", "INPUT", "NodeSocketFloat", 0.0, 0.0, 1.0)
         _sock(g, "Limbal Amount", "INPUT", "NodeSocketFloat", 1.0, 0.0, 1.0)
         gi = _new(g, "NodeGroupInput", "Group Input", (-1200, -200))
@@ -2100,7 +2108,7 @@ def grp_eye():
                       "iris colour * IrisOcclusion  [PLAN 0.3]")
         _prop(irisao, "data_type", "RGBA")
         _prop(irisao, "blend_type", "MULTIPLY")
-        _sv(irisao, "Factor", 1.0)
+        _sv(irisao, "Factor", 0.5)
         limbmul = _new(g, "ShaderNodeMix", "limbal_mul", (400, 400),
                        "base colour * limbal occlusion")
         _prop(limbmul, "data_type", "RGBA")
@@ -2109,8 +2117,11 @@ def grp_eye():
         nrm = _new(g, "ShaderNodeMix", "normal_mix", (200, 100),
                    "lerp(cornea, sclera N, mask)")
         _prop(nrm, "data_type", "VECTOR")
+        iris_normal = _new(g, "ShaderNodeMix", "iris_normal_mix", (420, 100),
+                            "lerp(iris detail normal, regular normal, sclera mask)")
+        _prop(iris_normal, "data_type", "VECTOR")
         n2nd = _new(g, "ShaderNodeMix", "second_normal", (200, -200),
-                    "lerp(cornea map, gaze, mask) -> GBufferE")
+                    "lerp(cornea map, gaze, mask)")
         _prop(n2nd, "data_type", "VECTOR")
         em = _new(g, "ShaderNodeMix", "emissive", (400, -420),
                   "IrisEmissive_ gate (additive, unshadowed)")
@@ -2125,7 +2136,7 @@ def grp_eye():
 
         _link(g, gi, "r", limbal, "r")
         _link(g, gi, "Sclera Mask", limbal, "Sclera Mask")
-        _link(g, gi, "Cornea Normal Map", limbal, "N8")
+        _link(g, gi, "Gaze Normal", limbal, "N8")
         _link(g, gi, "uvC2", limbal, "uvC2")
         _link(g, gi, "T2", limbal, "T2")
         _link(g, gi, "B2", limbal, "B2")
@@ -2135,6 +2146,7 @@ def grp_eye():
 
         _link(g, gi, "Iris Color", irisao, "A")
         _link(g, gi, "Iris Occlusion", irisao, "B")
+        _link(g, gi, "Iris AO Factor", irisao, "Factor")
         _link(g, irisao, "Result", albedo, "A")
         _link(g, gi, "Sclera Color", albedo, "B")
         _link(g, gi, "Sclera Mask", albedo, "Factor")
@@ -2143,10 +2155,13 @@ def grp_eye():
 
         _link(g, gi, "Sclera Mask", nrm, "Factor")
         _link(g, gi, "Cornea Normal", nrm, "A")
-        _link(g, gi, "Sclera Normal", nrm, "B")
+        _link(g, gi, "Sclera Base Normal", nrm, "B")
+        _link(g, gi, "Sclera Mask", iris_normal, "Factor")
+        _link(g, gi, "Iris Detail Normal", iris_normal, "A")
+        _link(g, nrm, "Result", iris_normal, "B")
         _link(g, gi, "Sclera Mask", n2nd, "Factor")
-        _link(g, gi, "Cornea Normal Map", n2nd, "A")
-        _link(g, gi, "Gaze Normal", n2nd, "B")
+        _link(g, gi, "Gaze Normal", n2nd, "A")
+        _link(g, gi, "Sclera Secondary Normal", n2nd, "B")
 
         _link(g, gi, "Sclera Mask", eminv, 1)
         _link(g, eminv, 0, emg, 0)
@@ -2155,7 +2170,7 @@ def grp_eye():
         _link(g, gi, "Iris Emissive", em, "B")
 
         _link(g, limbmul, "Result", go, "Base Color")
-        _link(g, nrm, "Result", go, "Normal")
+        _link(g, iris_normal, "Result", go, "Normal")
         _link(g, n2nd, "Result", go, "Coat Normal")
         _link(g, em, "Result", go, "Emission")
         _fix_conventions(g)
@@ -2180,16 +2195,25 @@ def grp_hair_strand(t2w_group_name="UE Tangent To World (mikktspace)",
     placement is impossible here. Principled's Anisotropic is ~93% suppressed
     by this N in Cycles and ignored by EEVEE. `Flow Influence` is therefore an
     explicitly non-game approximation: it projects flow into the surface plane
-    and folds it into the strand axis so the map can still steer the normal."""
+    and folds it into the strand axis so the map can still steer the normal.
+
+    ``Strand Map`` remains an unflipped DirectX vector for its final tangent
+    transform.  ``Strand Math Map`` is its locally Y-flipped twin: the
+    recovered component equation below was derived in Blender's Y convention,
+    making this the one path where component maths must see pre-flipped green.
+    """
     def _b(g):
         _sock(g, "Normal", "OUTPUT", "NodeSocketVector")
         _sock(g, "Mapped Normal", "OUTPUT", "NodeSocketVector")
         _sock(g, "Tangent", "OUTPUT", "NodeSocketVector")
         _sock(g, "Roughness", "OUTPUT", "NodeSocketFloat")
         _sock(g, "Strand Map", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Strand Math Map", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
         _sock(g, "Flow Map", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+        _sock(g, "Normal Map Strength", "INPUT", "NodeSocketFloat",
+              NORMAL_MAP_STRENGTH, 0.0, 2.0)
         _sock(g, "Roughness Map", "INPUT", "NodeSocketFloat", 0.35, 0.0, 1.0)
-        _sock(g, "Flow Influence", "INPUT", "NodeSocketFloat", 0.0, 0.0, 1.0)
+        _sock(g, "Flow Influence", "INPUT", "NodeSocketFloat", 0.2, 0.0, 1.0)
         _sock(g, "Min VdotT", "INPUT", "NodeSocketFloat", MIN_VDOTT, 0.001, 0.5)
         _sock(g, "Dither Sign", "INPUT", "NodeSocketFloat", 1.0, 0.0, 1.0)
         _sock(g, "Roughness Curvature", "INPUT", "NodeSocketFloat",
@@ -2198,7 +2222,8 @@ def grp_hair_strand(t2w_group_name="UE Tangent To World (mikktspace)",
         go = _new(g, "NodeGroupOutput", "Group Output", (1700, 0))
         geo = _new(g, "ShaderNodeNewGeometry", "Geometry", (-1900, 600))
 
-        sep = _new(g, "ShaderNodeSeparateXYZ", "n", (-1600, 500), "strand map")
+        sep = _new(g, "ShaderNodeSeparateXYZ", "n", (-1600, 500),
+                   "strand map (Blender-Y for recovered equation)")
         sx = _new(g, "ShaderNodeMath", "sx", (-1400, 640), "n.x * n.y")
         _prop(sx, "operation", "MULTIPLY")
         nxx = _new(g, "ShaderNodeMath", "nxx", (-1400, 480), "n.x^2")
@@ -2288,7 +2313,7 @@ def grp_hair_strand(t2w_group_name="UE Tangent To World (mikktspace)",
                      "sqrt(clamp(curv + r^2))")
         _prop(rsqrt, "operation", "SQRT")
 
-        _link(g, gi, "Strand Map", sep, 0)
+        _link(g, gi, "Strand Math Map", sep, 0)
         _link(g, sep, 0, sx, 0)
         _link(g, sep, 1, sx, 1)
         _link(g, sep, 0, nxx, 0)
@@ -2305,7 +2330,9 @@ def grp_hair_strand(t2w_group_name="UE Tangent To World (mikktspace)",
         _link(g, sz, 0, sc, 2)
         _link(g, sc, 0, sn, 0)
         _link(g, sn, 0, sw, 0)
+        _link(g, gi, "Normal Map Strength", sw, "Normal Map Strength")
         _link(g, gi, "Flow Map", fw, 0)
+        _link(g, gi, "Normal Map Strength", fw, "Normal Map Strength")
         _link(g, fw, 0, fdot, 0)
         _link(g, geo, "Normal", fdot, 1)
         _link(g, geo, "Normal", fn, 0)
@@ -2345,6 +2372,7 @@ def grp_hair_strand(t2w_group_name="UE Tangent To World (mikktspace)",
         _link(g, proj, 0, nsub, 1)
         _link(g, nsub, 0, nsh, 0)
         _link(g, gi, "Strand Map", n2w, 0)
+        _link(g, gi, "Normal Map Strength", n2w, "Normal Map Strength")
         _link(g, gi, "Roughness Map", rsq, 0)
         _link(g, gi, "Roughness Map", rsq, 1)
         _link(g, rsq, 0, radd, 0)
@@ -2476,8 +2504,8 @@ def grp_detail_layer():
                   "albedo overlay (native Blender mix)")
         _prop(ov, "data_type", "RGBA")
         _prop(ov, "blend_type", "OVERLAY")
-        slerp = _grp(g, "FF7R Util/Normal Slerp", "slerp", (-560, 140),
-                     "normal slerp [tier 1]")
+        slerp = _grp(g, "FF7R Util/Detail Normal Additive", "slerp", (-560, 140),
+                     "additive detail slerp [tier 1]")
         rnm = _grp(g, "FF7R Util/RNM", "rnm", (-560, -20),
                    "reoriented normal mapping [tier 1]")
         rc = _grp(g, "FF7R Util/Roughness Combine", "rough", (-560, -180))
@@ -2488,7 +2516,7 @@ def grp_detail_layer():
         chn = _new(g, "ShaderNodeVectorMath", "chain_n", (-380, -60))
         _prop(chn, "operation", "NORMALIZE")
         blend, sel, bvals = _menu(g, "DetailBlend", (-160, 140),
-                                  ["Slerp (character)", "Chained Normal Map",
+                                  ["Additive slerp (character)", "Chained Normal Map",
                                    "RNM (MEC, decompiled)"], "VECTOR",
                                   "Detail Normal Blend",
                                   selector_src=(gi, "Detail Blend"))
@@ -2500,8 +2528,8 @@ def grp_detail_layer():
         _link(g, gi, "Base Color", ov, "A")
         _link(g, gi, "Detail Color", ov, "B")
         _link(g, gate, 0, ov, "Factor")
-        _link(g, gi, "Base Normal", slerp, "A")
-        _link(g, dnorm, 0, slerp, "B")
+        _link(g, gi, "Base Normal", slerp, "Base")
+        _link(g, dnorm, 0, slerp, "Detail")
         _link(g, gate, 0, slerp, "t")
         _link(g, gi, "Base Normal", rnm, "Base")
         _link(g, dnorm, 0, rnm, "Detail")
@@ -2989,7 +3017,7 @@ ROLES = [
     ("Segment",    "LayeredColor",             "col", "sRGB",      (0.5, 0.5, 0.5, 1.0)),
     ("Emissive",   "Emissive",                 "col", "sRGB",      (0.0, 0.0, 0.0, 1.0)),
     ("Emissive",   "ExtraEmissive",            "col", "sRGB",      (0.0, 0.0, 0.0, 1.0)),
-    # BC1 full-RGB direction, not BC5. Flat/default Z is authored, never rebuilt.
+    # BC1 full-RGB direction: all three channels are authored, Z included.
     ("Hair",       "WideBentNormal",           "nrm", "Non-Color", (0.5, 0.5, 1.0, 1.0)),
     ("Transition", "PositiveTransitionNormal", "nrm", "Non-Color", (0.5, 0.5, 1.0, 1.0)),
     # eye  (PLAN 0.3 -- roles named from the JSON, not the shader slot numbers)
@@ -3084,9 +3112,11 @@ def _tex_slot(t, mat, role, kind, cs, default, frame, x, y, uvnodes,
 
 
 def _resolve_uv_names(n=4):
-    """Auto-populate the UV Coordinate Sets from `bpy.context.active_object`'s
-    UV layers, in the order they appear on the mesh -- layer 0 -> Coordinate0_,
-    layer 1 -> Coordinate1_, and so on.
+    """Auto-populate UV-map names from `bpy.context.active_object`'s layers.
+
+    The map order follows the mesh: layer 0 -> UV Map 0, layer 1 -> UV Map 1,
+    and so on. UE's CoordinateN_ permutation declarations are deliberately
+    not represented here or as material properties.
 
     Same convention as `resolve_uv_names()` in ff7r_hair_material.py, extended
     from 2 slots to N: a slot beyond the object's layer count is left blank
@@ -3102,22 +3132,22 @@ def _resolve_uv_names(n=4):
     if obj is not None and obj.type == "MESH":
         layers = [uvl.name for uvl in obj.data.uv_layers]
     elif obj is not None:
-        notes.append("active object %r is not a mesh -- UV Coordinate Sets "
+        notes.append("active object %r is not a mesh -- UV maps "
                      "left blank (active layer at render time)" % obj.name)
     else:
-        notes.append("no active object -- UV Coordinate Sets left blank "
+        notes.append("no active object -- UV maps left blank "
                      "(active layer at render time); select the target mesh "
                      "and re-run to auto-populate them")
     names = []
     for i in range(n):
         if i < len(layers):
             names.append(layers[i])
-            notes.append("Coordinate%d_ auto-resolved to %r (layer %d of %s)"
+            notes.append("UV Map %d auto-resolved to %r (layer %d of %s)"
                          % (i, layers[i], i, obj.name))
         else:
             names.append("")
             if layers:
-                notes.append("Coordinate%d_ left blank -- %s has only %d UV "
+                notes.append("UV Map %d left blank -- %s has only %d UV "
                              "layer%s" % (i, obj.name, len(layers),
                                          "" if len(layers) == 1 else "s"))
     return names, notes
@@ -3164,13 +3194,12 @@ def build():
 
     # --- groups, in dependency order
     util_tbn()
-    util_unpack_bc5()
-    util_unpack_rgb()
     util_tangent_to_world()
     hair_t2w = util_tangent_to_world(uv_names[0])
     util_frame_to_world()
     util_slerp()
     util_rnm()
+    util_detail_normal_additive()
     util_ao_combine()
     util_rough_combine()
     util_f0()
@@ -3204,7 +3233,7 @@ def build():
 
     F = {}
     for key, label in [("Props", "MATERIAL CONTROLS  ->  PROPERTY BUNDLE"),
-                       ("Coords", "UV COORDINATE SETS"),
+                       ("Coords", "UV MAP SETS"),
                        ("Base", "TEXTURES   Base"),
                        ("Coverage", "TEXTURES   Coverage"),
                        ("Detail", "TEXTURES   Detail layer"),
@@ -3267,7 +3296,7 @@ def build():
     for i in range(4):
         uv[i] = _new(t, "ShaderNodeUVMap", "UV%d" % i,
                      (UV_COLUMN[0], UV_COLUMN[1] - i * UV_ROW_PITCH),
-                     "Coordinate%d_" % i, F["Coords"])
+                     "UV Map %d" % i, F["Coords"])
         if uv_names[i]:
             _prop(uv[i], "uv_map", uv_names[i])
 
@@ -3288,12 +3317,13 @@ def build():
     # Hand-arranged in 4.5 (see the node layout block): the normal chain runs
     # along the top of the Shade frame, the coverage/alpha chain along the
     # bottom, and the per-pixel feature groups stack down its right-hand edge.
-    nbase = _grp(t, "UE Unpack Normal (RG)", "N_Base", (1993, 1138),
-                 "Normal  (BC5 -> vector)", F["Shade"])
-    ndet = _grp(t, "UE Unpack Normal (RG)", "N_Detail", (1985, 167),
-                "DetailNormal  (BC5 -> vector)", F["Shade"])
-    ntrans = _grp(t, "UE Unpack Normal (RG)", "N_Transition", (2203, 342),
-                  "PositiveTransitionNormal  (BC5)", F["Shade"])
+    nbase_in, nbase = _decode_tangent_normal(
+        t, "N_Base", (1803, 1138), "Normal -> DirectX tangent vector", F["Shade"])
+    ndet_in, ndet = _decode_tangent_normal(
+        t, "N_Detail", (1795, 167), "DetailNormal -> DirectX tangent vector", F["Shade"])
+    ntrans_in, ntrans = _decode_tangent_normal(
+        t, "N_Transition", (2013, 342),
+        "PositiveTransitionNormal -> DirectX tangent vector", F["Shade"])
     detail = _grp(t, "FF7R Detail Layer", "DetailLayer", (2204, 825), "", F["Shade"])
     trans = _grp(t, "FF7R Transition Normal", "TransitionNormal", (2442, 525),
                  "", F["Shade"])
@@ -3326,16 +3356,16 @@ def build():
     emis = _grp(t, "FF7R Emissive", "Emissive", (2644, -484), "", F["Shade"])
     smodel = _grp(t, "FF7R Shading Model", "ShadingModel", (2655, 366), "", F["Shade"])
 
-    _link(t, S("Normal"), "Result", nbase, "RG")
-    _link(t, S("DetailNormal"), "Result", ndet, "RG")
-    _link(t, S("PositiveTransitionNormal"), "Result", ntrans, "RG")
+    _link(t, S("Normal"), "Result", nbase_in, 0)
+    _link(t, S("DetailNormal"), "Result", ndet_in, 0)
+    _link(t, S("PositiveTransitionNormal"), "Result", ntrans_in, 0)
 
     _link(t, S("Color"), "Result", detail, "Base Color")
-    _link(t, nbase, "Normal", detail, "Base Normal")
+    _link(t, nbase, 0, detail, "Base Normal")
     _link(t, S("Roughness"), "Result", detail, "Base Roughness")
     _link(t, S("WideOcclusion"), "Result", detail, "Base AO")
     _link(t, S("DetailColor"), "Result", detail, "Detail Color")
-    _link(t, ndet, "Normal", detail, "Detail Normal")
+    _link(t, ndet, 0, detail, "Detail Normal")
     _link(t, S("DetailRoughness"), "Result", detail, "Detail Roughness")
     _link(t, S("DetailOcclusion"), "Result", detail, "Detail AO")
     _link(t, S("Detail"), "Result", detail, "Detail Mask")
@@ -3375,10 +3405,11 @@ def build():
     _link(t, P["Detail Normal Strength"], 0, detail, "Normal Strength")
 
     _link(t, detail, "Normal", trans, "Base Normal")
-    _link(t, ntrans, "Normal", trans, "Transition Normal")
+    _link(t, ntrans, 0, trans, "Transition Normal")
     _link(t, P["PositiveTransitionNormal_"], 0, trans, "Enable")
     _link(t, P["Vertex Expression Source"], 0, trans, "Source")
     _link(t, trans, "Normal", nworld, "Vector")
+    _link(t, P["Normal Map Strength"], 0, nworld, "Normal Map Strength")
 
     _link(t, detail, "Base Color", seg, "Base Color")
     _link(t, S("SegmentLayer0"), "Result", seg, "Mask 0")
@@ -3438,55 +3469,69 @@ def build():
     # Its slots 2/7/8 pass through DirectX Normal Map nodes before entering the
     # eye maths, so these three values are world-space -- unlike the shared
     # tangent-space normal layering path above.
-    nsclera = _new(t, "ShaderNodeNormalMap", "N_Sclera_World", (2318, 2324),
-                   "Normal / slot 2 -> sclera world normal", F["EyePath"])
-    nsecondary = _new(t, "ShaderNodeNormalMap", "N_Secondary_World",
+    nsclera = _new(t, "ShaderNodeNormalMap", "N_Sclera_Base_World", (2318, 2324),
+                   "Normal / slot 2 -> sclera base world normal", F["EyePath"])
+    nsecondary = _new(t, "ShaderNodeNormalMap", "N_Sclera_Secondary_World",
                       (2146, 2202),
-                      "ScrelaNormal / slot 7 -> secondary world normal",
+                      "ScrelaNormal / slot 7 -> sclera secondary world normal",
                       F["EyePath"])
-    ncornea = _new(t, "ShaderNodeNormalMap", "N_Cornea_World",
+    ngaze = _new(t, "ShaderNodeNormalMap", "N_Gaze_World",
                    (2147, 2048),
-                   "GazeNormal / slot 8 -> N8 cornea world normal",
+                   "GazeNormal / slot 8 -> N8 gaze world normal",
                    F["EyePath"])
-    for eye_nmap in (nsclera, nsecondary, ncornea):
+    for eye_nmap in (nsclera, nsecondary, ngaze):
         _prop(eye_nmap, "space", "TANGENT")
         if uv_names[0]:
             _prop(eye_nmap, "uv_map", uv_names[0])
         _convention(eye_nmap, "DIRECTX")
-        _sv(eye_nmap, "Strength", 1.0)
-    niris = _grp(t, "UE Unpack Normal (RG)", "N_Iris", (2318, 2008),
-                 "IrisNormal (BC5)", F["EyePath"])
+        _link(t, P["Normal Map Strength"], 0, eye_nmap, "Strength")
     # split geometry (produces Iris UV) from colour (consumes iris textures) --
     # a single group doing both is a node-graph cycle, see eye_uv()'s docstring
     eyeuv = _grp(t, "FF7R Eye UV", "EyeUV", (2319, 1887),
                 "eye disc + cornea (Iris UV)", F["EyePath"])
+    # Texture 10/IrisNormal is a cornea-frame detail normal in the standalone
+    # eye reconstruction. Decode its DirectX texel, transform it through the
+    # parallax cornea frame, then use it on the iris side of the main normal.
+    iris_unpack = _new(t, "ShaderNodeVectorMath", "N_Iris_Detail", (2500, 1845),
+                       "IrisNormal: (r*2-1, -(g*2-1), b*2-1)", F["EyePath"])
+    _prop(iris_unpack, "operation", "MULTIPLY_ADD")
+    _sv(iris_unpack, 1, (2.0, -2.0, 2.0))
+    _sv(iris_unpack, 2, (-1.0, 1.0, -1.0))
+    iris_world = _grp(t, "UE Frame To World (explicit TBN)", "N_Iris_World",
+                      (2690, 1810), "iris detail normal -> cornea frame", F["EyePath"])
     # Held clear of EyeUV's own row: the eye group is ~530 tall, so it takes
     # the column to the right rather than the slot underneath.
     eye = _grp(t, "FF7R Eye", "Eye", (2502, 2300), "eye path (SM 9)",
                F["EyePath"])
     _link(t, S("Normal"), "Result", nsclera, "Color")
     _link(t, S("ScrelaNormal"), "Result", nsecondary, "Color")
-    _link(t, S("GazeNormal"), "Result", ncornea, "Color")
-    _link(t, S("IrisNormal"), "Result", niris, "RG")
+    _link(t, S("GazeNormal"), "Result", ngaze, "Color")
+    _link(t, S("IrisNormal"), "Result", iris_unpack, 0)
     _link(t, uv[0], "UV", eyeuv, "UV0")
-    _link(t, ncornea, "Normal", eyeuv, "Cornea Normal Map")
+    _link(t, ngaze, "Normal", eyeuv, "Gaze Normal")
     _link(t, P["Pupil Dilation"], 0, eyeuv, "Pupil Dilation")
+    _link(t, eyeuv, "T2", iris_world, "T")
+    _link(t, eyeuv, "B2", iris_world, "B")
+    _link(t, ngaze, "Normal", iris_world, "N")
+    _link(t, iris_unpack, 0, iris_world, "Vector")
     _link(t, S("Color"), "Result", eye, "Sclera Color")
     _link(t, S("IrisColor"), "Result", eye, "Iris Color")
     _link(t, S("IrisOcclusion"), "Result", eye, "Iris Occlusion")
+    _link(t, P["Eye Iris AO Factor"], 0, eye, "Iris AO Factor")
     _link(t, S("IrisEmissive"), "Result", eye, "Iris Emissive")
-    _link(t, nsclera, "Normal", eye, "Sclera Normal")
-    _link(t, nsecondary, "Normal", eye, "Gaze Normal")
-    _link(t, ncornea, "Normal", eye, "Cornea Normal Map")
-    _link(t, niris, "Normal", eye, "Iris Normal")
+    _link(t, nsclera, "Normal", eye, "Sclera Base Normal")
+    _link(t, nsecondary, "Normal", eye, "Sclera Secondary Normal")
+    _link(t, ngaze, "Normal", eye, "Gaze Normal")
+    _link(t, iris_world, "Vector", eye, "Iris Detail Normal")
     _link(t, eyeuv, "Cornea Normal", eye, "Cornea Normal")
     _link(t, eyeuv, "uvC2", eye, "uvC2")
     _link(t, eyeuv, "r", eye, "r")
     _link(t, eyeuv, "Sclera Mask", eye, "Sclera Mask")
     _link(t, eyeuv, "T2", eye, "T2")
     _link(t, eyeuv, "B2", eye, "B2")
-    # Deliberately leave Light Position unlinked.  It is an artist hook for a
-    # driven Empty/bone position that fakes the limbal-occlusion source.
+    # Deliberately leave Light Position unlinked: the eye group defaults its
+    # artist hook to (17, 0, 17), but it can still be driven by an Empty/bone
+    # position when a scene needs a different limbal-occlusion source.
     _link(t, P["IrisEmissive_"], 0, eye, "IrisEmissive_")
     _link(t, P["Eye Limbal Amount"], 0, eye, "Limbal Amount")
     # the iris textures sample on the parallax-corrected UV eyeuv produces.
@@ -3496,18 +3541,32 @@ def build():
         _link(t, eyeuv, "Iris UV", slots[role][0], "Vector")
 
     # ---- hair path ----------------------------------------------------
-    nflow = _grp(t, "UE Unpack Normal (RGB)", "N_Flow", (1933, 1515),
-                 "WideBentNormal / flow (UV1, BC1 full RGB)", F["HairPath"])
+    nflow_in, nflow = _decode_tangent_normal(
+        t, "N_Flow", (1743, 1515),
+        "WideBentNormal / flow -> DirectX tangent vector (UV1)", F["HairPath"])
+    nhair_math = _new(t, "ShaderNodeVectorMath", "N_Base_Hair_Math", (2132, 1515),
+                      "Y-flip only for hair strand component equation", F["HairPath"])
+    _prop(nhair_math, "operation", "MULTIPLY")
+    _sv(nhair_math, 1, (1.0, -1.0, 1.0))
     hair = _grp(t, hair_group.name, "HairStrand", (2583, 1515),
                 "hair path (SM 7)", F["HairPath"])
-    _link(t, S("WideBentNormal"), "Result", nflow, "RGB")
-    _link(t, nbase, "Normal", hair, "Strand Map")
-    _link(t, nflow, "Normal", hair, "Flow Map")
+    _link(t, S("WideBentNormal"), "Result", nflow_in, 0)
+    _link(t, nbase, 0, hair, "Strand Map")
+    _link(t, nbase, 0, nhair_math, 0)
+    _link(t, nhair_math, 0, hair, "Strand Math Map")
+    _link(t, nflow, 0, hair, "Flow Map")
+    _link(t, P["Normal Map Strength"], 0, hair, "Normal Map Strength")
     _link(t, S("Roughness"), "Result", hair, "Roughness Map")
     _link(t, P["Hair Flow Influence"], 0, hair, "Flow Influence")
     _link(t, P["Hair Min VdotT"], 0, hair, "Min VdotT")
     _link(t, P["Hair Dither Sign"], 0, hair, "Dither Sign")
     _link(t, P["Hair Roughness Curvature"], 0, hair, "Roughness Curvature")
+
+    eye_rough = _new(t, "ShaderNodeMath", "EyeRoughness", (4200, 1640),
+                     "eye roughness ^ 0.4", F["EyePath"])
+    _prop(eye_rough, "operation", "POWER")
+    _sv(eye_rough, 1, 0.4)
+    _link(t, layer, "Roughness", eye_rough, 0)
 
     # ---- per-model routing --------------------------------------------
     # Blender 5.2 uses one Constant Menu -> FF7R Shading Model Menu Switch.
@@ -3543,6 +3602,14 @@ def build():
         _link(t, smodel, "Is Hair", rgsel, "Factor")
         _link(t, layer, "Roughness", rgsel, "A")
         _link(t, hair, "Roughness", rgsel, "B")
+        eye_rgsel = _new(t, "ShaderNodeMix", "SM_Roughness_Eye",
+                          _out_pos("SM_Roughness_Eye"),
+                          "Eye uses roughness ^ 0.4", F["Out"])
+        _prop(eye_rgsel, "data_type", "FLOAT")
+        _link(t, smodel, "Is Eye", eye_rgsel, "Factor")
+        _link(t, rgsel, "Result", eye_rgsel, "A")
+        _link(t, eye_rough, 0, eye_rgsel, "B")
+        rgsel = eye_rgsel
 
         try:
             t.links.new(P["Shading Model"].outputs[0],
@@ -3571,6 +3638,7 @@ def build():
         _menu_feed(t, nrmvals, 5, eye, "Normal")
         _menu_feed(t, nrmvals, 3, hair, "Normal")
         _menu_feed(t, rgvals, 3, hair, "Roughness")
+        _menu_feed(t, rgvals, 5, eye_rough)
         model_sockets = (colsel_in, nrmsel_in, rgsel_in,
                          _in(smodel, "Shading Model"))
         for sock_ in model_sockets:
@@ -3594,6 +3662,7 @@ def build():
                 _out_pos("Principled BSDF"), "RMI_Surface", F["Out"])
     _expand_panels(bsdf)
     _sv(bsdf, "IOR", 1.3)
+    _sv(bsdf, "Coat IOR", 1.15)
     _sv(bsdf, "Subsurface Anisotropy", -0.5)
     out = _new(t, "ShaderNodeOutputMaterial", "Material Output",
                _out_pos("Material Output"), "", F["Out"])
@@ -3659,7 +3728,7 @@ def build():
 # (SWITCH_CONTROLS, ROLES, SWITCH_FOR_ROLE, ...) without triggering build().
 # That distinction matters: build() calls every util_*()/grp_*() function,
 # each of which runs _rebuild_group() on a SHARED node group ("FF7R Eye",
-# "UE Unpack Normal (RG)", etc.) -- and _rebuild_group() wipes and recreates
+# "UE Tangent To World", etc.) -- and _rebuild_group() wipes and recreates
 # that group's interface sockets on an already-existing group. Any OTHER
 # material in the .blend that also has a ShaderNodeGroup instance pointed at
 # that same shared group (which is by design -- see the module docstring)
@@ -3684,7 +3753,7 @@ if __name__ == "__main__":
              len(ENUM_PROPS), len(FLOAT_PROPS)))
     print("     (Material Properties > Custom Properties)")
     if _UV_NOTES:
-        print("  UV Coordinate Sets:")
+        print("  UV Map Sets:")
         for m_ in _UV_NOTES:
             print("     " + m_)
     if _OBJ_PROP_NOTES:

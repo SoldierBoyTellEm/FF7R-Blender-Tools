@@ -30,39 +30,14 @@ from . import audit as kdi_audit
 from ..reporting import FF7R_LoggedOperator
 
 
-bl_info = {
-    "name": "FF7R KineDriver Import",
-    "author": "OpenAI Codex",
-    "version": (0, 3, 0),
-    "blender": (4, 0, 0),
-    "location": "Search > KDI Step 2",
-    "description": "Build audited KDI scalar, rotation, and anchor drivers",
-    "category": "Animation",
-}
-
-
-SCRIPT_VERSION = "0.3.1"
+SCRIPT_VERSION = "0.3.3"
 REGISTRY_PROPERTY = "kdi_scalar_registry_json"
-
-# Debug toggle for an unresolved naming question. The stereographic decomposition
-# itself is settled -- our formulas match CEDEC slide 24 term for term -- but
-# which of the two resulting angles the data calls BendS and which BendT is a
-# labelling convention we inferred rather than confirmed. We read BendS as the
-# up-axis angle and BendT as the cross-axis angle; a third-party reference reads
-# them the other way round (though its phrasing is ambiguous). Our assignment is
-# self-consistent between decomposition and recomposition, which is why rigs work,
-# so this cannot be settled by reasoning -- only by looking at a shoulder or hip
-# deform with it on and off. Enabling it swaps the interpretation on both sides at
-# once, which is a pure relabel; it is NOT a no-op, because a BendS->BendS link
-# then transports the cross-axis angle where it used to transport the up-axis one.
-SWAP_BEND_ST_DESCRIPTION = (
-    "Debug: reinterpret BendS as the cross-axis angle and BendT as the up-axis "
-    "angle (the opposite of this add-on's default reading). Swaps both the source "
-    "decomposition and the target recomposition together. Leave off unless you are "
-    "specifically testing which convention matches the game"
-)
 GENERATED_PROPERTY = "kdi_scalar_generated_json"
 SOURCE_PROPERTY = "kdi_scalar_source_audit"
+# Blender Text blocks are saved in the .blend, unlike the temporary JSON file
+# used by the direct-package import path.  Keep the report names on the rig so
+# the node viewer can always reconstruct its graph from the imported drivers.
+GRAPH_TEXTS_PROPERTY = "ff7r_kdi_graph_texts"
 KDI_BONE_COLLECTION = "KDI Helpers (Hidden)"
 PHYSICS_BONE_COLLECTION = "Physics Bones (Hidden)"
 LEAF_BONE_COLLECTION = "Leaf Bones (Hidden)"
@@ -313,10 +288,74 @@ def normalized_rows(values: tuple[float, ...] | list[float], offset: int = 0) ->
     ]
 
 
-def converted_axis(body: dict[str, Any], key: str, fallback: tuple[float, float, float]) -> list[float]:
-    value = body.get(key) or {"X": fallback[0], "Y": fallback[1], "Z": fallback[2]}
+def converted_vector(value: dict[str, Any], fallback: tuple[float, float, float]) -> list[float]:
     # KDI/UE vector -> Blender vector: mirror Y.
     return [float(value.get("X", fallback[0])), -float(value.get("Y", fallback[1])), float(value.get("Z", fallback[2]))]
+
+
+def converted_axis(body: dict[str, Any], key: str, fallback: tuple[float, float, float]) -> list[float]:
+    value = body.get(key) or {"X": fallback[0], "Y": fallback[1], "Z": fallback[2]}
+    return converted_vector(value, fallback)
+
+
+def converted_target_bend_axes(body: dict[str, Any]) -> tuple[list[float], list[float], list[float]]:
+    """Return a TargetBendSTRoll frame as target-local composition axes.
+
+    KDI stores Aim/Up/Cross as the authored orthonormal reference frame.  A
+    SourceRotate projects a rotation onto that frame, but a target performs the
+    inverse operation: its reference-space bend components must be changed into
+    the target's local coordinates.  That is the transpose (and, for an
+    orthonormal frame, inverse) of the authored axis matrix.
+
+    Treating the stored columns directly happens to work for cardinal frames.
+    It also looks close on slightly rotated frames, but rotates strongly oblique
+    frames into the wrong quadrant -- PC0012 Jacket C/E are the clear example.
+    Transpose in KDI space first, then apply the established UE-to-Blender vector
+    conversion to each resulting local axis.
+    """
+    defaults = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    authored = []
+    for key, fallback in zip(("AimVector", "UpVector", "CrossVector"), defaults):
+        value = body.get(key) or {"X": fallback[0], "Y": fallback[1], "Z": fallback[2]}
+        authored.append([
+            float(value.get("X", fallback[0])),
+            float(value.get("Y", fallback[1])),
+            float(value.get("Z", fallback[2])),
+        ])
+    inverse_axes = [
+        [authored[0][axis], authored[1][axis], authored[2][axis]]
+        for axis in range(3)
+    ]
+    return tuple(
+        converted_vector(
+            {"X": vector[0], "Y": vector[1], "Z": vector[2]},
+            defaults[index],
+        )
+        for index, vector in enumerate(inverse_axes)
+    )
+
+
+def converted_quaternion(
+        body: dict[str, Any],
+        key: str,
+        fallback: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
+) -> list[float]:
+    """Convert a KDI/UE ``(X, Y, Z, W)`` quaternion to Blender ``(W, X, Y, Z)``."""
+    value = body.get(key) or {
+        "X": fallback[0], "Y": fallback[1], "Z": fallback[2], "W": fallback[3],
+    }
+    # Carry the rotation through the same Y reflection used for skeleton bind
+    # transforms: M R M^-1 maps (X,Y,Z,W) to (W,-X,Y,-Z).
+    return normalize_quaternion([
+        float(value.get("W", fallback[3])),
+        -float(value.get("X", fallback[0])),
+        float(value.get("Y", fallback[1])),
+        -float(value.get("Z", fallback[2])),
+    ])
 
 
 def rotation_parameter(config: dict[str, Any], q: list[float]) -> float:
@@ -347,12 +386,6 @@ def rotation_parameter(config: dict[str, Any], q: list[float]) -> float:
         roll -= 2.0 * math.pi
     elif roll < -math.pi:
         roll += 2.0 * math.pi
-
-    if config.get("swap_bend_st"):
-        # Debug relabel: reinterpret which physical angle each channel name
-        # denotes. See the note on SWAP_BEND_ST_DESCRIPTION. The target side
-        # (kdi_rotation) swaps in step, so this stays a pure relabel.
-        bend_from_up, bend_from_cross = bend_from_cross, bend_from_up
 
     if parameter == "BendS":
         return bend_from_up
@@ -727,16 +760,58 @@ def source_value_count(config: dict[str, Any]) -> int:
 
 
 def source_rotation_delta(config: dict[str, Any], values: tuple[float, ...] | list[float]) -> list[float]:
-    """Blend every source bone's rotation delta into the node's single output.
+    """Resolve every source bone into the SourceRotate node's single output.
 
     A Source operator exposes one set of output ports, so it must resolve its
     sources into one rotation before decomposing into BendS/BendT/Roll -- the
     blend happens here, on the transforms, not afterwards on the decomposed
     angles (which would not be equivalent, the decomposition being non-linear).
+
+    Multi-source nodes carry one authored ``NeutralRotate`` for the combined
+    transform.  Blend their current transforms first, then apply that neutral;
+    neutralizing each source independently before the blend is a different
+    quaternion operation and gives incorrect cross-axis motion.  Single-source
+    nodes retain the established pose-delta path because Blender already exposes
+    their PARENT-space input as a rest-relative ``matrix_basis`` rotation.
     """
     mode = config["source_mode"]
     count = len(config_source_bones(config))
     mix, magnitude = blend_weights(config_source_weights(config))
+
+    if count > 1 and config.get("neutral_rotation"):
+        if mode == "PARENT_ROTATION":
+            rest_locals = config["rest_local_rotations"]
+            current = [
+                multiply_quaternion(
+                    rest_locals[index],
+                    list(values[index * 4:index * 4 + 4]),
+                )
+                for index in range(count)
+            ]
+        elif mode == "NODE_ROTATION":
+            base_matrix = normalized_rows(values, 9 * count)
+            current = [
+                matrix3_to_quaternion(
+                    multiply3(
+                        transpose3(base_matrix),
+                        normalized_rows(values, 9 * index),
+                    )
+                )
+                for index in range(count)
+            ]
+        else:
+            raise ValueError(f"Source mode {mode} does not produce a quaternion")
+
+        # NeutralRotate is authored in KDI's reference frame, whereas package
+        # armatures may carry the extra display-bone roll. Convert each complete
+        # current transform before blending and applying the shared neutral.
+        current_reference = [
+            source_quaternion_in_reference_frame(config, quaternion)
+            for quaternion in current
+        ]
+        blended_current = weighted_quaternion_average(current_reference, mix)
+        delta = multiply_quaternion(config["neutral_rotation"], blended_current)
+        return weighted_quaternion(delta, magnitude)
 
     if mode == "PARENT_ROTATION":
         deltas = [list(values[index * 4:index * 4 + 4]) for index in range(count)]
@@ -820,18 +895,14 @@ def kdi_rotation(config_id: int, component: int, *values: float) -> float:
             target_body = config["target_body"]
             bend_s = channels.get("BendS", 0.0)
             bend_t = channels.get("BendT", 0.0)
-            if config.get("swap_bend_st"):
-                # compose_bend_roll's first argument is always the up-axis angle
-                # and its second the cross-axis angle, so under the swapped
-                # labelling the channels feed the opposite slots.
-                bend_s, bend_t = bend_t, bend_s
+            target_aim, target_up, target_cross = converted_target_bend_axes(target_body)
             quaternion = compose_bend_roll(
                 bend_s,
                 bend_t,
                 channels.get("Roll", 0.0),
-                converted_axis(target_body, "AimVector", (1.0, 0.0, 0.0)),
-                converted_axis(target_body, "UpVector", (0.0, 1.0, 0.0)),
-                converted_axis(target_body, "CrossVector", (0.0, 0.0, 1.0)),
+                target_aim,
+                target_up,
+                target_cross,
                 bool(target_body.get("ReverseOrder", False)),
             )
         else:
@@ -1026,6 +1097,18 @@ def build_source_config(source_node: dict[str, Any], armature: Any) -> dict[str,
     }
     if source_mode.startswith("NODE_") and not config["base_bone"]:
         raise ValueError(f"Source node {source_node['operator_index']} has NODE base space without a base bone")
+    if source_type == "SourceRotate" and len(source_bones) > 1:
+        config["neutral_rotation"] = converted_quaternion(source_body, "NeutralRotate")
+        config["rest_local_rotations"] = []
+        for bone_name in source_bones:
+            bone = armature.data.bones[bone_name]
+            rest_local = (
+                bone.parent.matrix_local.inverted() @ bone.matrix_local
+                if bone.parent else bone.matrix_local.copy()
+            )
+            config["rest_local_rotations"].append(
+                matrix3_to_quaternion(matrix3_from_matrix4(rest_local.to_3x3()))
+            )
     if source_mode == "NODE_ROTATION":
         base_rest = armature.data.bones[config["base_bone"]].matrix_local.to_3x3()
         rest_relatives = [
@@ -1811,11 +1894,52 @@ def remove_generated(armature: Any) -> tuple[int, int]:
             collection = armature.data.collections.get(collection_name)
             if collection:
                 armature.data.collections.remove(collection)
-    for prop in (REGISTRY_PROPERTY, GENERATED_PROPERTY, SOURCE_PROPERTY):
+    for prop in (REGISTRY_PROPERTY, GENERATED_PROPERTY, SOURCE_PROPERTY, GRAPH_TEXTS_PROPERTY):
         if prop in armature:
             del armature[prop]
     schedule_runtime_load()
     return removed, restored
+
+
+def kdi_driver_fcurves(armature: Any):
+    """Yield each driver F-Curve this add-on generated on `armature`.
+
+    Reads the recorded ``(data_path, array_index)`` pairs from
+    ``GENERATED_PROPERTY`` (the same list ``remove_generated`` uses) rather
+    than every F-Curve in ``animation_data.drivers``, so a user's own
+    unrelated drivers on the same armature are never muted alongside ours.
+    """
+    if GENERATED_PROPERTY not in armature or armature.animation_data is None:
+        return
+    try:
+        payload = json.loads(armature[GENERATED_PROPERTY])
+    except (TypeError, ValueError):
+        return
+    for item in payload.get("drivers", []):
+        try:
+            fcurve = armature.animation_data.drivers.find(
+                item["data_path"], index=int(item["array_index"])
+            )
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        if fcurve is not None:
+            yield fcurve
+
+
+def set_kdi_drivers_muted(scene: Any, muted: bool) -> int:
+    """Mute/unmute every KDI-generated driver on every armature in `scene`.
+
+    Returns how many driver F-Curves were toggled. Used by the viewport
+    header's KDI on/off button (see ``_kdi_drivers_enabled_update`` below).
+    """
+    toggled = 0
+    for obj in scene.objects:
+        if obj.type != "ARMATURE":
+            continue
+        for fcurve in kdi_driver_fcurves(obj):
+            fcurve.mute = muted
+            toggled += 1
+    return toggled
 
 
 def apply_scale_compensation(armature: Any, node_by_index: dict[int, dict[str, Any]]) -> list[str]:
@@ -1904,33 +2028,12 @@ def hide_noninteractive_bones(armature: Any, node_by_index: dict[int, dict[str, 
     }
 
 
-def _stamp_swap_bend_st(configs: list[dict[str, Any]]) -> None:
-    """Mark every config, including the ones nested inside rotation targets.
-
-    Rotation configs carry their own scalar configs in ``scalar_inputs`` and
-    ``direct_source``; those are the dicts ``rotation_parameter`` actually
-    receives, so stamping only the top level would swap the target side without
-    the source side and produce a genuinely wrong rig rather than a relabel.
-    """
-    for config in configs:
-        if not isinstance(config, dict):
-            continue
-        config["swap_bend_st"] = True
-        nested = list(config.get("scalar_inputs") or [])
-        direct = config.get("direct_source")
-        if isinstance(direct, dict):
-            nested.append(direct)
-        if nested:
-            _stamp_swap_bend_st(nested)
-
-
 def build_scalar_drivers(
     armature: Any,
     audit: dict[str, Any],
     translation_axis_order: str = "XZY",
     scale_axis_order: str = "XZY",
     coordinate_profile: str = COORDINATE_PROFILE_REFERENCE,
-    swap_bend_st: bool = False,
     additive: bool = False,
 ) -> dict[str, Any]:
     for axis_order in (translation_axis_order, scale_axis_order):
@@ -2221,11 +2324,6 @@ def build_scalar_drivers(
         raise
 
     all_configs = configs + rotation_configs + anchor_configs
-    if swap_bend_st:
-        # Stamped onto the serialized configs rather than held in a module global
-        # so the choice travels with the .blend and survives a reload -- otherwise
-        # reopening the file would silently evaluate the drivers the other way.
-        _stamp_swap_bend_st(all_configs)
 
     def _merge(previous: list[Any], added: list[Any]) -> list[Any]:
         """Union, order-preserving, for the ownership lists remove_generated walks."""
@@ -2242,7 +2340,6 @@ def build_scalar_drivers(
         "schema_version": 1,
         "script_version": SCRIPT_VERSION,
         "source_sha256": graph["source"]["sha256"],
-        "swap_bend_st": bool(swap_bend_st),
         "configs": previous_registry.get("configs", []) + all_configs,
     }
     ownership = {
@@ -2320,11 +2417,6 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
         default=COORDINATE_PROFILE_REFERENCE,
         options={"HIDDEN", "SKIP_SAVE"},
     )
-    swap_bend_st: BoolProperty(
-        name="Swap BendS/BendT interpretation",
-        description=SWAP_BEND_ST_DESCRIPTION,
-        default=False,
-    )
     additive: BoolProperty(
         name="Add to the existing KDI layer",
         description=(
@@ -2336,6 +2428,17 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
         options={"HIDDEN", "SKIP_SAVE"},
     )
 
+    # This operator is also driven headlessly, with an explicit coordinate_profile,
+    # by the package Skeleton/KDI importers -- _load_last_import_settings only
+    # takes effect via invoke() below (the loose-file, user-facing entry point),
+    # so those internal calls never have their caller-supplied axis orders fed
+    # back into what a user chose the last time they picked a KDI JSON directly.
+    _persisted_props = ("replace_previous_generated", "translation_axis_order", "scale_axis_order")
+
+    def invoke(self, context: Any, event: Any):
+        self._load_last_import_settings(context)
+        return super().invoke(context, event)
+
     def draw(self, _context: Any) -> None:
         layout = self.layout
         layout.prop(self, "replace_previous_generated")
@@ -2343,9 +2446,6 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
         layout.label(text="Experimental target-axis mapping")
         layout.prop(self, "translation_axis_order")
         layout.prop(self, "scale_axis_order")
-        layout.separator()
-        layout.label(text="Debug")
-        layout.prop(self, "swap_bend_st")
 
     def execute(self, context: Any) -> set[str]:
         armature = context.active_object
@@ -2364,6 +2464,15 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
             text_block = bpy.data.texts.get(text_name) or bpy.data.texts.new(text_name)
             text_block.clear()
             text_block.write(report_text)
+            graph_texts = []
+            if self.additive and GRAPH_TEXTS_PROPERTY in armature:
+                try:
+                    graph_texts = list(json.loads(armature[GRAPH_TEXTS_PROPERTY]))
+                except (TypeError, ValueError):
+                    graph_texts = []
+            if text_name not in graph_texts:
+                graph_texts.append(text_name)
+            armature[GRAPH_TEXTS_PROPERTY] = json.dumps(graph_texts)
             if not audit.get("ready_for_driver_generation"):
                 blocker_count = len(audit.get("blockers", []))
                 raise ValueError(f"KDI audit found {blocker_count} blocker(s); see Blender Text {text_name}")
@@ -2379,7 +2488,6 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
                 translation_axis_order=self.translation_axis_order,
                 scale_axis_order=self.scale_axis_order,
                 coordinate_profile=self.coordinate_profile,
-                swap_bend_st=self.swap_bend_st,
                 additive=self.additive,
             )
             armature[SOURCE_PROPERTY] = str(source_path.resolve())
@@ -2392,7 +2500,6 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
                 f"{result['hidden_helper_bone_count']} helper/physics/leaf bones"
                 f"; translate {self.translation_axis_order}, scale {self.scale_axis_order}"
                 f"; frame {self.coordinate_profile}"
-                + ("; BendS/BendT SWAPPED" if self.swap_bend_st else "")
                 + (
                     f"; skipped {result['sourceless_anchor_count']} source-less constraint(s)"
                     if result["sourceless_anchor_count"] else ""
@@ -2407,6 +2514,7 @@ class KDI_OT_step2_scalar_drivers(FF7R_LoggedOperator, ImportHelper):
                 )
                 + f"; audit: {text_name}"
             )
+            self._save_last_import_settings(context)
             self.report({"INFO"}, success_message)
             return {"FINISHED"}
         except Exception as exc:
@@ -2440,6 +2548,33 @@ class KDI_OT_remove_scalar_drivers(FF7R_LoggedOperator):
 
 CLASSES = (KDI_OT_step2_scalar_drivers, KDI_OT_remove_scalar_drivers)
 
+KDI_DRIVERS_ENABLED_PROPERTY = "ff7r_kdi_drivers_enabled"
+
+
+def _kdi_drivers_enabled_update(self, context) -> None:
+    """Scene-property update callback backing the viewport header toggle."""
+    set_kdi_drivers_muted(context.scene, muted=not getattr(self, KDI_DRIVERS_ENABLED_PROPERTY))
+    context.view_layer.update()
+    if context.screen is not None:
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
+def _draw_kdi_drivers_toggle(self, context) -> None:
+    """Appended to VIEW3D_HT_header, beside the overlay/shading toggles."""
+    scene = context.scene
+    if scene is None:
+        return
+    self.layout.separator()
+    self.layout.prop(
+        scene,
+        KDI_DRIVERS_ENABLED_PROPERTY,
+        text="",
+        icon="DRIVER",
+        toggle=True,
+    )
+
 
 def register() -> None:
     for cls in CLASSES:
@@ -2451,9 +2586,26 @@ def register() -> None:
     if kdi_scalar_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(kdi_scalar_load_post)
     schedule_runtime_load()
+    setattr(
+        bpy.types.Scene,
+        KDI_DRIVERS_ENABLED_PROPERTY,
+        bpy.props.BoolProperty(
+            name="KDI Drivers",
+            description=(
+                "Enable or disable every FF7R KineDriver-generated driver on "
+                "armatures in this scene"
+            ),
+            default=True,
+            update=_kdi_drivers_enabled_update,
+        ),
+    )
+    bpy.types.VIEW3D_HT_header.append(_draw_kdi_drivers_toggle)
 
 
 def unregister() -> None:
+    bpy.types.VIEW3D_HT_header.remove(_draw_kdi_drivers_toggle)
+    if hasattr(bpy.types.Scene, KDI_DRIVERS_ENABLED_PROPERTY):
+        delattr(bpy.types.Scene, KDI_DRIVERS_ENABLED_PROPERTY)
     if kdi_scalar_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(kdi_scalar_load_post)
     if bpy.app.timers.is_registered(deferred_runtime_load):

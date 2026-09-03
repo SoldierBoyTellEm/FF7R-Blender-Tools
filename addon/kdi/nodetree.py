@@ -3,7 +3,9 @@
 KDI is genuinely node based: ``Operators`` are typed nodes and ``ConnectionBody``
 entries are edges carrying named ports, authored originally as a Maya graph. This
 module mirrors that structure into a custom Blender node tree so the rig can be
-inspected in the Node Editor.
+inspected in the Node Editor. Concrete node classes also expose the known KDI
+operator vocabulary in Blender's Add menu, laying out the types and default ports
+an eventual read-write editor can build on.
 
 It is a **viewer**: editing the tree changes nothing. The driver layer is still
 generated from the audit by ``kdi/drivers.py``; nothing here writes back.
@@ -24,6 +26,7 @@ path layering.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import bpy
@@ -129,16 +132,15 @@ class FF7R_KDI_Socket(bpy.types.NodeSocket):
 
 
 class FF7R_KDI_Node(bpy.types.Node):
-    """One KineDriver operator.
-
-    Deliberately one class for every operator type rather than 24 subclasses: the
-    type is data, sockets are built from the asset's own connections, and an
-    operator type this add-on has never seen still renders correctly.
-    """
+    """Fallback node for an unknown KineDriver operator type."""
 
     bl_idname = NODE_TYPE
     bl_label = "KDI Operator"
     bl_width_default = 230.0
+
+    kdi_operator_type = ""
+    default_inputs: tuple[str, ...] = ()
+    default_outputs: tuple[str, ...] = ()
 
     operator_type: StringProperty(name="Operator", default="")
     operator_index: IntProperty(name="Index", default=-1)
@@ -149,8 +151,19 @@ class FF7R_KDI_Node(bpy.types.Node):
     def poll(cls, node_tree):
         return node_tree.bl_idname == TREE_TYPE
 
+    def init(self, _context):
+        if self.kdi_operator_type:
+            self.operator_type = self.kdi_operator_type
+        for name in self.default_inputs:
+            self.inputs.new(SOCKET_TYPE, name)
+        for name in self.default_outputs:
+            self.outputs.new(SOCKET_TYPE, name)
+        self.use_custom_color = True
+        self.color = FAMILY_COLORS[operator_family(self.operator_type)]
+
     def draw_label(self):
-        return f"{self.operator_type} #{self.operator_index}"
+        operator_type = self.operator_type or self.kdi_operator_type or "Unknown"
+        return f"{operator_type} #{self.operator_index}" if self.operator_index >= 0 else operator_type
 
     def draw_buttons(self, _context, layout):
         if self.asset_label:
@@ -160,12 +173,216 @@ class FF7R_KDI_Node(bpy.types.Node):
                 layout.label(text=line)
 
 
+class FF7R_KDI_SourceTranslateNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_SourceTranslateNode"
+    bl_label = "Source Translate"
+    bl_description = "Read translation channels from one or more source bones"
+    kdi_operator_type = "SourceTranslate"
+    default_outputs = ("TranslateX", "TranslateY", "TranslateZ", "Distance")
+
+
+class FF7R_KDI_SourceRotateNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_SourceRotateNode"
+    bl_label = "Source Rotate"
+    bl_description = "Read Bend, Roll, angle, or quaternion channels from source bones"
+    kdi_operator_type = "SourceRotate"
+    default_outputs = (
+        "BendS", "BendT", "Roll", "BendingAngle", "RotateAngle",
+        "BendingQuat", "RotateQuat",
+    )
+
+
+class FF7R_KDI_EffectorEZParamLinkNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_EffectorEZParamLinkNode"
+    bl_label = "EZ Parameter Link"
+    bl_description = "Map a scalar through KineDriver's two-segment Bezier curve"
+    kdi_operator_type = "EffectorEZParamLink"
+    default_inputs = ("Input",)
+    default_outputs = ("Output",)
+
+
+class FF7R_KDI_EffectorEZParamLinkLinearNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_EffectorEZParamLinkLinearNode"
+    bl_label = "Linear Parameter Link"
+    bl_description = "Apply scalar scale, offset, and optional limits"
+    kdi_operator_type = "EffectorEZParamLinkLinear"
+    default_inputs = ("Input",)
+    default_outputs = ("Output",)
+
+
+class FF7R_KDI_EffectorLinkWithNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_EffectorLinkWithNode"
+    bl_label = "Link With"
+    bl_description = "KineDriver single-key driven interpolation"
+    kdi_operator_type = "EffectorLinkWith"
+    default_inputs = ("Input",)
+    default_outputs = ("Output",)
+
+
+class FF7R_KDI_EffectorRBFInterpNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_EffectorRBFInterpNode"
+    bl_label = "RBF Interpolation"
+    bl_description = "KineDriver multidimensional radial-basis interpolation"
+    kdi_operator_type = "EffectorRBFInterp"
+    default_inputs = ("Input[0]",)
+    default_outputs = ("Output",)
+
+
+class FF7R_KDI_EffectorExprNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_EffectorExprNode"
+    bl_label = "Expression"
+    bl_description = "Evaluate a compiled KineDriver expression"
+    kdi_operator_type = "EffectorExpr"
+    default_inputs = ("Input[0]",)
+    default_outputs = ("Output",)
+
+
+class FF7R_KDI_EffectorInverseNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_EffectorInverseNode"
+    bl_label = "Inverse"
+    bl_description = "KineDriver inverse effector"
+    kdi_operator_type = "EffectorInverse"
+    default_inputs = ("Input",)
+    default_outputs = ("Output",)
+
+
+class FF7R_KDI_TargetTranslateNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetTranslateNode"
+    bl_label = "Target Translate"
+    bl_description = "Write translation channels to a target bone"
+    kdi_operator_type = "TargetTranslate"
+    default_inputs = ("TranslateX", "TranslateY", "TranslateZ")
+
+
+class FF7R_KDI_TargetScaleNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetScaleNode"
+    bl_label = "Target Scale"
+    bl_description = "Write scale channels to a target bone"
+    kdi_operator_type = "TargetScale"
+    default_inputs = ("ScaleX", "ScaleY", "ScaleZ")
+
+
+class FF7R_KDI_TargetBendSTRollNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetBendSTRollNode"
+    bl_label = "Target Bend S/T/Roll"
+    bl_description = "Compose BendS, BendT, and Roll onto a target bone"
+    kdi_operator_type = "TargetBendSTRoll"
+    default_inputs = ("BendS", "BendT", "Roll")
+
+
+class FF7R_KDI_TargetBendRollNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetBendRollNode"
+    bl_label = "Target Bend/Roll"
+    bl_description = "Compose a bending quaternion and scalar Roll onto a target bone"
+    kdi_operator_type = "TargetBendRoll"
+    default_inputs = ("BendingQuat", "Roll")
+
+
+class FF7R_KDI_TargetRotateNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetRotateNode"
+    bl_label = "Target Rotate"
+    bl_description = "Write a quaternion rotation to a target bone"
+    kdi_operator_type = "TargetRotate"
+    default_inputs = ("RotateQuat",)
+
+
+class FF7R_KDI_TargetPoscnsNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetPoscnsNode"
+    bl_label = "Target Position Constraint"
+    bl_description = "Constrain a target bone's position to authored source bones"
+    kdi_operator_type = "TargetPoscns"
+
+
+class FF7R_KDI_TargetOricnsNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetOricnsNode"
+    bl_label = "Target Orientation Constraint"
+    bl_description = "Constrain a target bone's orientation to authored source bones"
+    kdi_operator_type = "TargetOricns"
+
+
+class FF7R_KDI_TargetDircnsNode(FF7R_KDI_Node):
+    bl_idname = "FF7R_KDI_TargetDircnsNode"
+    bl_label = "Target Direction Constraint"
+    bl_description = "Aim a target bone using KineDriver's direction constraint"
+    kdi_operator_type = "TargetDircns"
+
+
+SOURCE_NODE_CLASSES = (
+    FF7R_KDI_SourceTranslateNode,
+    FF7R_KDI_SourceRotateNode,
+)
+EFFECTOR_NODE_CLASSES = (
+    FF7R_KDI_EffectorEZParamLinkNode,
+    FF7R_KDI_EffectorEZParamLinkLinearNode,
+    FF7R_KDI_EffectorLinkWithNode,
+    FF7R_KDI_EffectorRBFInterpNode,
+    FF7R_KDI_EffectorExprNode,
+    FF7R_KDI_EffectorInverseNode,
+)
+TARGET_NODE_CLASSES = (
+    FF7R_KDI_TargetTranslateNode,
+    FF7R_KDI_TargetScaleNode,
+    FF7R_KDI_TargetBendSTRollNode,
+    FF7R_KDI_TargetBendRollNode,
+    FF7R_KDI_TargetRotateNode,
+    FF7R_KDI_TargetPoscnsNode,
+    FF7R_KDI_TargetOricnsNode,
+    FF7R_KDI_TargetDircnsNode,
+)
+OPERATOR_NODE_CLASSES = SOURCE_NODE_CLASSES + EFFECTOR_NODE_CLASSES + TARGET_NODE_CLASSES
+NODE_TYPE_BY_OPERATOR = {
+    cls.kdi_operator_type: cls.bl_idname for cls in OPERATOR_NODE_CLASSES
+}
+
+
 class FF7R_KDI_NodeTree(bpy.types.NodeTree):
     """Read-only view of a KineDriver operator graph."""
 
     bl_idname = TREE_TYPE
     bl_label = "FF7R KineDriver"
     bl_icon = "DRIVER"
+
+
+def _draw_node_items(layout: Any, classes: tuple[type, ...]) -> None:
+    for node_class in classes:
+        props = layout.operator("node.add_node", text=node_class.bl_label)
+        props.type = node_class.bl_idname
+        props.use_transform = True
+
+
+class FF7R_KDI_MT_add_source(bpy.types.Menu):
+    bl_idname = "FF7R_KDI_MT_add_source"
+    bl_label = "Source"
+
+    def draw(self, _context):
+        _draw_node_items(self.layout, SOURCE_NODE_CLASSES)
+
+
+class FF7R_KDI_MT_add_effector(bpy.types.Menu):
+    bl_idname = "FF7R_KDI_MT_add_effector"
+    bl_label = "Effector"
+
+    def draw(self, _context):
+        _draw_node_items(self.layout, EFFECTOR_NODE_CLASSES)
+
+
+class FF7R_KDI_MT_add_target(bpy.types.Menu):
+    bl_idname = "FF7R_KDI_MT_add_target"
+    bl_label = "Target"
+
+    def draw(self, _context):
+        _draw_node_items(self.layout, TARGET_NODE_CLASSES)
+
+
+def draw_kdi_add_menu(self: Any, context: Any) -> None:
+    space = getattr(context, "space_data", None)
+    if not space or getattr(space, "tree_type", None) != TREE_TYPE:
+        return
+    layout = self.layout
+    layout.separator()
+    layout.menu(FF7R_KDI_MT_add_source.bl_idname, icon="BONE_DATA")
+    layout.menu(FF7R_KDI_MT_add_effector.bl_idname, icon="DRIVER")
+    layout.menu(FF7R_KDI_MT_add_target.bl_idname, icon="CONSTRAINT_BONE")
 
 
 def _port_key(port: dict[str, Any]) -> str:
@@ -276,7 +493,12 @@ def build_node_tree(
     for index in sorted(candidates):
         source_node = candidates[index]
         operator_type = source_node.get("operator_type") or "Unknown"
-        node = tree.nodes.new(NODE_TYPE)
+        node = tree.nodes.new(NODE_TYPE_BY_OPERATOR.get(operator_type, NODE_TYPE))
+        # Manually added nodes expose their eventual authoring ports. Imported
+        # graphs instead reflect the cooked asset exactly, so discard the class
+        # defaults and recreate only ports referenced by live connections below.
+        node.inputs.clear()
+        node.outputs.clear()
         node.operator_type = operator_type
         node.operator_index = index
         label = source_node.get("label")
@@ -329,6 +551,96 @@ def _selected_bone_name(context: Any) -> str:
     return active.name if active else ""
 
 
+def _stored_graphs(armature: Any) -> list[dict[str, Any]]:
+    """Return graphs embedded in this .blend when the KDI was imported.
+
+    Package imports use a JSON file in a temporary folder, so a file path alone
+    cannot reliably reopen a graph after the import has finished.  The driver
+    importer saves its audit Text block with the armature for this exact use.
+    """
+    from .drivers import GRAPH_TEXTS_PROPERTY
+    from .audit import TEXT_BLOCK_PREFIX
+
+    try:
+        text_names = json.loads(armature.get(GRAPH_TEXTS_PROPERTY, "[]"))
+    except (TypeError, ValueError):
+        text_names = []
+    # The fallback covers rigs generated with an earlier add-on release: those
+    # releases did write the audit Text, just not its name onto the armature.
+    # Once a graph has been explicitly associated, never mix in other rigs'
+    # audit reports from the same blend.
+    text_blocks = [bpy.data.texts.get(str(name)) for name in text_names]
+    if not text_names:
+        text_blocks = [text for text in bpy.data.texts if text.name.startswith(TEXT_BLOCK_PREFIX)]
+    graphs = []
+    for text_block in text_blocks:
+        if text_block is None:
+            continue
+        try:
+            report = json.loads(text_block.as_string())
+            graph = report.get("graph") if isinstance(report, dict) else None
+            if isinstance(graph, dict) and graph.get("nodes"):
+                graphs.append(graph)
+        except (TypeError, ValueError):
+            continue
+    return graphs
+
+
+def _graph_for_bone(graphs: list[dict[str, Any]], bone_name: str) -> dict[str, Any] | None:
+    if not graphs:
+        return None
+    if bone_name:
+        for graph in graphs:
+            if any(
+                (node.get("body") or {}).get("TargetObjectBoneName") == bone_name
+                for node in graph.get("nodes", [])
+            ):
+                return graph
+    return graphs[0]
+
+
+def _show_graph(context: Any, graph: dict[str, Any], armature: Any,
+                target_bone: str, max_nodes: int) -> tuple[str, str]:
+    asset_name = (graph.get("source") or {}).get("asset_name") or getattr(armature, "name", "KDI")
+    name = f"KDI {asset_name} [{target_bone}]" if target_bone else f"KDI {asset_name}"
+    tree = bpy.data.node_groups.get(name)
+    if tree is None or tree.bl_idname != TREE_TYPE:
+        tree = bpy.data.node_groups.new(name, TREE_TYPE)
+    try:
+        stats = build_node_tree(tree, graph, target_bone, max_nodes)
+    except Exception as exc:
+        return "ERROR", f"Could not build the graph view: {exc}"
+    if not stats["node_count"]:
+        return "WARNING", f"Nothing to show for '{target_bone}' -- no operator in this KDI drives that bone."
+
+    # Point any open Node Editor at the focused tree, so choosing a bone does
+    # not require a second selection in the editor's datablock menu.
+    for area in context.screen.areas:
+        if area.type == "NODE_EDITOR":
+            for space in area.spaces:
+                if space.type == "NODE_EDITOR":
+                    space.tree_type = TREE_TYPE
+                    space.node_tree = tree
+    message = (f"'{name}': {stats['node_count']} operators, {stats['link_count']} "
+               f"connections (of {stats['total_operators']} operators in the asset)")
+    if stats["truncated"]:
+        message += f"; truncated at the {max_nodes} node limit"
+    return "INFO", message
+
+
+def selected_bone_has_kdi_driver(context: Any) -> bool:
+    armature = context.active_object
+    bone_name = _selected_bone_name(context)
+    if not armature or not bone_name:
+        return False
+    try:
+        from .drivers import REGISTRY_PROPERTY
+        registry = json.loads(armature.get(REGISTRY_PROPERTY, "{}"))
+        return any(item.get("target_bone") == bone_name for item in registry.get("configs", []))
+    except (TypeError, ValueError):
+        return False
+
+
 class FF7R_KDI_OT_visualize(FF7R_LoggedOperator):
     """Show a KineDriver rig as a node graph in the Node Editor"""
 
@@ -338,8 +650,8 @@ class FF7R_KDI_OT_visualize(FF7R_LoggedOperator):
 
     filepath: StringProperty(
         name="KDI JSON",
-        description="KineDriver JSON to visualize. Leave blank to use the one the "
-                    "active armature's driver layer was built from",
+        description="Optional KineDriver JSON. Leave blank to use the graph saved "
+                    "with the active armature's imported KDI drivers",
         subtype="FILE_PATH",
         default="",
     )
@@ -379,66 +691,84 @@ class FF7R_KDI_OT_visualize(FF7R_LoggedOperator):
         from .drivers import SOURCE_PROPERTY
 
         source = (self.filepath or "").strip()
+        armature = context.active_object if context.active_object and context.active_object.type == "ARMATURE" else None
+        graph = None
         if not source:
-            armature = context.active_object
-            if armature and armature.type == "ARMATURE":
+            if armature:
+                graph = _graph_for_bone(_stored_graphs(armature), self.target_bone.strip())
+            if graph is None and armature:
                 source = armature.get(SOURCE_PROPERTY, "")
-            if not source:
+            if graph is None and not source:
                 self.report({"ERROR"},
-                            "No KDI given. Choose a file, or select an armature that "
-                            "already has an imported KDI layer.")
+                            "No embedded KDI graph was found. Select an armature with "
+                            "imported KDI drivers, or choose a KDI JSON file.")
                 return {"CANCELLED"}
 
-        path = Path(bpy.path.abspath(source))
-        if not path.is_file():
-            self.report({"ERROR"}, f"KDI JSON not found: {path}")
+        if graph is None:
+            path = Path(bpy.path.abspath(source))
+            if not path.is_file():
+                self.report({"ERROR"}, f"KDI JSON not found: {path}")
+                return {"CANCELLED"}
+            try:
+                asset, raw = kdi_audit.read_kdi(path)
+                graph = kdi_audit.build_graph(asset, path, raw)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Could not read the KDI: {exc}")
+                return {"CANCELLED"}
+        level, message = _show_graph(context, graph, armature, self.target_bone.strip(), self.max_nodes)
+        self.report({level}, message)
+        return {"FINISHED" if level == "INFO" else "CANCELLED"}
+
+
+class FF7R_KDI_OT_focus_selected_bone(FF7R_LoggedOperator):
+    """Focus the embedded KDI graph on the selected driven bone."""
+
+    bl_idname = "kdi.focus_selected_bone_graph"
+    bl_label = "KDI: Focus Selected Bone in Graph"
+    bl_description = "Show the KDI subgraph that drives the selected bone"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return selected_bone_has_kdi_driver(context)
+
+    def execute(self, context):
+        armature = context.active_object
+        bone_name = _selected_bone_name(context)
+        graph = _graph_for_bone(_stored_graphs(armature), bone_name)
+        if graph is None:
+            self.report({"ERROR"}, "This KDI layer has no embedded graph. Re-import it to enable graph focus.")
             return {"CANCELLED"}
-
-        try:
-            asset, raw = kdi_audit.read_kdi(path)
-            graph = kdi_audit.build_graph(asset, path, raw)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Could not read the KDI: {exc}")
-            return {"CANCELLED"}
-
-        name = f"KDI {asset.get('Name') or path.stem}"
-        if self.target_bone:
-            name += f" [{self.target_bone}]"
-        tree = bpy.data.node_groups.get(name)
-        if tree is None or tree.bl_idname != TREE_TYPE:
-            tree = bpy.data.node_groups.new(name, TREE_TYPE)
-
-        try:
-            stats = build_node_tree(tree, graph, self.target_bone.strip(), self.max_nodes)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Could not build the graph view: {exc}")
-            return {"CANCELLED"}
-
-        if not stats["node_count"]:
-            self.report({"WARNING"},
-                        f"Nothing to show for '{self.target_bone}' -- no operator in this "
-                        f"KDI drives that bone.")
-            return {"CANCELLED"}
-
-        # Point any open Node Editor at the tree, so it is visible without hunting.
-        for area in context.screen.areas:
-            if area.type == "NODE_EDITOR":
-                for space in area.spaces:
-                    if space.type == "NODE_EDITOR":
-                        space.tree_type = TREE_TYPE
-                        space.node_tree = tree
-
-        message = (f"'{name}': {stats['node_count']} operators, {stats['link_count']} "
-                   f"connections (of {stats['total_operators']} operators in the asset)")
-        if stats["truncated"]:
-            message += f"; truncated at the {self.max_nodes} node limit"
-        self.report({"INFO"}, message)
-        return {"FINISHED"}
+        level, message = _show_graph(context, graph, armature, bone_name, DEFAULT_MAX_NODES)
+        self.report({level}, message)
+        return {"FINISHED" if level == "INFO" else "CANCELLED"}
 
 
 CLASSES = (
     FF7R_KDI_Socket,
     FF7R_KDI_Node,
+    *OPERATOR_NODE_CLASSES,
     FF7R_KDI_NodeTree,
+    FF7R_KDI_MT_add_source,
+    FF7R_KDI_MT_add_effector,
+    FF7R_KDI_MT_add_target,
     FF7R_KDI_OT_visualize,
+    FF7R_KDI_OT_focus_selected_bone,
 )
+
+
+def register_add_menu() -> None:
+    # Reloading during add-on development can otherwise append the callback more
+    # than once and duplicate all three categories in Blender's Add menu.
+    try:
+        bpy.types.NODE_MT_add.remove(draw_kdi_add_menu)
+    except (AttributeError, ValueError):
+        pass
+    bpy.types.NODE_MT_add.append(draw_kdi_add_menu)
+
+
+def unregister_add_menu() -> None:
+    try:
+        bpy.types.NODE_MT_add.remove(draw_kdi_add_menu)
+    except (AttributeError, ValueError):
+        pass

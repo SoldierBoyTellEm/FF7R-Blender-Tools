@@ -16,3 +16,5 @@ dist/
 *.swp
 Thumbs.db
 .DS_Store
+
+docs/

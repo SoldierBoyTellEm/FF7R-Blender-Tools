@@ -10,9 +10,10 @@ import bpy
 import json
 import math
 import re
+from pathlib import Path
 
 BLEND = r"O:\Blender\Assets\FF7\cloud baseline.blend"
-UMODEL_TXT = r"C:\Users\Ghouls\Proton Drive\GhoulCulture\My files\TheBeastintheTable\Blender\FF7R\Rebirth scripts\ff7r_kdi\pc0000_00 hierarchy.txt"
+UMODEL_TXT = str(Path(__file__).resolve().parent / "pc0000_00 hierarchy.txt")
 SKEL = "End/Content/Character/Player/PC0000_00_Cloud_Standard/Model/PC0000_00_Skeleton.uasset"
 TOLERANCE = 0.0002
 

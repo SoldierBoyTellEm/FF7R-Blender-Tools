@@ -16,6 +16,22 @@ CUE4Parse is Copyright (c) FabianFG and contributors, licensed under the
 Apache License, Version 2.0. A copy of the license is available at
 <http://www.apache.org/licenses/LICENSE-2.0> and is not modified here.
 
+## Animation Compression Library (ACL)
+
+Rebirth stores its AnimSequence key frames as ACL 1.x compressed clips, which
+neither CUE4Parse nor CUE4Parse-Conversion can decode. `bridge/AclDecoder.cs`
+and `bridge/AclDecompressor.cs` are a partial C# port of the decompression path
+of [ACL](https://github.com/nfrechette/acl) v1.3.5 — specifically
+`acl/algorithm/uniformly_sampled/decoder.h`, `acl/decompression/decompress_data.h`,
+`acl/math/quat_packing.h` and `acl/math/vector4_packing.h`.
+
+ACL is Copyright (c) 2017 Nicholas Frechette & Animation Compression Library
+contributors, licensed under the MIT License. Those two files are derivative
+works and carry the MIT license rather than this repository's Unlicense
+dedication; the license text is available at
+<https://github.com/nfrechette/acl/blob/develop/LICENSE>. No ACL source or
+binary is bundled here.
+
 ## Other bundled dependencies
 
 `addon/bridge/` also ships the transitive NuGet dependencies CUE4Parse pulls in

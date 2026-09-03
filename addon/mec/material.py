@@ -257,6 +257,30 @@ def _make_y_invert_curves(nt, loc):
     return crv
 
 
+def _make_normal_map(nt, links, color_out, loc, *,
+                     legacy_loc=None, legacy_curves_loc=None):
+    """Wire *color_out* into a Normal Map node that honours UE's DirectX green.
+
+    Blender 5.2+ does the flip on the node itself through
+    convention='DIRECTX'.  Older builds get the equivalent RGB Curves Y-flip
+    spliced in front, at *legacy_curves_loc* (default: one column left of the
+    Normal Map node), with the Normal Map node itself moved to *legacy_loc*
+    where the layout has no room for the extra column.  Returns the Normal Map
+    node; the caller links its Normal output.
+    """
+    if bpy.app.version < (5, 2, 0):
+        if legacy_loc is not None:
+            loc = legacy_loc
+        crv = _make_y_invert_curves(nt, legacy_curves_loc or (loc[0] - 300, loc[1]))
+        links.new(color_out, crv.inputs['Color'])
+        color_out = crv.outputs['Color']
+    nm = nt.nodes.new('ShaderNodeNormalMap')
+    nm.location = loc
+    _set_normal_convention(nm)
+    links.new(color_out, nm.inputs['Color'])
+    return nm
+
+
 def _make_tex_node(nt, game_path: str, tex_root: str, tex_ext: str,
                    color_space: str, loc, *, links=None, uv_node=None,
                    tex_index=None):
@@ -421,17 +445,9 @@ def _setup_nodes_standard(mat, hashes: list, tex_root: str, tex_ext: str,
         n = make_tex(nrm_path, 'Non-Color', (_COL_TEX, -100))
         if n:
             n.label = 'Normal'
-            nrm_out = n.outputs['Color']
-            if bpy.app.version < (5, 2, 0):
-                # DirectX convention toggle absent; invert G with an RGB Curves node
-                # positioned in the existing gap between the texture and Normal Map columns.
-                crv = _make_y_invert_curves(nt, (_COL_MID - 300, -100))
-                links.new(nrm_out, crv.inputs['Color'])
-                nrm_out = crv.outputs['Color']
-            nm = nt.nodes.new('ShaderNodeNormalMap')
-            nm.location = (_COL_MID, -100)
-            _set_normal_convention(nm)
-            links.new(nrm_out, nm.inputs['Color'])
+            # On < 5.2 the curves fallback lands in the existing gap between
+            # the texture and Normal Map columns.
+            nm = _make_normal_map(nt, links, n.outputs['Color'], (_COL_MID, -100))
             links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
 
     # Slot 3: Roughness
@@ -629,17 +645,9 @@ def _setup_nodes_9slot(mat, hashes: list, tex_root: str, tex_ext: str,
                 nrm_tex_out = det_nrm.outputs['Color']
 
     if nrm_tex_out is not None:
-        if bpy.app.version < (5, 2, 0):
-            crv = _make_y_invert_curves(nt, (_COL_MID - 150, -100))
-            links.new(nrm_tex_out, crv.inputs['Color'])
-            nrm_tex_out = crv.outputs['Color']
-            nm_x = _COL_MID + 130
-        else:
-            nm_x = _COL_MID
-        nm = nt.nodes.new('ShaderNodeNormalMap')
-        nm.location = (nm_x, -100)
-        _set_normal_convention(nm)
-        links.new(nrm_tex_out, nm.inputs['Color'])
+        nm = _make_normal_map(nt, links, nrm_tex_out, (_COL_MID, -100),
+                              legacy_loc=(_COL_MID + 130, -100),
+                              legacy_curves_loc=(_COL_MID - 150, -100))
         links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
 
     # Slot 3: Roughness.
@@ -795,15 +803,8 @@ def _setup_nodes_10slot(mat, hashes: list, tex_root: str, tex_ext: str,
         n = make_nrm_tex(nrm_path, 'Non-Color', (_10_CX_TEX, -100))
         if n:
             n.label = 'Normal (UV1)' if use_base_fields else 'Normal (UV2)'
-            nrm_out = n.outputs['Color']
-            if bpy.app.version < (5, 2, 0):
-                crv = _make_y_invert_curves(nt, (_10_CX_MID - 300, -100))
-                links.new(nrm_out, crv.inputs['Color'])
-                nrm_out = crv.outputs['Color']
-            nm = nt.nodes.new('ShaderNodeNormalMap')
-            nm.location = (_10_CX_MID, -100)
-            _set_normal_convention(nm)
-            links.new(nrm_out, nm.inputs['Color'])
+            nm = _make_normal_map(nt, links, n.outputs['Color'],
+                                  (_10_CX_MID, -100))
             links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
 
     # Roughness
@@ -1015,18 +1016,10 @@ def _setup_nodes_extended(mat, hashes: list, tex_root: str, tex_ext: str,
                 nrm_tex_out = det_nrm.outputs['Color']
 
     if nrm_tex_out is not None:
-        if bpy.app.version < (5, 2, 0):
-            # Place the curves node where NM would normally sit, then push NM right.
-            crv = _make_y_invert_curves(nt, (_EX_CX_MID + 100, 300))
-            links.new(nrm_tex_out, crv.inputs['Color'])
-            nrm_tex_out = crv.outputs['Color']
-            nm_x = _EX_CX_MID + 380
-        else:
-            nm_x = _EX_CX_MID + 100
-        nm = nt.nodes.new('ShaderNodeNormalMap')
-        nm.location = (nm_x, 300)
-        _set_normal_convention(nm)
-        links.new(nrm_tex_out, nm.inputs['Color'])
+        # On < 5.2 the curves node takes the Normal Map slot and NM moves right.
+        nm = _make_normal_map(nt, links, nrm_tex_out, (_EX_CX_MID + 100, 300),
+                              legacy_loc=(_EX_CX_MID + 380, 300),
+                              legacy_curves_loc=(_EX_CX_MID + 100, 300))
         links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
 
     # Slot 3: Roughness
@@ -1313,32 +1306,21 @@ def _setup_nodes_two_layer(mat, hashes: list, tex_root: str, tex_ext: str,
     nrm2 = tex(11, 'Non-Color', (_TL_TEX, -2100), 'Layer 2 Normal (UV2)', True)
 
     def unpack_normal(node, y, tag):
-        """Texel -> unit tangent-space normal, Z rebuilt like the shader does."""
+        """Texel -> unit tangent-space normal, still DirectX-convention.
+
+        Blender's DDS loader already hands back BC5 normal maps with the
+        blue/Z channel reconstructed, so all three channels decode straight
+        through as rgb*2-1.  The green flip is not applied here: it belongs
+        to the single Normal Map node at the end of the chain.
+        """
         signed = vmath('MULTIPLY_ADD', (_TL_A, y), tag + ' *2-1',
                        node.outputs['Color'], (2.0, 2.0, 2.0), (-1.0, -1.0, -1.0))
-        flat = vmath('MULTIPLY', (_TL_A, y - 170), tag + ' xy', signed,
-                     (1.0, 1.0, 0.0))
-        dot = vmath('DOT_PRODUCT', (_TL_B, y - 170), tag + ' dot(xy,xy)',
-                    flat, flat)
-        z = math('SQRT', (_TL_C, y - 170), tag + ' z',
-                 math('MAXIMUM', (_TL_B, y - 340), 'max(0, 1-d)',
-                      math('SUBTRACT', (_TL_B, y - 510), '1 - d', 1.0, dot), 0.0))
-        sep = nt.nodes.new('ShaderNodeSeparateXYZ')
-        sep.location = (_TL_B, y)
-        links.new(flat, sep.inputs['Vector'])
-        comb = nt.nodes.new('ShaderNodeCombineXYZ')
-        comb.location = (_TL_C, y)
-        comb.label = tag + ' xyz'
-        links.new(sep.outputs['X'], comb.inputs['X'])
-        links.new(sep.outputs['Y'], comb.inputs['Y'])
-        links.new(z, comb.inputs['Z'])
-        return vmath('NORMALIZE', (_TL_C, y + 170), tag + ' normalize',
-                     comb.outputs['Vector'])
+        return vmath('NORMALIZE', (_TL_B, y), tag + ' normalize', signed)
 
     n_out = None
     if nrm1 is not None and nrm2 is not None:
         n1 = unpack_normal(nrm1, -1650, 'L1')
-        n2 = unpack_normal(nrm2, -2600, 'L2')
+        n2 = unpack_normal(nrm2, -2100, 'L2')
         # Reoriented normal mapping: r = normalize(t*dot(t,u) - u*t.z),
         # with t = n1 + (0,0,1) and u = n2 * (-1,-1,1). The shader first
         # rotates n2 from UV2's tangent frame into UV1's using screen-space
@@ -1357,22 +1339,25 @@ def _setup_nodes_two_layer(mat, hashes: list, tex_root: str, tex_ext: str,
                                   scale=dot_tu),
                             vmath('SCALE', (_TL_C, -2990), 'u * t.z', u,
                                   scale=t_sep.outputs['Z'])))
-    elif nrm1 is not None:
-        n_out = unpack_normal(nrm1, -1650, 'L1')
-    elif nrm2 is not None:
-        n_out = unpack_normal(nrm2, -2100, 'L2')
 
     if n_out is not None:
-        # Back to [0,1] with Y negated, which converts UE's DirectX-convention
-        # green channel to the OpenGL convention a default Normal Map node
-        # expects. Doing it here keeps this builder free of the version-gated
-        # DIRECTX/curves branch the other builders need.
+        # Back to [0,1] for the Normal Map node.  Y is NOT negated here: the
+        # node's own DIRECTX convention (or the < 5.2 curves fallback) does
+        # that, exactly as in every other builder in this file.
         packed = vmath('MULTIPLY_ADD', (_TL_BSDF - 120, -2000), 'Pack to [0,1]',
-                       n_out, (0.5, -0.5, 0.5), (0.5, 0.5, 0.5))
-        nm = nt.nodes.new('ShaderNodeNormalMap')
-        nm.location = (_TL_BSDF - 120, -1800)
-        links.new(packed, nm.inputs['Color'])
+                       n_out, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        nm = _make_normal_map(nt, links, packed, (_TL_BSDF - 120, -1800),
+                              legacy_curves_loc=(_TL_BSDF - 120, -2200))
         links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+    else:
+        # A single layer needs no vector maths at all: the texture feeds the
+        # Normal Map node directly.
+        lone = nrm1 if nrm1 is not None else nrm2
+        if lone is not None:
+            nm = _make_normal_map(nt, links, lone.outputs['Color'],
+                                  (_TL_BSDF - 120, -1800),
+                                  legacy_curves_loc=(_TL_C, -1800))
+            links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
 
 
 # ============================================================

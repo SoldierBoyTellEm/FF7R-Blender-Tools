@@ -29,7 +29,7 @@ IMPORTANT -- why importing ff7r_rmi_surface.py used to break OTHER materials
 ------------------------------------------------------------------------------
 "A node group SHARES its node tree between instances" is called out in
 ff7r_rmi_surface.py's own module docstring: FF7R Eye, FF7R Hair Strand,
-FF7R Coverage, UE Unpack Normal (RG), and every other util_*/grp_* group are
+FF7R Coverage, UE Tangent To World, and every other util_*/grp_* group are
 ONE node-group datablock referenced by a ShaderNodeGroup instance in every
 material that uses that feature -- the master, and any hand-made variant
 copy of it (PC0000_00_TopsA included).
@@ -586,7 +586,9 @@ def apply_variant(mat, master_mod, variant_full_name, switches):
             if _mute(node, not active):
                 stats["muted"] += 1
 
-    # 7. UV coordinate sets: keep only the ones this variant actually reads --
+    # 7. UV coordinate sets: keep only the ones this variant actually reads.
+    # CoordinateN_ is an engine-routing declaration, deliberately not a
+    # Blender material control; ROLE_UV is the material's sole UV usage map.
     used_uv = set()
     for role, sw in master_mod.SWITCH_FOR_ROLE.items():
         if sw in switches:
@@ -594,7 +596,7 @@ def apply_variant(mat, master_mod, variant_full_name, switches):
     for i in range(4):
         node = t.nodes.get("UV%d" % i)
         if node is not None:
-            active = ("Coordinate%d_" % i in switches) or (i in used_uv)
+            active = i in used_uv
             if _mute(node, not active):
                 stats["muted"] += 1
 

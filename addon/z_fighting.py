@@ -71,7 +71,9 @@ class MESH_OT_find_opposite_faces(FF7R_LoggedOperator):
             print(f"[FF7R Tools] Could not create opposite-face attribute for {obj.name}: {exc}")
 
         for material in obj.data.materials:
-            if not material or not material.use_nodes:
+            # ``use_nodes`` is deprecated in Blender 5.x and merely reading it
+            # emits a warning. A missing node tree is the same practical test.
+            if not material or material.node_tree is None:
                 continue
             nodes = material.node_tree.nodes
             links = material.node_tree.links
@@ -108,10 +110,11 @@ class MESH_OT_find_opposite_faces(FF7R_LoggedOperator):
             links.new(attribute_node.outputs["Fac"], mix_node.inputs["Factor"])
             links.new(mix_node.outputs["Result"], principled.inputs["Subsurface Weight"])
 
-    def process_object(self, obj):
+    @staticmethod
+    def process_object(obj):
         if obj.type != "MESH":
             return False
-        opposite_vertices = self.find_opposite_faces(obj)
+        opposite_vertices = MESH_OT_find_opposite_faces.find_opposite_faces(obj)
         if not opposite_vertices:
             return False
 
@@ -123,7 +126,7 @@ class MESH_OT_find_opposite_faces(FF7R_LoggedOperator):
             modifier = obj.modifiers.new(name="Alpha Displace", type="DISPLACE")
             modifier.strength = 0.0005
             modifier.vertex_group = group_name
-        self.setup_material_nodes(obj, group_name)
+        MESH_OT_find_opposite_faces.setup_material_nodes(obj, group_name)
         return True
 
     def execute(self, context):

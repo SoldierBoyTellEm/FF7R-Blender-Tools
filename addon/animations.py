@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import traceback
 from typing import Iterable
 
@@ -10,6 +11,7 @@ from mathutils import Matrix, Quaternion, Vector
 
 from . import game_packages
 from .reporting import FF7R_LoggedOperator, report
+from .skeleton import importer as skeleton_importer
 
 
 def _selected_armature_skeleton_path(armature: bpy.types.Object) -> str | None:
@@ -44,6 +46,13 @@ def _vector(value: Iterable[float], fallback: tuple[float, float, float]) -> Vec
     return Vector(parts[:3] if len(parts) >= 3 else fallback)
 
 
+def _ue_location(value: Iterable[float]) -> Vector:
+    """Centimetres in UE's left-handed frame to metres in Blender's."""
+    location = _vector(value, (0.0, 0.0, 0.0)) * 0.01
+    location.y = -location.y
+    return location
+
+
 def _quaternion(value: Iterable[float]) -> Quaternion:
     parts = tuple(float(part) for part in value)
     if len(parts) < 4:
@@ -53,6 +62,36 @@ def _quaternion(value: Iterable[float]) -> Quaternion:
     result = Quaternion((parts[3], -parts[0], parts[1], -parts[2]))
     result.normalize()
     return result
+
+
+# skeleton/importer.py frames each edit bone by aiming Blender's +Y down Unreal's
+# local +X, aligning +Z to Unreal's +Z, then adding a 90 degree roll.  The net
+# effect is a single constant change of basis: a package bone's ``matrix_local``
+# equals the UE-converted armature-space bind matrix that the importer composes,
+# times this rotation.  Derived by replaying that framing on synthetic bind
+# matrices; identical for every bone to within 2e-6.
+DISPLAY_CORRECTION = Matrix((
+    (0.0, 1.0, 0.0, 0.0),
+    (0.0, 0.0, -1.0, 0.0),
+    (-1.0, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+))
+DISPLAY_CORRECTION_INVERSE = DISPLAY_CORRECTION.inverted()
+
+# The root track is not a bone-parented transform: its translation is the actor's
+# raw world placement (thousands of centimetres from the origin) and its rotation
+# is a fixed 120 degrees about (-1, 1, -1)/sqrt(3), byte-identical in every clip
+# sampled.  It is a component-to-world placement, so it does not carry the 90
+# degree display roll that skeleton/importer.py adds to each *bone's* frame, and
+# applying that roll to it lays the whole character on its side -- hip-to-head
+# pointing down world +X instead of +Z.  Undoing the roll is a -90 degree turn
+# about the bone's own Y, which leaves exactly the pre-roll correction.
+ROOT_DISPLAY_CORRECTION = DISPLAY_CORRECTION @ Matrix.Rotation(math.radians(-90.0), 4, "Y")
+
+# Largest per-element difference tolerated between a bone's rest matrix and the
+# bind pose the clip was authored against.  Connected bones nudge a parent's tail
+# onto the child head, so an exact match is not expected.
+REST_CONVENTION_TOLERANCE = 0.01
 
 
 def _rest_local_matrix(bone: bpy.types.Bone) -> Matrix:
@@ -72,34 +111,87 @@ def _blender_basis_values(
 ) -> tuple[Vector, Quaternion, Vector]:
     """Convert a UE local track transform into this add-on's bone display basis.
 
-    Package armatures have a deliberate per-bone roll correction so Blender
-    draws its +Y bone axis along Unreal's +X.  Carry that correction from the
-    UE bind pose into every animated local transform before deriving
-    ``matrix_basis``.  This makes animation keys agree with the existing rig
-    instead of treating its display orientation as source data.
+    Write ``L`` for a parent-relative UE transform carried into Blender axes and
+    ``D`` for :data:`DISPLAY_CORRECTION`.  A package bone's rest matrix is
+    ``B_bind @ D`` and its posed matrix must be ``B_anim @ D``, so the
+    parent-relative rest is ``D^-1 @ L_bind @ D``, the parent-relative pose is
+    ``D^-1 @ L_anim @ D``, and
+
+        matrix_basis = (D^-1 @ L_bind @ D)^-1 @ (D^-1 @ L_anim @ D)
+                     = D^-1 @ L_bind^-1 @ L_anim @ D
+
+    which is what this returns.  The same expression covers root bones, where
+    both rest and pose instead pick up the importer's -Y-forward rotation and it
+    cancels between them.
+
+    Conjugating by ``D`` is the step that was missing: without it the UE delta
+    gets applied in the display frame rather than being carried into it, which
+    leaves poses that look plausible in scale but are rotated by ~100 degrees.
     """
-    location = _vector(translation, (0.0, 0.0, 0.0)) * 0.01
-    location.y = -location.y
     source_matrix = Matrix.LocRotScale(
-        location,
+        _ue_location(translation),
         _quaternion(rotation),
         _vector(scale, (1.0, 1.0, 1.0)),
     )
-    rest_local = _rest_local_matrix(bone)
-    source_bind_location = _vector(bind_translation, (0.0, 0.0, 0.0)) * 0.01
-    source_bind_location.y = -source_bind_location.y
-    ue_bind = Matrix.LocRotScale(
-        source_bind_location,
+    bind_matrix = Matrix.LocRotScale(
+        _ue_location(bind_translation),
         _quaternion(bind_rotation),
         _vector(bind_scale, (1.0, 1.0, 1.0)),
     )
-    correction = ue_bind.inverted_safe() @ rest_local
-    basis = rest_local.inverted_safe() @ (source_matrix @ correction)
+    delta = bind_matrix.inverted_safe() @ source_matrix
+    target = ROOT_DISPLAY_CORRECTION if bone.parent is None else DISPLAY_CORRECTION
+    basis = DISPLAY_CORRECTION_INVERSE @ delta @ target
     return basis.decompose()
 
 
+def _rest_convention_error(
+        bone: bpy.types.Bone,
+        bind_matrix: Matrix,
+        forward_rotation: Matrix,
+) -> float:
+    """How far this bone's rest pose is from the UE bind pose the clip assumes.
+
+    Large values mean the armature was not built by this add-on's package
+    importer, so the keys will land somewhere other than the animation intends.
+
+    A root bone's rest is measured against the armature origin rather than a
+    parent, so it also carries the importer's forward-axis rotation -- hence
+    ``forward_rotation``.  Checking roots matters: the root is the one bone whose
+    rest and animated frames are not related by ``DISPLAY_CORRECTION`` alone.
+    """
+    rest = _rest_local_matrix(bone)
+    if bone.parent is None:
+        expected = forward_rotation @ bind_matrix @ DISPLAY_CORRECTION
+    else:
+        expected = DISPLAY_CORRECTION_INVERSE @ bind_matrix @ DISPLAY_CORRECTION
+    return max(abs(a - b) for row_a, row_b in zip(expected, rest) for a, b in zip(row_a, row_b))
+
+
+def _action_curves(action: bpy.types.Action, target: bpy.types.Object):
+    """Return a curve factory for the action, plus the slot that owns the curves.
+
+    Blender 4.4 moved an Action's curves into a slot/layer/strip channelbag and
+    5.0 dropped the old ``Action.fcurves`` shortcut, so build the channelbag when
+    the shortcut is gone.  The two collections name their group argument
+    differently and both refuse positional arguments, hence the factory.
+    """
+    legacy = getattr(action, "fcurves", None)
+    if legacy is not None:
+        def new_curve(data_path, axis, group):
+            return legacy.new(data_path, index=axis, action_group=group)
+        return new_curve, None
+
+    slot = action.slots.new(id_type='OBJECT', name=target.name)
+    strip = action.layers.new("Layer").strips.new(type='KEYFRAME')
+    curves = strip.channelbag(slot, ensure=True).fcurves
+
+    def new_curve(data_path, axis, group):
+        return curves.new(data_path, index=axis, group_name=group)
+    return new_curve, slot
+
+
 def _insert_keys(
-        action: bpy.types.Action,
+        new_curve,
         bone_name: str,
         data_path: str,
         values: list[tuple[float, ...]],
@@ -114,7 +206,7 @@ def _insert_keys(
         source_frames = [0.0] * len(values)
     count = min(len(values), len(source_frames))
     for axis in range(dimensions):
-        curve = action.fcurves.new(data_path=data_path, index=axis, action_group=bone_name)
+        curve = new_curve(data_path, axis, bone_name)
         curve.keyframe_points.add(count)
         for index in range(count):
             point = curve.keyframe_points[index]
@@ -287,6 +379,7 @@ class FF7R_REBIRTH_OT_apply_animation_game_packages(FF7R_LoggedOperator):
         frame_scale = scene_fps / source_fps
         action_name = f"{armature.name} | {animation.get('name') or virtual_path.rsplit('/', 1)[-1]}"
         action = bpy.data.actions.new(action_name)
+        new_curve, action_slot = _action_curves(action, armature)
         action["ff7r_animation_virtual_path"] = virtual_path
         action["ff7r_skeleton_asset_path"] = skeleton_path
         action["ff7r_source_fps"] = source_fps
@@ -295,6 +388,14 @@ class FF7R_REBIRTH_OT_apply_animation_game_packages(FF7R_LoggedOperator):
         keyed_bones = 0
         skipped_bones = 0
         key_count = 0
+        worst_rest_error = 0.0
+        # Baked into the rest matrices of root bones, so it cancels out of every
+        # matrix_basis; it is needed only to validate a root's rest pose above.
+        forward_rotation = (
+            skeleton_importer.Y_FORWARD_ROTATION
+            if skeleton_importer.armature_face_forward(armature) == skeleton_importer.FACE_FORWARD_BLENDER
+            else Matrix.Identity(4)
+        )
         for track in animation.get("tracks") or []:
             bone_name = track.get("boneName")
             bone = armature.data.bones.get(bone_name) if bone_name else None
@@ -320,6 +421,13 @@ class FF7R_REBIRTH_OT_apply_animation_game_packages(FF7R_LoggedOperator):
             bind_translation = _vector(track.get("bindTranslation") or (), (0.0, 0.0, 0.0))
             bind_rotation = tuple(track.get("bindRotation") or (0.0, 0.0, 0.0, 1.0))
             bind_scale = _vector(track.get("bindScale") or (), (1.0, 1.0, 1.0))
+            worst_rest_error = max(worst_rest_error, _rest_convention_error(
+                bone,
+                Matrix.LocRotScale(
+                    _ue_location(bind_translation), _quaternion(bind_rotation), bind_scale
+                ),
+                forward_rotation,
+            ))
             bases = [
                 _blender_basis_values(
                     bone,
@@ -336,22 +444,32 @@ class FF7R_REBIRTH_OT_apply_animation_game_packages(FF7R_LoggedOperator):
             rotations = [tuple(basis[1]) for basis in bases]
             scales = [tuple(basis[2]) for basis in bases]
             path = f'pose.bones["{bone.name}"]'
-            key_count += _insert_keys(action, bone.name, path + ".location", translations,
+            key_count += _insert_keys(new_curve, bone.name, path + ".location", translations,
                                       source_frames, frame_scale, self.start_frame)
-            key_count += _insert_keys(action, bone.name, path + ".rotation_quaternion", rotations,
+            key_count += _insert_keys(new_curve, bone.name, path + ".rotation_quaternion", rotations,
                                       source_frames, frame_scale, self.start_frame)
-            key_count += _insert_keys(action, bone.name, path + ".scale", scales,
+            key_count += _insert_keys(new_curve, bone.name, path + ".scale", scales,
                                       source_frames, frame_scale, self.start_frame)
             keyed_bones += 1
 
-        if not action.fcurves:
+        if not key_count:
             bpy.data.actions.remove(action)
             report(self, {'ERROR'}, "No animation tracks matched bones on the selected armature.")
             return {'CANCELLED'}
         action.frame_start = self.start_frame
         action.frame_end = self.start_frame + max(0.0, float(animation.get("duration") or 0.0) * scene_fps)
         if self.replace_current_action:
-            armature.animation_data_create().action = action
+            animation_data = armature.animation_data_create()
+            animation_data.action = action
+            if action_slot is not None:
+                animation_data.action_slot = action_slot
+        if worst_rest_error > REST_CONVENTION_TOLERANCE:
+            report(self,
+                {'WARNING'},
+                f"'{armature.name}' rest pose differs from the animation's bind pose by "
+                f"{worst_rest_error:.3f}; the keys will not land where the clip intends. "
+                "Import the Skeleton from packages so the rig uses this add-on's bone frame.",
+            )
         report(self,
             {'INFO'},
             f"Imported '{animation.get('name') or action.name}' to '{armature.name}': "
